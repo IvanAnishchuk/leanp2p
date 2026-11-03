@@ -19,10 +19,9 @@ milestones", over the OpenSSL shim:
   fixture's public key, verifies the fixture's signature, and verifies
   a fresh signature of its own. The RSA re-sign is byte-identical
   (`sigDeterministic`). go-libp2p signs secp256k1 by RFC 6979, and so
-  does the shim, so the secp256k1 re-sign is byte-identical too, and
-  the digest signer gives the fixture's `(r, s)`. Sixteen more messages
-  check that both forms agree, are low-S, and verify. P-256 signs with
-  a random nonce. The secp256k1 fixture point passes
+  does the shim, so the secp256k1 re-sign is byte-identical too.
+  Sixteen more messages check that each signature is low-S and
+  verifies. P-256 signs with a random nonce. The secp256k1 fixture point passes
   `secp256k1PointValid`, and a point with an unknown prefix fails it.
 * Random bytes: a draw returns the requested length, two draws differ,
   and a draw past the 1 MiB cap is `invalidInput`.
@@ -207,31 +206,20 @@ private def goKeys (r : Runner) : IO Unit := do
       r.check "secp256k1: a point with prefix 0x05 is invalid"
         (!secp256k1PointValid (ByteArray.mk #[0x05] ++ pub.extract 1 pub.size))
       -- go-libp2p signs by RFC 6979 over SHA-256 (`sigDeterministic`),
-      -- so both signers must give the fixture's (r, s) exactly.
-      let digestOf (m : ByteArray) : IO Digest32 := do
-        let some d := (sha256 m).toOption.bind Digest32.ofByteArray?
-          | throw <| IO.userError s!"{file}: SHA-256 failed"
-        pure d
-      let digest ← digestOf msg
-      let (fr, fs) ← Ecdsa.derSig file sig
+      -- so the re-sign must give the fixture's bytes exactly.
       r.check "go key secp256k1: the re-sign is byte-identical" (succeedsWith sig (secp256k1Sign scalar msg))
-      r.check "go key secp256k1: the digest signer gives the fixture (r, s)"
-        (succeedsWith (Ecdsa.bytesOfNat 32 fr ++ Ecdsa.bytesOfNat 32 fs)
-          (secp256k1SignDigest scalar digest))
       -- About half the raw signatures carry a high S, and the shim must
       -- replace S with n minus S. Sixteen messages reach that path with
-      -- probability 1 minus 2^-16. Each DER answer must be low-S and
-      -- verify, and the compact answer must hold the same (r, s).
+      -- probability 1 minus 2^-16. Each answer must be low-S and verify.
       let draws := 16
       let mut good := 0
       for i in [0:draws] do
         let m := msg.push i.toUInt8
-        if let (.ok der, .ok c) := (secp256k1Sign scalar m, secp256k1SignDigest scalar (← digestOf m)) then
-          let (sr, ss) ← Ecdsa.derSig "secp256k1Sign" der
-          if ss ≤ Ecdsa.secp256k1Order / 2 && secp256k1Verify pub m der &&
-              c == Ecdsa.bytesOfNat 32 sr ++ Ecdsa.bytesOfNat 32 ss then
+        if let .ok der := secp256k1Sign scalar m then
+          let (_, ss) ← Ecdsa.derSig "secp256k1Sign" der
+          if ss ≤ Ecdsa.secp256k1Order / 2 && secp256k1Verify pub m der then
             good := good + 1
-      r.check s!"secp256k1: {draws} signatures are low-S, verify, and agree in both forms ({good} did)"
+      r.check s!"secp256k1: {draws} signatures are low-S and verify ({good} did)"
         (good == draws)
       -- SEC 1 §3.2.1 takes a private key from [1, n - 1]. OpenSSL
       -- loads 0 and n and signs with them, so the shim checks the range.
@@ -240,8 +228,7 @@ private def goKeys (r : Runner) : IO Unit := do
           | throw <| IO.userError "a 32-byte scalar"
         r.check s!"secp256k1: every scalar binding rejects {label}"
           (failsWith .invalidKey (secp256k1PublicKey bad) &&
-           failsWith .invalidKey (secp256k1Sign bad msg) &&
-           failsWith .invalidKey (secp256k1SignDigest bad digest))
+           failsWith .invalidKey (secp256k1Sign bad msg))
     | "ecdsa" =>
       r.check "go key ecdsa: derives the fixture public key" (succeedsWith pub (p256PublicKey priv))
       r.check "go key ecdsa: the SEC1 re-encode gives the fixture bytes" (succeedsWith priv (p256Sec1 priv))

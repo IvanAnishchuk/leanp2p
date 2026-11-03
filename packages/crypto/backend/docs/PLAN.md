@@ -44,9 +44,7 @@ SHA-256, HMAC, and HKDF through the facade, all through one import of
 `Crypto`; it draws its ephemerals through the `Rng` seam.
 W5.6 (`libp2p/host`) signs and verifies through the facade. W6.1
 (`libp2p/identity` ENR) consumes the keccak-256 digest through the
-facade; the digest routes to `LeanHazmatKeccak` (§4.6). It signs a
-record through the secp256k1 compact digest signer, and it recovers a key
-through `LeanHazmatSecp256k1`. The `Rng`
+facade; the digest routes to `LeanHazmatKeccak` (§4.6). The `Rng`
 seam is the test-seam home: a seeded value replays a
 fixed sequence, so every suite above this package pins its randomness
 (§3.1).
@@ -83,9 +81,8 @@ Milestones for 1a:
   "Vector stance"): derive, sign, and verify over the fixed message of
   the file. The RSA signature is byte-identical on re-sign
   (`sigDeterministic`), and so is the secp256k1 re-sign, because both
-  sides use the RFC 6979 nonce. The compact digest signer gives the
-  fixture's `(r, s)`. Sixteen more messages check that the two forms
-  agree, are low-S, and verify. ECDSA P-256 draws a random nonce, so
+  sides use the RFC 6979 nonce. Sixteen more messages check that each
+  secp256k1 signature is low-S and verifies. ECDSA P-256 draws a random nonce, so
   verification is its contract. A scalar of zero and a scalar equal to
   the group order are `invalidKey` under every secp256k1 binding.
 - Random bytes: the requested length comes back, two draws differ, and
@@ -254,7 +251,7 @@ the file records. The expired-certificate and critical-extension
 fixtures are generated that way, since the tls.md set holds none. The
 randomized P-256 signature has no known answer; the fixture suites and
 the verifier regressions close it, and a captured hostile-signature
-suite would close it harder. Both secp256k1 signers have one: the go
+suite would close it harder. The secp256k1 signer has one: the go
 fixture, which go-libp2p signs by RFC 6979.
 
 Keccak-256 has no RFC vector file on the spike branch, and the spike

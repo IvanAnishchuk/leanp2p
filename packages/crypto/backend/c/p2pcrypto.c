@@ -558,7 +558,7 @@ static int ec_half_order(EVP_PKEY *k, BIGNUM **order, BIGNUM **half) {
 }
 
 /* Normalize S in `s` to its low form: S > n/2 becomes n - S, where n
-   is the group order of `k`. Both secp256k1 signers call it, so the
+   is the group order of `k`. The secp256k1 signer calls it, so the
    signatures pass the low-S rule of the verifier below. 0 on a library
    fault. */
 static int k1_low_s(EVP_PKEY *k, ECDSA_SIG *s) {
@@ -618,13 +618,13 @@ LEAN_EXPORT uint8_t leanp2p_secp256k1_check(b_lean_obj_arg point) {
 
 /* The one secp256k1 signer: ECDSA over a 32-byte digest with the
    RFC 6979 nonce, then S in its low form. NULL on a bad scalar or a
-   library fault. Both entry points below call it.
+   library fault. Every secp256k1 sign entry point calls it.
 
    OpenSSL 3.2 added the deterministic nonce (`nonce-type` 1). The
    nonce's HMAC-DRBG runs on the `digest` parameter, SHA-256, whatever
    hash made the digest. libsecp256k1 and decred also run RFC 6979 on
    HMAC-SHA-256, so the three give the same signature for one key and
-   one digest. The signer draws no randomness, so both bindings are
+   one digest. The signer draws no randomness, so its bindings are
    pure. */
 static ECDSA_SIG *k1_sign(b_lean_obj_arg scalar, const uint8_t digest[32]) {
     EVP_PKEY *k = k1_private(scalar);
@@ -662,25 +662,6 @@ LEAN_EXPORT lean_obj_res leanp2p_secp256k1_sign(b_lean_obj_arg scalar, b_lean_ob
     int n = s != NULL ? i2d_ECDSA_SIG(s, &der) : -1;
     if (n > 0) r = some(mk_bytes(der, (size_t)n));
     OPENSSL_free(der);
-    ECDSA_SIG_free(s);
-    return r;
-}
-
-/* The compact form of the ENR `v4` scheme (EIP-778): sign the caller's
-   32-byte digest, and give `r ‖ s`, each half big-endian and
-   left-padded to 32 bytes. */
-LEAN_EXPORT lean_obj_res leanp2p_secp256k1_sign_digest(b_lean_obj_arg scalar,
-                                                       b_lean_obj_arg digest) {
-    ECDSA_SIG *s = k1_sign(scalar, bptr(digest));
-    lean_object *r = none();
-    if (s != NULL) {
-        const BIGNUM *sr = NULL, *ss = NULL;
-        ECDSA_SIG_get0(s, &sr, &ss);
-        lean_object *out = alloc_bytes(64);
-        uint8_t *o = lean_sarray_cptr(out);
-        r = some_or_free(BN_bn2binpad(sr, o, 32) == 32 && BN_bn2binpad(ss, o + 32, 32) == 32,
-                         out);
-    }
     ECDSA_SIG_free(s);
     return r;
 }
