@@ -95,12 +95,10 @@ package; §4.9 names no echo, so no module line covers it.
   stream to the peer and negotiating the id is the host's job (W5.6),
   as go-libp2p's `NewStream` does it
   (`vendor/go-libp2p/p2p/host/basic/basic_host.go`, line 441). The host
-  names it `newStream`. The host still upgrades through a mock of
-  `libp2p/negotiate` (issue #70), so the suite runs against a mock of
-  the call. `requestPeer` takes the call as an argument, with a slot
-  of the peer's `Limiter`, and runs `request` on the stream the call
-  returns. `request` needs no host type: it writes
-  the request, half-closes, and hands each response chunk to a callback
+  names it `newStream`. `requestPeer` takes the call as an argument,
+  with a slot of the peer's `Limiter`, and runs `request` on the stream
+  the call returns. `request` needs no host type: it writes the
+  request, half-closes, and hands each response chunk to a callback
   under a deadline. `serve` reads one request, answers through a
   callback, and closes, and `handler` wraps it as the `StreamHandler`
   the registry stores. Both work on opaque payload bytes; the core holds
