@@ -74,7 +74,10 @@ interop check of the vector stance runs through
 - The leftover hand-over: bytes the negotiation over-read reach the
   handshake through the `ByteArray` argument, and bytes the handshake
   over-read reach the transport reader through the `SecureConn`
-  (§4.7, §5.6).
+  (§4.7, §5.6). A leftover that ends inside a frame joins the next
+  read.
+- The transport reader posts whole frames: a peer whose bytes arrive
+  one per read costs at most one loop step per frame.
 - The suite passes under `+RTS -N1` (§6, PRINCIPLES 5.3).
 
 ## Vector stance
