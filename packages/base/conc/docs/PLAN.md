@@ -60,3 +60,6 @@ required.
 - `Outcome` keeps the first fault and records none after the end. A
   fault under an orderly answer throws, and a protocol error stays the
   answer.
+- A million ready values run in bounded stack, in a `repeat` loop and in
+  a recursive loop: `Wrap.await` takes the value of a finished task at
+  once, so no step goes through the pool.

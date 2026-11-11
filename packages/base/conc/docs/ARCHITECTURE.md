@@ -167,6 +167,15 @@ channels and the parks wrap `Std`, so the suite pins their behavior
   measurement). A parked loop or reader of a host (§3.3) therefore adds
   no thread. Code inside an `Async` task must not block either:
   a blocking call holds a pool worker.
+- **A finished task gives its value at once.** `Std`'s `await` wraps
+  every task as pending, and the next bind queues the rest of the
+  computation on the pool, also when the task has ended. A receive
+  from a channel that holds a value is such a task, so each value
+  would cost a round trip through the pool and its lock. `Wrap.await`
+  checks `IO.hasFinished` first. A `repeat` loop whose steps all end
+  at once still runs in constant stack, since `Std`'s `forIn` takes the
+  next step by a self tail call; the suite runs a million ready values
+  through a `repeat` loop and a recursive loop.
 - **A sender never parks inside `Std`.** `Std.CloseableChannel.close`
   wakes the parked receivers only. A sender parked inside `Std` on a
   full channel wakes only when a receive frees a slot, one sender per
