@@ -56,9 +56,10 @@ load under `Libp2p.Mux.Test.*`. Those declarations stay unsupported.
 
 ### The yamux value
 
-`open` forwards the `Connection` and the negotiation leftover to
-`Yamux.Session.new`. The session loop takes that leftover as its
-first input (§4.7).
+`open` forwards the `Connection`, the negotiation leftover, and the
+upgrader's `Clock` to `Yamux.Session.new`. The session loop takes that
+leftover as its first input (§4.7), and runs its timers on that clock,
+so a host on a test clock runs its sessions on it too (root §3.1).
 
 `Core.Role.initiator` selects the Yamux client. That side opens
 stream id `1` first, then the later odd ids. `Core.Role.responder`
