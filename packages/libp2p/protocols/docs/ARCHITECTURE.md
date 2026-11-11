@@ -82,7 +82,11 @@ package; §4.9 names no echo, so no module line covers it.
   that ends before any byte returns `.ok ()` and leaves the peerstore
   unchanged; go clears the peer's protocols.
 - **Ping.** `Ping.protocolId` is the constant. The handler echoes each
-  32-byte payload until the stream closes (the spike's `handle`). The
+  32-byte payload until the stream closes (the spike's `handle`). It
+  writes the whole payloads of one read as one write: a stream write
+  waits until the muxer has sent its frame, so a write per payload
+  costs a round trip through the muxer per 32 bytes, and a peer that
+  sends many pings outruns the handler. The
   initiator sends 32 bytes, awaits the echo, and checks its length and
   bytes; the spike's `Ping.ping` is the shape. The initiator's echo
   read has no deadline, as in the spike. §5.4 requires a deadline only

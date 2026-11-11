@@ -60,6 +60,7 @@ in the codec group wrapping upstream `google/snappy`.
   handler on the other end validates it, and `addrsOf` reads the
   addresses back.
 - The ping handler echoes 32 bytes and repeats until the stream closes.
+  The pings of one read come back in one write, in order.
   The concurrent-ping legs of the spike's 1000-stream stress stay as
   the load check.
 - The ping initiator rejects a wrong length: the spike's `Ping.ping`
