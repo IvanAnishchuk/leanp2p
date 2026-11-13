@@ -42,13 +42,14 @@ private def mapOpenError (e : Streams.Error) : Error :=
   | .reset => .closed detail
   | .timeout => .timeout detail
 
-/-- The production yamux muxer. `id` is `yamuxId`. `open` starts the
-landed session. The adapter maps its returned open and join errors
-into `Core.Error`. -/
-def yamux : Muxer where
+/-- A yamux muxer with the host's keepalive policy: the interval in
+milliseconds, or `none` for no keepalive. The policy rides in the
+muxer value the host's `Config.muxers` lists, so the `Muxer` seam keeps
+its shape (OCP; etheorem/leanp2p#93 asked for a seam change). -/
+def yamuxWith (keepalive : Option Nat) : Muxer where
   id := yamuxId
   «open» := fun role connection leftover clock => ExceptT.mk do
-    let session ← Yamux.Session.new (yamuxRole role) connection leftover clock
+    let session ← Yamux.Session.new (yamuxRole role) connection leftover clock keepalive
     return .ok {
       openStream := fun _ =>
         ExceptT.mk ((Except.mapError mapOpenError) <$> session.openStream)
@@ -56,5 +57,8 @@ def yamux : Muxer where
       close := session.close
       join := ExceptT.mk ((Except.mapError mapProtocolError) <$> session.join)
     }
+
+/-- The production yamux muxer, with yamux's default keepalive. -/
+def yamux : Muxer := yamuxWith (some Yamux.keepaliveIntervalMs)
 
 end Libp2p.Mux

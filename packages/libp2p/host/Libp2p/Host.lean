@@ -4,6 +4,7 @@ import Libp2p.Host.Registry
 import Libp2p.Host.Dedup
 import Libp2p.Host.Peerstore
 import Libp2p.Host.Policy
+import Libp2p.Host.Limits
 import Libp2p.Host.Gate
 import Libp2p.Host.Upgrade
 import Libp2p.Host.StreamSelect

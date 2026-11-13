@@ -105,6 +105,18 @@ inductive ConnEvent where
   /-- The live session `session` of the peer ended. -/
   | disconnected (peer : PeerId) (session : Nat)
 
+/-- A liveness probe of the live sessions (root §9, delta 2: "a
+keepalive or identity probe"), for a muxer with no keepalive of its
+own, such as mplex. Every `intervalMs` the host runs `run` against each
+connected peer under a `timeoutMs` deadline; a probe that answers
+`false` or misses the deadline ends that peer's session (`closePeer`).
+The caller builds `run` from a protocol above the host, such as the
+libp2p ping (`Libp2p.Protocols.Ping`), which the host cannot import. -/
+structure Probe where
+  intervalMs : Nat
+  timeoutMs : Nat
+  run : PeerId → Async Bool
+
 /-- The configuration of a host: the ordered seam lists, the identity,
 the handlers, the policy values, the clock, and where the failures of
 owned tasks go (ARCHITECTURE §3.1). `cli/` or a consumer assembles it;
@@ -141,6 +153,10 @@ structure Config where
   /-- Where the failures of owned tasks go. It runs on the failing
   task, so it answers at once. -/
   onFailure : Failure → BaseIO Unit := fun _ => pure ()
+  /-- The bounds of the peerstore (root §9, delta 3). -/
+  peerstoreLimits : Limits := {}
+  /-- The liveness probe; `none` runs none (`Host.startProbe`). -/
+  probe : Option Probe := none
 
 /-- A session the host serves: the upgraded connection, the peer's
 transport address, and the resource scope it holds. -/
@@ -233,13 +249,24 @@ private def report (h : Host) (peer : Option PeerId) (protocol : Option Protocol
 def setHandler (h : Host) (handler : StreamHandler) : BaseIO Unit :=
   h.handlers.update (Handlers.set handler)
 
-/-- Add addresses of `peer` to the peerstore, each once. -/
-def addAddrs (h : Host) (peer : PeerId) (addrs : List Multiaddr) : BaseIO Unit :=
-  h.peerstore.update (Peerstore.addAddrs peer addrs)
+/-- Add addresses of `peer` to the peerstore, each once. `ttlMs` gives
+them an expiry on the host clock; discovered addresses take one, and
+dialed addresses take none. -/
+def addAddrs (h : Host) (peer : PeerId) (addrs : List Multiaddr) (ttlMs : Option Nat := none) :
+    BaseIO Unit := do
+  let now ← h.config.clock.nowMs
+  h.peerstore.update (Peerstore.addAddrs peer addrs (nowMs := now) (ttlMs := ttlMs)
+    (limits := h.config.peerstoreLimits))
 
-/-- The addresses of `peer` in the peerstore. -/
+/-- The live addresses of `peer` in the peerstore. -/
 def addrsOf (h : Host) (peer : PeerId) : BaseIO (List Multiaddr) := do
-  return Peerstore.addrsOf (← h.peerstore.get) peer
+  return Peerstore.addrsOf (← h.peerstore.get) peer (← h.config.clock.nowMs)
+
+/-- Drop the expired addresses. The host runs no timer for it; the
+owner calls it, as Lighthouse's peer manager runs its own heartbeat. -/
+def prunePeerstore (h : Host) : BaseIO Unit := do
+  let now ← h.config.clock.nowMs
+  h.peerstore.update (Peerstore.prune · now)
 
 /-- True when the host serves a live session with `peer`. -/
 def connected (h : Host) (peer : PeerId) : BaseIO Bool := do
@@ -656,6 +683,36 @@ def startListening (h : Host) (addr : Multiaddr) : Async (Except Error Multiaddr
     | return .error (.noTransport addr)
   let l ← transport.listen addr
   h.adoptListener h.listeners l l.addr l.close l.join (h.acceptLoop l)
+
+/-! ## The liveness probe -/
+
+/-- One round of the probe: every connected peer, one after the other.
+A probe that fails or misses its deadline ends the session; the
+deadline's expiry closes the session at once, which wakes the probe's
+parked read. -/
+private def probeRound (h : Host) (p : Probe) : Async Unit := do
+  for peer in ← (h.peers : BaseIO (List PeerId)) do
+    let r ← Conc.withinDeadline h.config.clock p.timeoutMs (discard (h.closePeer peer))
+      (try p.run peer catch _ => pure false)
+    match r with
+    | .ok true => pure ()
+    | _ => discard (h.closePeer peer : BaseIO Bool)
+
+/-- The probe loop: a round every `intervalMs` until `close`. Park: the
+timer wakes it, and so does `close`, which closes `shutdown` first. -/
+private partial def probeLoop (h : Host) (p : Probe) : Async Unit := do
+  let timer ← (h.config.clock.after p.intervalMs : BaseIO (Park Unit))
+  let stop ← select #[timer.map fun _ => false, Park.recv h.shutdown fun _ => true]
+  if stop || (← (h.isClosing : BaseIO Bool)) then return
+  h.probeRound p
+  h.probeLoop p
+
+/-- Start the probe of `Config.probe` as a host task, which `close`
+joins. `false` when the config has none or the host is closing. -/
+def startProbe (h : Host) : Async Bool := do
+  let some p := h.config.probe | return false
+  -- The wake is the shutdown channel's close, which `close` does first.
+  h.hostTasks.spawn (h.probeLoop p) (pure ())
 
 /-! ## Outbound streams -/
 

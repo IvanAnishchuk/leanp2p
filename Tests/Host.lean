@@ -260,11 +260,60 @@ private def peerstoreChecks (r : Runner) : Async Unit := do
   for a in addrs do
     -- Each address goes in twice, from two tasks.
     for _ in [0:2] do
-      ts.spawn do cell.update (Peerstore.addAddrs large [a])
+      -- The cap is above the 32 addresses: this check is about atomicity.
+      ts.spawn do cell.update (Peerstore.addAddrs large [a] (limits := { addrsPerPeer := 64 }))
   ts.joinAll
   let got := Peerstore.addrsOf (← (cell.get : BaseIO Peerstore)) large
   r.check "concurrent adds keep every address" (addrs.all got.contains)
   r.check "concurrent adds keep each address once" (got.length == addrs.length)
+
+  -- The bounds (root §9, delta 3). The per-peer cap keeps the newest.
+  let capped := Peerstore.addAddrs large [a1, a2, a3] {} (limits := { addrsPerPeer := 2 })
+  r.check "the per-peer cap keeps the newest addresses" (Peerstore.addrsOf capped large == [a2, a3])
+  -- An address with a TTL hides once it expires, and prune drops it.
+  let timed := Peerstore.addAddrs large [a1] {} (nowMs := 100) (ttlMs := some 50)
+  r.check "a TTL address is live before its expiry" (Peerstore.addrsOf timed large 149 == [a1])
+  r.check "a TTL address hides at its expiry" (Peerstore.addrsOf timed large 150).isEmpty
+  r.check "prune drops the expired peer" ((Peerstore.prune timed 150).size == 0)
+  -- A re-add with no TTL keeps the address for good.
+  let kept := Peerstore.addAddrs large [a1] timed (nowMs := 120)
+  r.check "a re-add without TTL keeps the address" (Peerstore.addrsOf kept large 10000 == [a1])
+  -- The peer cap refuses a new peer and still takes a known one.
+  let one := Peerstore.addAddrs large [a1] {} (limits := { peers := 1 })
+  let two := Peerstore.addAddrs small [a2] one (limits := { peers := 1 })
+  r.check "the peer cap refuses a new peer" (Peerstore.addrsOf two small).isEmpty
+  let more := Peerstore.addAddrs large [a2] one (limits := { peers := 1 })
+  r.check "the peer cap takes a known peer's address" (Peerstore.addrsOf more large == [a1, a2])
+
+/-! ## The limiting resource manager -/
+
+private def limitsChecks (r : Runner) : IO Unit := do
+  let b : Limits.Bounds :=
+    { connections := 2, connectionsPerPeer := 1, streamsPerConnection := 2, streamsPerPeer := 3
+      memoryPerConnection := 100, memory := 150 }
+  let t : Limits.Table := {}
+  let (c0, t) := Limits.Table.openConn b t
+  let (c1, t) := Limits.Table.openConn b t
+  let (c2, t) := Limits.Table.openConn b t
+  r.check "limits: the host connection cap" (c0 == some 0 && c1 == some 1 && c2.isNone)
+  let (p0, t) := Limits.Table.setPeer b 0 large t
+  let (p1, t) := Limits.Table.setPeer b 1 large t
+  r.check "limits: the per-peer connection cap" (p0 && !p1)
+  let (s0, t) := Limits.Table.addStream b 0 t
+  let (s1, t) := Limits.Table.addStream b 0 t
+  let (s2, t) := Limits.Table.addStream b 0 t
+  r.check "limits: the per-connection stream cap" (s0 && s1 && !s2)
+  r.check "limits: streams count against the peer" ((t.peerUse large).streams == 2)
+  let (m0, t) := Limits.Table.addMemory b 0 90 t
+  let (m1, t) := Limits.Table.addMemory b 0 20 t
+  let (m2, t) := Limits.Table.addMemory b 1 70 t
+  r.check "limits: the per-connection memory cap" (m0 && !m1)
+  r.check "limits: the host memory ceiling" (!m2 && t.memory == 90)
+  let t := Limits.Table.closeConn 0 t
+  r.check "limits: a close returns the connection's use"
+    (t.connections == 1 && t.memory == 0 && !t.peers.contains large)
+  let (c3, t) := Limits.Table.openConn b t
+  r.check "limits: a closed connection frees a slot" (c3 == some 2 && t.connections == 2)
 
 /-! ## `Host.Error` -/
 
@@ -347,7 +396,7 @@ private def failHandler : StreamHandler where
 failures arrive on. -/
 private def mkHost (net : Sim.Net) (idByte : UInt8) (tc : TestClock)
     (gater : ConnectionGater := Policy.permissiveGater)
-    (resources : ResourceManager := Policy.unlimited) :
+    (resources : ResourceManager := Policy.unlimited) (probe : Option Probe := none) :
     Async (Host × Chan Failure) := do
   let cfg ← cfgOf idByte
   let failures : Chan Failure ← Chan.new 16
@@ -367,7 +416,8 @@ private def mkHost (net : Sim.Net) (idByte : UInt8) (tc : TestClock)
     gater
     resources
     clock := tc.clock
-    onFailure := fun f => discard (failures.trySend f) }
+    onFailure := fun f => discard (failures.trySend f)
+    probe }
   match ← (Host.new config : BaseIO _) with
   | .ok h => return (h, failures)
   | .error _ => throw <| IO.userError "test host does not build"
@@ -662,6 +712,53 @@ private def eventChecks (r : Runner) : Async Unit := do
   a.close
   tc.close
 
+/-- The limiting resource manager on a real host (root §9, delta 4): a
+connection admits one stream, so a second stream while the first is
+open is refused with `gated .resources`, and a third after the first
+closes is admitted. -/
+private def limitedHostChecks (r : Runner) : Async Unit := do
+  let net ← Sim.Net.new
+  let tc ← TestClock.new
+  let (rm, _) ← (Limits.manager { streamsPerConnection := 1 } : BaseIO _)
+  let (a, _) ← mkHost net 23 tc
+  let (b, _) ← mkHost net 24 tc (resources := rm)
+  let addrA ← listenOn a "/memory/191"
+  discard <| b.dial (← withPeer addrA a.localPeer)
+  match ← b.newStream a.localPeer [echoId] with
+  | .error e => r.check s!"host limits: the first stream opens ({e})" false
+  | .ok (_, s1) =>
+    r.check "host limits: a second stream is refused while the first is open"
+      ((← b.newStream a.localPeer [echoId]) matches .error (.gated .resources))
+    s1.reset
+    r.check "host limits: a stream opens again once the first is gone"
+      (← echoOnce b a.localPeer "after")
+  b.close
+  a.close
+  tc.close
+
+/-- The liveness probe (root §9, delta 2): a probe that answers `false`
+ends the peer's session at the next round on the test clock. -/
+private def probeChecks (r : Runner) : Async Unit := do
+  let net ← Sim.Net.new
+  let tc ← TestClock.new
+  let probe : Probe := { intervalMs := 1000, timeoutMs := 500, run := fun _ => pure false }
+  let (a, _) ← mkHost net 25 tc
+  let (b, _) ← mkHost net 26 tc (probe := some probe)
+  let seenB ← (recordEvents b : BaseIO _)
+  let addrA ← listenOn a "/memory/192"
+  discard <| b.dial (← withPeer addrA a.localPeer)
+  discard <| seenB.recv
+  r.check "host probe: the probe starts" (← b.startProbe)
+  -- The probe loop arms its interval timer; advance past it.
+  discard tc.nextTimer
+  tc.advance 1000
+  match ← seenB.recv with
+  | some (.disconnected p _) => r.check "host probe: a failed probe ends the session" (p == a.localPeer)
+  | _ => r.check "host probe: a failed probe ends the session" false
+  b.close
+  a.close
+  tc.close
+
 /-- The leftover hand-over on a served stream (§4.7, §5.6). A peer
 writes its stream header, its proposal, and data in one write. The
 handler gets the data in its first read. The peer runs the plain
@@ -885,10 +982,12 @@ def Host.run (r : Runner) : IO Unit := do
   (livenessChecks r).run
   (handlerChecks r).run
   (peerstoreChecks r).run
+  limitsChecks r
   errorChecks r
   for (label, act) in [("pipeline", pipelineChecks r), ("answers", answerChecks r),
       ("policy", policyChecks r), ("silent peer", silentPeerChecks r),
       ("shutdown", shutdownChecks r), ("events", eventChecks r),
+      ("limits", limitedHostChecks r), ("probe", probeChecks r),
       ("hand-over", handOverChecks r),
       ("mplex", mplexChecks r), ("secured", securedChecks r),
       ("secured policy", securedPolicyChecks r),
