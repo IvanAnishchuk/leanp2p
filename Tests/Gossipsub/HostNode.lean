@@ -210,13 +210,14 @@ def runPartial (r : Runner) : IO Unit := Async.run do
   -- and every partial message it hands to the application.
   let firsts : Chan Bool ← Chan.new 4
   let seenFrom ← OnceRef.new ([] : List Peer)
+  let extCount ← OnceRef.new 0
   let onRpc (q : Peer) (bytes : List Nat) : BaseIO Unit := do
+    let ext := match Pb.decodeMessage? (α := Rpc.RPC) bytes with
+      | .ok (rpc, _) => (rpc.control.bind (·.extensions)).isSome
+      | .error _ => false
+    if ext then extCount.update (· + 1)
     let first ← seenFrom.updateGet fun l => (!l.contains q, if l.contains q then l else q :: l)
-    if first then
-      let ext := match Pb.decodeMessage? (α := Rpc.RPC) bytes with
-        | .ok (rpc, _) => (rpc.control.bind (·.extensions)).isSome
-        | .error _ => false
-      discard (firsts.trySend ext)
+    if first then discard (firsts.trySend ext)
   let partials : Chan (Peer × Rpc.PartialMessage) ← Chan.new 4
   let server ← (Node.start (HostSeam.ofHost p.server)
     { clock := p.clock.clock, params, onRpc,
@@ -256,6 +257,9 @@ def runPartial (r : Runner) : IO Unit := Async.run do
     (got == some (p.client.localPeer, pm))
   r.check "partial: the application's judgment is accepted"
     (← (server.judgePartial p.client.localPeer topic true : BaseIO Bool))
+  -- Many RPCs crossed by now: subscriptions, grafts, the partial message.
+  r.check "partial: the client sent the Extensions message once"
+    ((← (extCount.get : BaseIO Nat)) == 1)
   client.stop
   server.stop
   r.check "partial: the pair closes with no fault" (← p.close).isNone

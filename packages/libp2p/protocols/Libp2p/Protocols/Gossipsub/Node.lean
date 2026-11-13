@@ -304,10 +304,6 @@ structure Outbound where
   queue : Conc.Chan ByteArray
   /-- Stop resets this stream to wake a parked write. -/
   stream : Conc.OnceRef (Option Streams.Stream)
-  /-- No frame entered the queue yet. The first one carries our
-  Extensions message, since each writer opens its own stream
-  (`gossipsub-v1.3.md`: "the first message on the stream"). -/
-  fresh : Conc.OnceRef Bool
 
 /-- Close a queue and reset its stream to wake its writer. -/
 private def endOutbound (ob : Outbound) : Conc.Async Unit := do
@@ -497,6 +493,12 @@ private structure Env where
   /-- The payloads of the `ByteArray` path, by id, with the time each
   was stored. -/
   payloads : Conc.OnceRef (Std.HashMap MessageId (ByteArray × Millis))
+  /-- The peers that got our Extensions message since they joined. The
+  message goes once per peer, in the first frame we send it
+  (`gossipsub-v1.3.md`); a writer that reopens its stream sends none,
+  as rust-libp2p sends it once per peer (`behaviour.rs`,
+  `handle_established_*_connection`). `removePeer` clears the entry. -/
+  extSent : Conc.OnceRef (List Peer)
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
@@ -524,16 +526,15 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
     | some (_, ob) => pure ob
     | none => do
       let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
-      let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none,
-                             fresh := ← Conc.OnceRef.new true }
+      let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none }
       env.outbound.update (fun table => (peer, ob) :: table)
       let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
         env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
       env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record peer ob)
       pure ob
-  -- The first frame of a stream carries the Extensions message. A v1.1
-  -- or v1.2 peer skips field 6 as an unknown field.
-  let first ← ob.fresh.updateGet fun f => (f, false)
+  -- The first frame to a peer carries the Extensions message. A v1.1 or
+  -- v1.2 peer skips field 6 as an unknown field.
+  let first ← env.extSent.updateGet fun l => (!l.contains peer, if l.contains peer then l else peer :: l)
   let rpc := match first, Core.ownExtensions env.config.params with
     | true, some ext =>
       let c := rpc.control.getD { ihave := [], iwant := [], graft := [], prune := [] }
@@ -552,8 +553,7 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
     else pure ((Rpc.encodeFrame? rpc env.config.maxRpcSize).map Bytes.ofNatList)
   let some frame := frame? | do
     -- The frame is dropped; the next one takes the Extensions message.
-    -- The loop is the only task that touches `fresh`.
-    if first then ob.fresh.update fun _ => true
+    if first then env.extSent.update (·.filter (· != peer))
     return false
   if ← env.closing.get then
     ob.queue.close
@@ -571,6 +571,9 @@ private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := d
 
 /-- Retire a peer writer after its disconnect event. -/
 private def removePeer (env : Env) (peer : Peer) : BaseIO Unit := do
+  -- A rejoin starts a new record at the peer's core, so it takes a new
+  -- Extensions message.
+  env.extSent.update (·.filter (· != peer))
   let removed ← env.outbound.updateGet fun table =>
     (table.filter (fun e => e.1 == peer), table.filter (fun e => e.1 != peer))
   for (_, ob) in removed do
@@ -851,10 +854,11 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let closing ← Conc.OnceRef.new false
   let drops ← Conc.OnceRef.new 0
   let unsupported ← Conc.OnceRef.new ([] : List Peer)
+  let extSent ← Conc.OnceRef.new ([] : List Peer)
   tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
   let env : Env :=
     { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
-      versions, payloads }
+      versions, payloads, extSent }
   tasks.spawn <| loop env
     { router := { initialState config.params now with explicit := config.explicitPeers }
       pending := []
