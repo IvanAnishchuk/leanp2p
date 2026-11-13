@@ -466,8 +466,8 @@ private structure Env where
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
-private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := do
-  if ← env.closing.get then return ()
+private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Bool := do
+  if ← env.closing.get then return true
   -- IDONTWANT goes to a v1.2 peer only (`gossipsub-v1.2.md`); for any
   -- other peer, and before the version is known, the control drops it.
   let v12 := ((← env.versions.get).lookup peer) == some Constants.meshsubV12Id
@@ -482,7 +482,7 @@ private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := 
        | none => true) &&
       !(match rpc0.control with | some c => c.idontwant.isEmpty | none => true) then
     -- Only an IDONTWANT, and the peer cannot take it.
-    return ()
+    return true
   (env.config.onSend peer rpc : BaseIO Unit)
   -- On the payload path the published messages carry handles, and the
   -- frame takes the stored payloads back (`Payload.joinOutbound`).
@@ -494,7 +494,7 @@ private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := 
         some (Bytes.ofNatList (Streams.Framing.encodeLength .uvarint body.size) ++ body)
         else none)
     else pure ((Rpc.encodeFrame? rpc env.config.maxRpcSize).map Bytes.ofNatList)
-  let some frame := frame? | return ()
+  let some frame := frame? | return false
   let table ← env.outbound.get
   let ob ← match table.find? (fun e => e.1 == peer) with
     | some (_, ob) => pure ob
@@ -508,8 +508,17 @@ private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := 
       pure ob
   if ← env.closing.get then
     ob.queue.close
-    return ()
+    return true
   if !(← ob.queue.trySend frame) then env.drops.update (· + 1)
+  return true
+
+/-- Encode and offer one RPC to a peer's queue (`enqueueFrame`). The
+core sends at most one message per RPC (`forwardPubs`, `handleIwant`,
+`publishLocal`), so an RPC over the cap holds one message too large on
+its own: it is dropped and counted in `Node.dropped`, never lost
+unseen. -/
+private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := do
+  if !(← enqueueFrame env peer rpc) then env.drops.update (· + 1)
 
 /-- Retire a peer writer after its disconnect event. -/
 private def removePeer (env : Env) (peer : Peer) : BaseIO Unit := do

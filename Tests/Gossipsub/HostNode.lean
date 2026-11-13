@@ -138,6 +138,30 @@ def run (r : Runner) : IO Unit := Async.run do
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (payload)" (← p.close).isNone
+  -- A message over the RPC cap (spike P7): counted in `dropped`, not lost
+  -- unseen. The client's cap is 64 bytes; the server subscribes, so the
+  -- client's publish goes to it through the fanout.
+  do
+    let p ← hostPair
+    let server ← (Node.start (HostSeam.ofHost p.server) { clock := p.clock.clock } :
+      BaseIO Node.Node)
+    let client ← (Node.start (HostSeam.ofHost p.client)
+      { clock := p.clock.clock, maxRpcSize := 64 } : BaseIO Node.Node)
+    let topic : TopicId := ⟨"blocks"⟩
+    discard (server.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+    discard <| waitPeers p.clock client (·.contains p.serverPeer) 4
+    -- The server's subscription reaches the client on the server's stream.
+    discard <| waitStats p.clock server (·.v12Peers == 1) 4
+    let mut counted := false
+    for _ in [0:4] do
+      discard (client.publish topic ⟨Array.replicate 200 7⟩ : BaseIO Bool)
+      if ← waitStats p.clock client (·.dropped ≥ 1) 1 then
+        counted := true
+        break
+    r.check "hosts: an RPC over the cap is counted in dropped" counted
+    client.stop
+    server.stop
+    r.check "hosts: the pair closes with no fault (over cap)" (← p.close).isNone
   -- An explicit peer (spike P9): the client keeps the server, and dials it
   -- back at its next check after the session ends.
   do
