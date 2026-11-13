@@ -1,6 +1,7 @@
 import Tests.Support
 import Tests.Gossipsub.Identity
 import Libp2p.Protocols.Gossipsub.Core
+import Libp2p.Protocols.Gossipsub.Payload
 
 /-!
 # Gossipsub: one block-sized message through the core
@@ -61,6 +62,47 @@ def run (r : Runner) : IO Unit := do
     let t3 ← IO.monoMsNow
     IO.println s!"bigmsg: re-encoded the forwards, {out} bytes, in {t3 - t2} ms"
     r.check "bigmsg: the message is forwarded to the other mesh peer" (0 < out)
+
+/-- The same 10 MiB message on the `ByteArray` payload path
+(`LEANP2P_SUITE=bigmsgB`): the raw RPC splits into a small RPC and the
+payload, the core steps on the small one, and the forward joins the
+payload back. Compare the peak with `run`'s. -/
+def runB (r : Runner) : IO Unit := do
+  r.section "gossipsub big message, ByteArray path" "(spike F3: a measurement)"
+  let size := Constants.maxPayloadSize
+  let payload : ByteArray := ⟨(Array.range size).map (·.toUInt8)⟩
+  let idOf (_ : String) (d : ByteArray) : MessageId := ⟨(d.extract 0 20).toList.map (·.toNat)⟩
+  -- The raw RPC, built by hand around the payload as a peer would send it.
+  let header : Message :=
+    { «from» := none, data := none, seqno := none, topic := ta, signature := none, key := none }
+  let inner := Bytes.ofNatList (Pb.encodeMessage header)
+  let raw := Payload.lenField Payload.rpcPublish (inner ++ Payload.lenField Payload.msgData payload)
+  let t0 ← IO.monoMsNow
+  let some (small, ps) := Payload.splitInbound raw idOf
+    | r.check "bigmsgB: the RPC splits" false
+  let t1 ← IO.monoMsNow
+  IO.println s!"bigmsgB: split {raw.size} bytes into {small.size} and {ps.length} payload in {t1 - t0} ms"
+  let pa := Tests.Gossipsub.Identity.peer 1
+  let pb := Tests.Gossipsub.Identity.peer 2
+  let hp : Params := { params with msgId := fun m => ⟨m.data.getD []⟩ }
+  let s : State :=
+    { peers := [(pa, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }),
+        (pb, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] })]
+      mesh := [(ta, [pa, pb])], fanout := []
+      mcache := Cache.MessageIndex.empty hp.window
+      seen := Cache.SeenIndex.empty hp.seen
+      backoff := [], iwant := [], topics := [ta], now := 0, lastHeartbeat := 0 }
+  match step hp s (.rpc pa (Bytes.toNatList small)) with
+  | .error e => r.check s!"bigmsgB: the step decodes ({repr e})" false
+  | .ok (_, acts) =>
+    let t2 ← IO.monoMsNow
+    IO.println s!"bigmsgB: step in {t2 - t1} ms, {acts.length} actions"
+    let lookup (h : MessageId) : Option ByteArray := (ps.find? (·.1 == h)).map (·.2)
+    let out := acts.foldl (fun n a => match a with
+      | .sendRpc _ rpc => n + (Payload.joinOutbound rpc lookup).size | _ => n) 0
+    let t3 ← IO.monoMsNow
+    IO.println s!"bigmsgB: joined the forwards, {out} bytes, in {t3 - t2} ms"
+    r.check "bigmsgB: the forward carries the whole payload" (out ≥ size)
 
 /-- A 20-byte id from a number, as the consensus id is 20 bytes. -/
 private def idOf (n : Nat) : MessageId :=

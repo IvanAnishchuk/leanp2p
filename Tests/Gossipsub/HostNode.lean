@@ -98,6 +98,46 @@ def run (r : Runner) : IO Unit := Async.run do
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (meshsub)" (← p.close).isNone
+  -- The ByteArray payload path (spike F3): a 2 MiB message crosses two
+  -- nodes, and the receiver's validation sees the bytes intact.
+  do
+    let p ← hostPair
+    let idOf (topic : String) (d : ByteArray) : MessageId :=
+      ⟨topic.length :: d.size % 256 :: d.size / 256 % 256 :: d.size / 65536 % 256 ::
+        (d.extract 0 8).toList.map (·.toNat)⟩
+    let held : Chan (MessageId × Peer) ← Chan.new 4
+    let cap := Libp2p.Protocols.Constants.gossipMaxMessageSize
+    let base : Node.Config :=
+      { clock := p.clock.clock, payloadId := some idOf, maxRpcSize := cap
+        params := { Core.defaults with validateMessages := true } }
+    let server ← (Node.start (HostSeam.ofHost p.server)
+      { base with onValidate := fun _ id src => discard (held.trySend (id, src)) } : BaseIO Node.Node)
+    let client ← (Node.start (HostSeam.ofHost p.client) base : BaseIO Node.Node)
+    let topic : TopicId := ⟨"blocks"⟩
+    discard (server.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+    discard (client.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+    -- Wait for the mesh: the client grafts the server at a heartbeat.
+    discard <| waitStats p.clock client (fun s => s.mesh.any (·.2 == 1)) 5
+    let payload : ByteArray := ⟨(Array.range (2 * 2 ^ 20)).map (·.toUInt8)⟩
+    r.check "payload path: publish takes 2 MiB" (← (client.publish topic payload : BaseIO Bool))
+    let mut got : Option (MessageId × Peer) := none
+    for i in [0:80] do
+      if let some h ← (held.tryRecv : BaseIO _) then
+        got := some h
+        break
+      nap
+      if i % 10 == 9 then p.clock.advance 1000
+    match got with
+    | some (id, src) =>
+      r.check "payload path: the receiver holds it from the client" (src == p.client.localPeer)
+      r.check "payload path: the receiver's bytes equal the sent bytes"
+        ((← (server.payload id : BaseIO _)).map (·.toList) == some payload.toList)
+      r.check "payload path: the handle is the id function's"
+        (id == idOf topic.name payload)
+    | none => r.check "payload path: the receiver holds the message" false
+    client.stop
+    server.stop
+    r.check "hosts: the pair closes with no fault (payload)" (← p.close).isNone
   -- An explicit peer (spike P9): the client keeps the server, and dials it
   -- back at its next check after the session ends.
   do

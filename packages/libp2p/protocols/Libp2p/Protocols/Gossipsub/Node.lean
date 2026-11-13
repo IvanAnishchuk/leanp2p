@@ -6,6 +6,7 @@ import Libp2p.Core
 import Libp2p.Protocols.StreamError
 import Libp2p.Protocols.Gossipsub.HostSeam
 import Libp2p.Protocols.Gossipsub.Core
+import Libp2p.Protocols.Gossipsub.Payload
 
 /-!
 # Gossipsub node: the loop over the router core
@@ -158,6 +159,15 @@ structure Config where
   explicitPeers : List Peer := []
   /-- "The recommended period for connectivity checks is 5 minutes." -/
   explicitCheckMs : Millis := 300000
+  /-- The `ByteArray` payload path (`Gossipsub.Payload`): the message id
+  of a payload on a topic. When set, the node keeps every payload as a
+  `ByteArray` and the core sees only its id, so a block-sized message
+  never becomes a `List Nat`. The node then sets `params.msgId` to read
+  the handle, and checks `params.maxDataSize` itself: an RPC with an
+  oversize payload is dropped whole, with no P₄ penalty. `onValidate`
+  gets the message with its handle in `data`; `Node.payload` reads the
+  bytes. -/
+  payloadId : Option (String → ByteArray → MessageId) := none
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
 Lighthouse's `lighthouse_network` metrics are off in the shadow node
@@ -218,6 +228,10 @@ structure Node where
   /-- A snapshot of the router (`Stats`). `none` when the node stopped
   or its queue is full. -/
   stats : Conc.Async (Option Stats)
+  /-- The payload of a message id on the `ByteArray` path
+  (`Config.payloadId`); `none` off that path, or once it expired with
+  the message cache. -/
+  payload : MessageId → BaseIO (Option ByteArray)
   /-- Close the event queue and join the loop task. The loop serves the
   queued events first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
@@ -313,7 +327,8 @@ before emptyWithCapacity allocates the body. This is the pinned Lean name
 for the capacity constructor. Each copySlice writes only the next slice at
 cursor, without retaining an earlier body value. EOF between frames is clean.
 The repeat loop uses constant stack space for any number of chunks or frames. -/
-private def readFrames (events : Conc.Chan Input) (cap : Nat) (peer : Peer)
+private def readFrames (events : Conc.Chan Input) (cap : Nat)
+    (split : ByteArray → BaseIO (Option ByteArray)) (peer : Peer)
     (stream : Streams.Stream) : Conc.Async (Except Libp2p.Core.Error Unit) := do
   let mut header := ByteArray.emptyWithCapacity Varint.maxBytes
   let mut body := ByteArray.empty
@@ -324,9 +339,12 @@ private def readFrames (events : Conc.Chan Input) (cap : Nat) (peer : Peer)
   repeat
     if let some size := expected then
       if cursor = size then
-        -- Park: the loop frees a slot, or stop closes the event queue.
-        if let .error _ ← events.send (.event (.rpc peer (Bytes.toNatList body))) then
-          return .ok ()
+        -- On the payload path the core gets the RPC with handles; an
+        -- RPC the split refuses is dropped.
+        if let some small ← (split body : BaseIO (Option ByteArray)) then
+          -- Park: the loop frees a slot, or stop closes the event queue.
+          if let .error _ ← events.send (.event (.rpc peer (Bytes.toNatList small))) then
+            return .ok ()
         body := ByteArray.empty
         expected := none
         cursor := 0
@@ -370,7 +388,8 @@ both directions. A clean EOF closes our write direction. The host owns and
 joins this handler task. -/
 def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
     (id : Libp2p.Core.ProtocolId := Constants.meshsubId)
-    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit := fun _ _ => pure ()) :
+    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit := fun _ _ => pure ())
+    (split : ByteArray → BaseIO (Option ByteArray) := fun b => pure (some b)) :
     Libp2p.Core.StreamHandler where
   id := id
   handle ctx stream := ExceptT.mk do
@@ -381,7 +400,7 @@ def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
     if let .error _ ← events.send (.event (.peerJoined peer .meshsub)) then
       stream.close
       return .ok ()
-    let answer ← readFrames events cap peer stream
+    let answer ← readFrames events cap split peer stream
     match answer with
     | .ok () => stream.close
     | .error _ => stream.reset
@@ -441,6 +460,9 @@ private structure Env where
   /-- The meshsub version each peer negotiated, from our writer's open
   or from the handler that served its stream. -/
   versions : Conc.OnceRef (List (Peer × Libp2p.Core.ProtocolId))
+  /-- The payloads of the `ByteArray` path, by id, with the time each
+  was stored. -/
+  payloads : Conc.OnceRef (Std.HashMap MessageId (ByteArray × Millis))
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
@@ -462,7 +484,17 @@ private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := 
     -- Only an IDONTWANT, and the peer cannot take it.
     return ()
   (env.config.onSend peer rpc : BaseIO Unit)
-  let some frame := Rpc.encodeFrame? rpc env.config.maxRpcSize | return ()
+  -- On the payload path the published messages carry handles, and the
+  -- frame takes the stored payloads back (`Payload.joinOutbound`).
+  let frame? : Option ByteArray ←
+    if env.config.payloadId.isSome && !rpc.publish.isEmpty then do
+      let store ← env.payloads.get
+      let body := Payload.joinOutbound rpc (fun h => (store.get? h).map (·.1))
+      pure (if body.size ≤ env.config.maxRpcSize then
+        some (Bytes.ofNatList (Streams.Framing.encodeLength .uvarint body.size) ++ body)
+        else none)
+    else pure ((Rpc.encodeFrame? rpc env.config.maxRpcSize).map Bytes.ofNatList)
+  let some frame := frame? | return ()
   let table ← env.outbound.get
   let ob ← match table.find? (fun e => e.1 == peer) with
     | some (_, ob) => pure ob
@@ -477,7 +509,7 @@ private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := 
   if ← env.closing.get then
     ob.queue.close
     return ()
-  if !(← ob.queue.trySend (Bytes.ofNatList frame)) then env.drops.update (· + 1)
+  if !(← ob.queue.trySend frame) then env.drops.update (· + 1)
 
 /-- Retire a peer writer after its disconnect event. -/
 private def removePeer (env : Env) (peer : Peer) : BaseIO Unit := do
@@ -643,6 +675,11 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
   let st := { st with pending := later }
   if st.nextTick ≤ now then
     let st ← reconcile env st
+    -- A stored payload lives one heartbeat past the message cache's
+    -- window, so an IWANT answer and a held message still find it.
+    if env.config.payloadId.isSome then
+      let ttl := (st.params.window.historyLength + 1) * st.params.heartbeatInterval
+      env.payloads.update fun m => m.filter fun _ (_, t) => now < t + ttl
     let st ← if st.nextExplicitCheck ≤ now then do
         dialExplicit env
         pure { st with nextExplicitCheck := now + env.config.explicitCheckMs }
@@ -708,15 +745,40 @@ queue holds 64 events. A full queue parks an inbound handler, which carries
 the back-pressure to the peer, and it refuses a `BaseIO` post of the
 application. -/
 def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
+  -- On the payload path a message's `data` is its handle, the id bytes,
+  -- so the core's id function reads it back.
+  let config := if config.payloadId.isSome then
+      { config with params := { config.params with msgId := fun m => ⟨m.data.getD []⟩ } }
+    else config
   let now ← config.clock.nowMs
   let subs : Conc.OnceRef Subscriptions ← Conc.OnceRef.new { next := 0, entries := [] }
   let events : Conc.Chan Input ← Conc.Chan.new 64
   let versions ← Conc.OnceRef.new ([] : List (Peer × Libp2p.Core.ProtocolId))
   let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
     versions.update fun l => (q, id) :: l.filter (·.1 != q)
+  let payloads ← Conc.OnceRef.new ({} : Std.HashMap MessageId (ByteArray × Millis))
+  let over (d : ByteArray) : Bool :=
+    match config.params.maxDataSize with
+    | some cap => decide (cap < d.size)
+    | none => false
+  -- The inbound split of the payload path (`Payload.splitInbound`). An RPC
+  -- that does not split goes to the core as it came, and the core's
+  -- decoder reports it. An RPC with an oversize payload is dropped.
+  let split : ByteArray → BaseIO (Option ByteArray) := fun body => do
+    match config.payloadId with
+    | none => return some body
+    | some idOf =>
+      match Payload.splitInbound body idOf with
+      | none => return some body
+      | some (small, ps) =>
+        if ps.any (fun (_, d) => over d) then return none
+        let t ← config.clock.nowMs
+        payloads.update fun m =>
+          ps.foldl (fun m (id, d) => if m.contains id then m else m.insert id (d, t)) m
+        return some small
   -- Both versions are served; the handler's id tells the peer's choice.
-  host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record)
-  host.setHandler (handler events config.maxRpcSize Constants.meshsubId record)
+  host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record split)
+  host.setHandler (handler events config.maxRpcSize Constants.meshsubId record split)
   let tasks ← Conc.TaskSet.new
   let alarm ← Conc.Alarm.new
   let outbound ← Conc.OnceRef.new ([] : List (Peer × Outbound))
@@ -727,7 +789,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
   let env : Env :=
     { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
-      versions }
+      versions, payloads }
   tasks.spawn <| loop env
     { router := { initialState config.params now with explicit := config.explicitPeers }
       pending := []
@@ -759,9 +821,20 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     -- "MUST NOT emit" a message over the cap (phase0 "Maximum message
     -- sizes"): an oversize payload is refused here.
     publish := fun topic payload =>
-      if Core.sizeOk config.params (messageOf topic payload) then
-        post (.publish (messageOf topic payload))
-      else pure false
+      match config.payloadId with
+      | some idOf =>
+        -- The payload path: store the bytes, publish the handle.
+        if over payload then pure false
+        else do
+          let id := idOf topic.name payload
+          let t ← config.clock.nowMs
+          payloads.update (·.insert id (payload, t))
+          post (.publish { messageOf topic .empty with data := some id.bytes })
+      | none =>
+        if Core.sizeOk config.params (messageOf topic payload) then
+          post (.publish (messageOf topic payload))
+        else pure false
+    payload := fun id => do return ((← payloads.get).get? id).map (·.1)
     subscribe := fun topic callback => do
       if ← closing.get then return false
       let id ← subs.updateGet fun s =>
