@@ -52,8 +52,82 @@ private def pingOf (pt : ByteArray) : Option (UInt8 × List Nat × Nat) :=
   | .ok (t, [.bytes rid, .bytes seq]) => some (t, rid, Libp2p.Identity.Rlp.beNat seq)
   | _ => none
 
+/-! ## Two cores, in memory -/
+
+/-- Deterministic "random" bytes for event `n`: a counter pattern, long
+enough for `randLen`. The ephemeral key slice (bytes 44 to 75) is a
+valid secp256k1 scalar for every `n` used here. -/
+private def randFor (n : Nat) : ByteArray :=
+  ⟨(Array.range randLen).map fun i => ((i * 7 + n * 13 + 1) % 251 + 1).toUInt8⟩
+
+/-- Deliver every send among the two cores until none is left, and
+collect the responses each one reports. `fuel` bounds the rounds. -/
+private def settle (a b : State) (epA epB : Endpoint) (acts : List (Bool × Action)) (fuel : Nat)
+    (n : Nat) : State × State × List (Bool × Message) := Id.run do
+  let mut a := a
+  let mut b := b
+  let mut queue := acts
+  let mut got : List (Bool × Message) := []
+  let mut k := n
+  for _ in [0:fuel] do
+    match queue with
+    | [] => break
+    | (fromA, act) :: rest =>
+      queue := rest
+      match act with
+      | .response _ m => got := got ++ [(fromA, m)]
+      | .send _ bytes =>
+        k := k + 1
+        if fromA then
+          let (b', out) := Core.step b (.packet epA bytes (randFor k))
+          b := b'
+          queue := queue ++ out.map (false, ·)
+        else
+          let (a', out) := Core.step a (.packet epB bytes (randFor k))
+          a := a'
+          queue := queue ++ out.map (true, ·)
+  return (a, b, got)
+
+private def memoryChecks (r : Runner) : IO Unit := do
+  let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "discv5 memory: key A" false
+  let some kb := key32 nodeBKey | r.check "discv5 memory: key B" false
+  let epA : Endpoint := { ip := [127, 0, 0, 1], port := 9001 }
+  let epB : Endpoint := { ip := [127, 0, 0, 1], port := 9002 }
+  let pairs (ep : Endpoint) : List Libp2p.Identity.Enr.Pair :=
+    [⟨.ip, .bytes ep.ip⟩, ⟨.udp, .bytes (Libp2p.Identity.Rlp.ofScalar ep.port)⟩]
+  match Libp2p.Identity.Enr.sign ka 1 (pairs epA), Libp2p.Identity.Enr.sign kb 1 (pairs epB) with
+  | .ok ea, .ok eb =>
+    let a0 := Core.init ka ea
+    let b0 := Core.init kb eb
+    -- The first PING has no session: B answers WHOAREYOU, A sends the
+    -- handshake, and B's PONG comes back in the new session.
+    let (a1, out) := Core.step a0 (.request eb epB (.ping [1] 1) (randFor 0))
+    let (a2, b2, got) := settle a1 b0 epA epB (out.map (true, ·)) 20 0
+    r.check "discv5 memory: the first PING runs the handshake and gets its PONG"
+      (got.any fun (toA, m) => toA && match m with
+        | .pong [1] 1 ip port => ip == [127, 0, 0, 1] && port == 9001
+        | _ => false)
+    r.check "discv5 memory: both sides hold a session"
+      ((a2.sessions.get? (idNat eb.nodeId)).isSome && (b2.sessions.get? (idNat ea.nodeId)).isSome)
+    r.check "discv5 memory: B learned A's record from the handshake"
+      (b2.table.entries.any (·.id == ea.nodeId))
+    r.check "discv5 memory: A recorded B's view of its endpoint" (a2.votes.contains epA)
+    -- A second request goes straight through the session: one packet
+    -- each way.
+    let (a3, out) := Core.step a2 (.request eb epB (.findNode [2] [0]) (randFor 100))
+    r.check "discv5 memory: a session request is one packet" (out.length == 1)
+    let (a4, _, got) := settle a3 b2 epA epB (out.map (true, ·)) 20 100
+    r.check "discv5 memory: FINDNODE at distance 0 returns B's record"
+      (got.any fun (toA, m) => toA && match m with
+        | .nodes [2] 1 [e] => e.nodeId == eb.nodeId
+        | _ => false)
+    r.check "discv5 memory: A's table holds B after NODES" (a4.table.entries.any (·.id == eb.nodeId))
+  | _, _ => r.check "discv5 memory: the records sign" false
+
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
+  memoryChecks r
   -- ECDH.
   match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
   | none => r.check "discv5: the ECDH key builds" false
