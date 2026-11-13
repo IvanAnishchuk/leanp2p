@@ -500,9 +500,10 @@ private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
   z.stop
   (x.addEnr ey : BaseIO Unit)
   (x.addEnr ez : BaseIO Unit)
-  -- Z's check times out after one second; give it three.
+  -- Z's check times out after one second, and once more on the retry;
+  -- give it six.
   let mut dropped := false
-  for _ in [0:60] do
+  for _ in [0:120] do
     Conc.select #[← (Conc.Park.sleep 50 () : BaseIO (Conc.Park Unit))]
     let known ← (x.known : BaseIO (List Libp2p.Identity.Enr))
     if !known.any (·.nodeId == ez.nodeId) then

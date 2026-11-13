@@ -171,7 +171,7 @@ def votes (n : Node) : BaseIO (List Endpoint) := do
 
 /-- Send `m` (its request id is set here) to `e`, and collect responses
 until `done` holds or `timeoutMs` passes. -/
-private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat)
+private def askOnce (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat)
     (done : List Message → Bool) : Async (List Message) := do
   let some ep := endpointOf? e | return []
   let num ← (n.nextId.updateGet fun i => (i, i + 1) : BaseIO Nat)
@@ -194,6 +194,22 @@ private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat
   -- The core keeps the request until its answer ends; past the deadline
   -- the shell ends it here.
   n.feed fun _ => .forget rid
+  return got
+
+/-- The resends of a request that got no answer: Lighthouse's
+`request_retries(1)`. A UDP datagram can be lost; one loss should not
+fail a liveness check. -/
+def requestRetries : Nat := 1
+
+/-- Send a request and collect its answers (`askOnce`); with no answer
+at all, send it again under a fresh request id, up to `requestRetries`
+times. -/
+private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat)
+    (done : List Message → Bool) : Async (List Message) := do
+  let mut got ← n.askOnce e m timeoutMs done
+  for _ in [0:requestRetries] do
+    if !got.isEmpty || (← (n.stopping.isClosed : BaseIO Bool)) then break
+    got ← n.askOnce e m timeoutMs done
   return got
 
 /-- PING a node; its PONG, if one came within `timeoutMs`. -/
