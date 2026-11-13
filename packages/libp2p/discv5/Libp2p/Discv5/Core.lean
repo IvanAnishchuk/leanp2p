@@ -49,6 +49,11 @@ structure Session where
   readKey : Crypto.Key16
   writeKey : Crypto.Key16
   endpoint : Endpoint
+  /-- The messages sent under `writeKey`: the first 32 bits of each
+  nonce, so no nonce repeats under one key. -/
+  count : Nat := 0
+  /-- The core's tick at the last use, for the LRU bound. -/
+  used : Nat := 0
 
 /-- A request we sent, by the nonce of its packet, so a WHOAREYOU can
 answer it with a handshake. -/
@@ -66,6 +71,8 @@ structure Challenge where
   challengeData : ByteArray
   endpoint : Endpoint
   packet : ByteArray
+  /-- The core's tick when it was sent, for the bound. -/
+  at_ : Nat := 0
 
 /-- A request awaiting its answer, by request id. Only an answer from
 the node we asked, for a request we sent, counts: an unsolicited NODES
@@ -85,6 +92,8 @@ structure State where
   sent : Std.HashMap (List UInt8) Sent := {}
   challenges : Std.HashMap Nat Challenge := {}
   pending : Std.HashMap (List Nat) Pending := {}
+  /-- The steps taken so far: the core's clock for the LRU bounds. -/
+  tick : Nat := 0
   table : Table
   /-- The `recipient-ip`/`port` each PONG reported, newest first, one
   per voter by node id: the votes for our external endpoint
@@ -122,6 +131,37 @@ private def slice (b : ByteArray) (from_ len : Nat) : ByteArray := b.extract fro
 
 private def nonceKey (n : ByteArray) : List UInt8 := n.toList
 
+/-- The sessions the core keeps; past it, the least recently used goes
+(discv5-theory.md, "Session Cache": "a limited number of sessions in an
+in-memory LRU cache"). -/
+def maxSessions : Nat := 1000
+
+/-- The challenges the core keeps; past it, the oldest goes. The spec
+keeps a challenge "for a short duration"; a bound keeps spoofed packets
+from growing the map. -/
+def maxChallenges : Nat := 1000
+
+/-- The key of the least recent entry of a map, by `age`. -/
+private def oldestKey {α : Type} (m : Std.HashMap Nat α) (age : α → Nat) : Option Nat :=
+  (m.fold (fun best k v => match best with
+    | some (_, a) => if age v < a then some (k, age v) else best
+    | none => some (k, age v)) none).map (·.1)
+
+/-- Store a session, used now, within `maxSessions`. -/
+def putSession (s : State) (id : ByteArray) (ses : Session) : State :=
+  let m := s.sessions.insert (idNat id) { ses with used := s.tick }
+  let m := if m.size > maxSessions then
+      match oldestKey m (·.used) with
+      | some k => m.erase k
+      | none => m
+    else m
+  { s with sessions := m }
+
+/-- The nonce of message `count` of a session: the count in the first 32
+bits, then 64 random bits (discv5-theory.md, "Session Cache"). -/
+private def counterNonce (count : Nat) (rand8 : ByteArray) : ByteArray :=
+  ByteArray.mk ((List.range 4).reverse.map fun i => (count / 256 ^ i % 256).toUInt8).toArray ++ rand8
+
 /-- Seal `m` in an ordinary message packet for `destId` under `key`. -/
 private def messagePacket (localId destId : ByteArray) (key : Crypto.Key16) (iv nonce : ByteArray)
     (m : Message) : Option ByteArray := do
@@ -135,8 +175,7 @@ message packet with random content, which draws the WHOAREYOU of step 2
 private def sendTo (s : State) (destId destPub : ByteArray) (ep : Endpoint) (m : Message)
     (rand : ByteArray) : State × List Action :=
   let iv := slice rand 0 16
-  let nonce := slice rand 16 12
-  let remember (s : State) : State :=
+  let remember (s : State) (nonce : ByteArray) : State :=
     if m.isRequest then
       { s with
         sent := s.sent.insert (nonceKey nonce) { destId, destPub, endpoint := ep, message := m }
@@ -146,15 +185,19 @@ private def sendTo (s : State) (destId destPub : ByteArray) (ep : Endpoint) (m :
   -- new handshake.
   match (s.sessions.get? (idNat destId)).filter (·.endpoint == ep) with
   | some ses =>
+    let nonce := counterNonce ses.count (slice rand 16 8)
     match messagePacket s.localId destId ses.writeKey iv nonce m with
-    | some p => (remember s, [.send ep p])
+    | some p =>
+      let s := putSession s destId { ses with count := ses.count + 1 }
+      (remember s nonce, [.send ep p])
     | none => (s, [])
   | none =>
+    let nonce := slice rand 16 12
     let h : Header := { flag := .message, nonce, authdata := s.localId }
     -- Random bytes in place of a sealed message: the recipient cannot
     -- open it, and answers WHOAREYOU.
     match mask destId iv h (slice rand 44 20) with
-    | .ok p => (remember s, [.send ep p])
+    | .ok p => (remember s nonce, [.send ep p])
     | .error _ => (s, [])
 
 /-- The NODES answers to FINDNODE: our record for distance 0, the table's
@@ -231,9 +274,10 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
     | none => (s, [])
     | some ses =>
       let packets := (List.range ms.length).zip ms |>.filterMap fun (i, r) =>
-        -- Each answer takes its own nonce from the random bytes.
-        let nonce := ByteArray.mk ((slice rand 16 12).toList.toArray.set! 11 (UInt8.ofNat i))
+        -- Each answer takes the next count of the session.
+        let nonce := counterNonce (ses.count + i) (slice rand 16 8)
         messagePacket s.localId srcId ses.writeKey (slice rand 0 16) nonce r
+      let s := putSession s srcId { ses with count := ses.count + ms.length }
       (s, packets.map (Action.send ses.endpoint))
   match m with
   | .ping rid _ => reply s [.pong rid s.localEnr.seq src.ip src.port]
@@ -241,9 +285,11 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
   | .talkReq rid _ _ => reply s [.talkResp rid []]
   | .pong rid _ ip port =>
     if !solicited s srcId rid then (s, []) else
-    let s := finish s rid
+    -- The node answered our PING: it is live, so FINDNODE may relay it.
+    let s := { finish s rid with table := s.table.markLive srcId }
     let voter := idNat srcId
-    let votes := ((voter, { ip, port }) :: s.votes.filter (·.1 != voter)).take maxVotes
+    let vote : Endpoint := { ip, port }
+    let votes := ((voter, vote) :: s.votes.filter (·.1 != voter)).take maxVotes
     (refreshRecord { s with votes }, [.response srcId m])
   | .nodes rid total rs =>
     match s.pending.get? rid with
@@ -283,8 +329,14 @@ private def challenge (s : State) (srcId : ByteArray) (src : Endpoint) (nonce ra
   let iv := slice rand 0 16
   match mask srcId iv h .empty with
   | .ok p =>
-    let ch : Challenge := { challengeData := iv ++ h.encode, endpoint := src, packet := p }
-    ({ s with challenges := s.challenges.insert (idNat srcId) ch }, [.send src p])
+    let ch : Challenge := { challengeData := iv ++ h.encode, endpoint := src, packet := p, at_ := s.tick }
+    let m := s.challenges.insert (idNat srcId) ch
+    let m := if m.size > maxChallenges then
+        match oldestKey m (·.at_) with
+        | some k => m.erase k
+        | none => m
+      else m
+    ({ s with challenges := m }, [.send src p])
   | .error _ => (s, [])
 
 /-- Answer a WHOAREYOU with a handshake packet that carries the request
@@ -307,10 +359,11 @@ private def onWhoareyou (s : State) (u : Unmasked) (rand : ByteArray) : State ×
       let h : Header := { flag := .handshake, nonce, authdata }
       let ct ← (sealMessage keys.initiator iv h p.message.encode).toOption
       let pkt ← (mask p.destId iv h ct).toOption
-      let s := { s with
-        sessions := s.sessions.insert (idNat p.destId)
-          { readKey := keys.recipient, writeKey := keys.initiator, endpoint := p.endpoint }
-        sent := (s.sent.erase (nonceKey u.header.nonce)).insert (nonceKey nonce) p }
+      -- The handshake packet is message 0 under the new write key, so
+      -- the counter starts at 1.
+      let s := putSession s p.destId
+        { readKey := keys.recipient, writeKey := keys.initiator, endpoint := p.endpoint, count := 1 }
+      let s := { s with sent := (s.sent.erase (nonceKey u.header.nonce)).insert (nonceKey nonce) p }
       return (s, [.send p.endpoint pkt])
     result.getD (s, [])
 
@@ -339,16 +392,16 @@ private def onHandshake (s : State) (src : Endpoint) (u : Unmasked) (rand : Byte
     let keys ← (deriveKeys s.key ephPub ch.challengeData srcId s.localId).toOption
     let pt ← (openMessage keys.initiator u).toOption
     let m ← Message.decode? pt
+    let s := putSession s srcId
+      { readKey := keys.initiator, writeKey := keys.recipient, endpoint := src }
     let s := { s with
-      sessions := s.sessions.insert (idNat srcId)
-        { readKey := keys.initiator, writeKey := keys.recipient, endpoint := src }
       challenges := s.challenges.erase (idNat srcId)
       table := s.table.insert { id := srcId, record } }
     return onMessage s srcId src m rand
   result.getD (s, [])
 
-/-- One step of the core. -/
-def step (s : State) : Event → State × List Action
+/-- One step of the core, at the current tick. -/
+private def stepAt (s : State) : Event → State × List Action
   | .request dest ep m rand =>
     sendTo s dest.nodeId (ofNatList dest.publicKey) ep m rand
   | .packet src bytes rand =>
@@ -369,12 +422,21 @@ def step (s : State) : Event → State × List Action
         | some pt =>
           -- A message that opens but does not decode, such as a request
           -- id over 8 bytes, is dropped with no answer.
+          -- The session was used now.
+          let s := match s.sessions.get? (idNat srcId) with
+            | some ses => putSession s srcId ses
+            | none => s
           match Message.decode? pt with
           | some m => onMessage s srcId src m rand
           | none => (s, [])
       | .whoareyou => onWhoareyou s u rand
       | .handshake => onHandshake s src u rand
   | .forget rid => (finish s rid, [])
+
+/-- One step of the core. Each step advances the tick that orders the
+LRU bounds. -/
+def step (s : State) (e : Event) : State × List Action :=
+  stepAt { s with tick := s.tick + 1 } e
 
 end Core
 

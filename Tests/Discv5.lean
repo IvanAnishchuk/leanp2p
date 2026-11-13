@@ -189,6 +189,10 @@ private def gethChecks (r : Runner) : IO Unit := do
     let (a3, out) := Core.step a2 (.request eb epB (.ping [2] 1) (randFor 300))
     match onlySend out with
     | some p =>
+      -- The handshake packet was message 0 of A's write key, so this
+      -- one carries count 1 in its first 32 bits.
+      r.check "session nonces carry the message count"
+        ((nonceFor eb.nodeId p).map (·.take 4) == some [0, 0, 0, 1])
       let (_, bOut) := Core.step b2 (.packet epA2 p (randFor 301))
       r.check "geth PingMultiIP: a session packet from another IP draws WHOAREYOU, not PONG"
         (match sendsOf bOut with
@@ -295,6 +299,34 @@ private def gethChecks (r : Runner) : IO Unit := do
             | .response _ (.nodes [9] _ []) => true
             | _ => false)
     | none => r.check "NODES at a wrong distance: B sends one packet" false
+    -- FINDNODE relays only live nodes: C, known to B but never pinged,
+    -- stays out of the answer until it is marked live.
+    let dC := logDistance ec.nodeId eb.nodeId
+    let bKnows : State := { b2 with table := b2.table.insert { id := ec.nodeId, record := ec } }
+    let askC (b : State) (rid : List Nat) (n : Nat) : Bool := Id.run do
+      let (a', out) := Core.step a2 (.request eb epB (.findNode rid [dC]) (randFor n))
+      let (_, _, got) := settle a' b epA epB (out.map (true, ·)) 20 n
+      return got.any fun (toA, m) => toA && match m with
+        | .nodes _ _ rs => rs.any (·.nodeId == ec.nodeId)
+        | _ => false
+    r.check "FINDNODE does not relay a node not yet live" (!askC bKnows [10] 390)
+    r.check "FINDNODE relays a live node"
+      (askC { bKnows with table := bKnows.table.markLive ec.nodeId } [11] 395)
+
+    -- The session cache is bounded: past `maxSessions`, the least
+    -- recently used session goes.
+    match Crypto.Key16.ofByteArray? (ByteArray.mk (Array.replicate 16 0)) with
+    | some k =>
+      let idOf (i : Nat) : ByteArray :=
+        ByteArray.mk ((List.range 32).map fun j => if j = 31 then (i % 256).toUInt8 else if j = 30 then (i / 256).toUInt8 else 1).toArray
+      let ses : Session := { readKey := k, writeKey := k, endpoint := epA }
+      let full := (List.range (Core.maxSessions + 1)).foldl
+        (fun (s : State) i => Core.putSession { s with tick := i } (idOf i) ses) b0
+      r.check "the session cache stays at maxSessions"
+        (full.sessions.size == Core.maxSessions)
+      r.check "the least recently used session went first"
+        (!(full.sessions.contains (idNat (idOf 0))) && full.sessions.contains (idNat (idOf Core.maxSessions)))
+    | none => r.check "a 16-byte key" false
   | _, _, _ => r.check "geth: the records sign" false
 
 /-! ## Three nodes over UDP on the loopback -/
@@ -325,10 +357,15 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
   | some (.pong _ _ ip port) =>
     r.check "discv5 udp: A's PING to B gets a PONG naming A's endpoint" (ip == lo && port == a.port)
   | _ => r.check "discv5 udp: A's PING to B gets a PONG" false
-  -- A FINDNODE at C's distance from B returns C's record.
+  -- B relays only nodes it has seen answer: before B pings C, a FINDNODE
+  -- at C's distance returns nothing; after, it returns C.
   let d := logDistance eb.nodeId ec.nodeId
+  let before ← a.findNode eb [d]
+  r.check "discv5 udp: B does not relay C before C answers a PING"
+    (!before.any (·.nodeId == ec.nodeId))
+  discard <| b.ping ec
   let found ← a.findNode eb [d]
-  r.check "discv5 udp: FINDNODE through B returns C" (found.any (·.nodeId == ec.nodeId))
+  r.check "discv5 udp: FINDNODE through B returns C once C is live" (found.any (·.nodeId == ec.nodeId))
   -- The client's interface: a lookup that keeps the records with the
   -- `eth2` pair finds C, which A never booted from.
   let peers ← a.findPeers (fun e => (e.get? eth2Key).isSome) 4
@@ -403,6 +440,18 @@ private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
   r.check "liveness: a node that does not answer leaves the table" dropped
   r.check "liveness: a node that answers stays"
     ((← (x.known : BaseIO (List Libp2p.Identity.Enr))).any (·.nodeId == ey.nodeId))
+  -- Y re-signs its record, as a client does when its subnets change; X's
+  -- next check sees the higher seq in the PONG and pulls the record.
+  r.check "liveness: Y re-signs its record"
+    (← (y.updateEnr [⟨eth2Key, .bytes [9, 9, 9, 9]⟩] : BaseIO Bool))
+  let mut pulled := false
+  for _ in [0:60] do
+    Conc.select #[← (Conc.Park.sleep 50 () : BaseIO (Conc.Park Unit))]
+    let known ← (x.known : BaseIO (List Libp2p.Identity.Enr))
+    if known.any (fun e => e.nodeId == ey.nodeId && e.seq == ey.seq + 1) then
+      pulled := true
+      break
+  r.check "liveness: a PONG with a higher seq pulls the new record" pulled
   x.stop
   y.stop
 

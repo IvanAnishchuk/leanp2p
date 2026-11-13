@@ -102,6 +102,18 @@ def stop (n : Node) : Async Unit := do
 def localEnr (n : Node) : BaseIO Enr := do
   return (← n.core.get).localEnr
 
+/-- Re-sign the local record under the next `seq`, with `pairs` in place
+of the pairs of the same keys: a consensus client does this when its
+`eth2`, `attnets`, or `syncnets` change. `false` when the record does not
+sign, and the record stays. Peers pull the new record at their next
+liveness check. -/
+def updateEnr (n : Node) (pairs : List Enr.Pair) : BaseIO Bool :=
+  n.core.updateGet fun s =>
+    let keep := s.localEnr.pairs.filter fun p => !pairs.any (·.key == p.key)
+    match Enr.sign s.key (s.localEnr.seq + 1) (pairs ++ keep) with
+    | .ok r => (true, { s with localEnr := r })
+    | .error _ => (false, s)
+
 /-- Add a record to the table, as a boot record is. -/
 def addEnr (n : Node) (e : Enr) : BaseIO Unit :=
   n.core.update fun s => { s with table := s.table.insert { id := e.nodeId, record := e } }
@@ -156,6 +168,10 @@ def findNode (n : Node) (e : Enr) (distances : List Nat) (timeoutMs : Nat := 200
     match total ms with | some t => ms.length ≥ t | none => false
   return ms.flatMap fun m => match m with | .nodes _ _ rs => rs | _ => []
 
+/-- α, the FINDNODE requests a lookup runs at once (discv5-theory.md,
+"Lookup": "typically 3"). -/
+def alpha : Nat := 3
+
 /-- Walk toward `target`: the `k` closest records found
 (discv5-theory.md, "Lookup"). -/
 def lookup (n : Node) (target : ByteArray) (k : Nat := bucketSize) (rounds : Nat := 8) :
@@ -166,17 +182,27 @@ def lookup (n : Node) (target : ByteArray) (k : Nat := bucketSize) (rounds : Nat
   let mut seen : List Enr := (s.table.closest target k).map (·.record)
   let mut queried : List ByteArray := []
   for _ in [0:rounds * k] do
+    -- `stop` ends a lookup between rounds.
+    if ← (n.stopping.isClosed : BaseIO Bool) then break
     let sorted := seen.mergeSort fun a b => dist a ≤ dist b
-    let closest := sorted.take k
-    let some next := closest.find? (fun e => !queried.contains e.nodeId) | break
-    queried := next.nodeId :: queried
-    let d := logDistance next.nodeId target
-    let ds := ([d, d + 1, d - 1].filter fun x => 1 ≤ x && x ≤ 256).eraseDups
-    let found ← n.findNode next (if ds.isEmpty then [256] else ds)
-    for e in found do
-      if e.nodeId != self && !seen.any (·.nodeId == e.nodeId) then
-        seen := e :: seen
-        n.addEnr e
+    let batch := ((sorted.take k).filter fun e => !queried.contains e.nodeId).take alpha
+    if batch.isEmpty then break
+    queried := batch.map (·.nodeId) ++ queried
+    -- Up to `alpha` FINDNODEs at once, each on a task of a set this
+    -- round joins.
+    let results : Chan (List Enr) ← Chan.new alpha
+    let ts ← TaskSet.new
+    for next in batch do
+      let d := logDistance next.nodeId target
+      let ds := ([d, d + 1, d - 1].filter fun x => 1 ≤ x && x ≤ 256).eraseDups
+      ts.spawn do discard <| results.send (← n.findNode next (if ds.isEmpty then [256] else ds))
+    ts.joinAll
+    for _ in batch do
+      if let some found ← (results.tryRecv : BaseIO (Option (List Enr))) then
+        for e in found do
+          if e.nodeId != self && !seen.any (·.nodeId == e.nodeId) then
+            seen := e :: seen
+            n.addEnr e
   return (seen.mergeSort fun a b => dist a ≤ dist b).take k
 
 /-- The client's interface: up to `count` records a lookup toward a
@@ -187,6 +213,9 @@ def findPeers (n : Node) (pred : Enr → Bool) (count : Nat) : Async (List Enr) 
   let known ← (n.known : BaseIO (List Enr))
   let all := found ++ known.filter fun e => !found.any (·.nodeId == e.nodeId)
   return (all.filter pred).take count
+
+/-- The liveness rounds between two refresh lookups. -/
+def refreshEvery : Nat := 30
 
 /-- One liveness check: PING the table entry checked longest ago. A node
 that does not answer leaves the table, and the newest replacement of its
@@ -203,18 +232,31 @@ private def revalidateOnce (n : Node) : Async Unit := do
   let some (e, _) := s.table.entries.foldl pick none | return
   let now ← (IO.monoMsNow : IO Nat)
   (n.checked.update (·.insert (idNat e.id) now) : BaseIO Unit)
-  if (← n.ping e.record 1000).isNone then
+  match ← n.ping e.record 1000 with
+  | none =>
     (n.core.update fun s => { s with table := s.table.remove e.id } : BaseIO Unit)
     (n.checked.update (·.erase (idNat e.id)) : BaseIO Unit)
+  | some (.pong _ seq _ _) =>
+    -- "When the PONG response indicates that a new version of the node
+    -- record is available, the liveness check should pull the new record"
+    -- (discv5-theory.md, "Table Maintenance In Practice").
+    if e.record.seq < seq then
+      for r in ← n.findNode e.record [0] 1000 do
+        if r.nodeId == e.id then (n.addEnr r : BaseIO Unit)
+  | some _ => pure ()
 
-/-- The revalidation task (discv5-theory.md, "Table Maintenance"): one
-check every `revalidateMs`. Park: the timer wakes it, and so does `stop`,
-which closes `stopping`. `partial`, as the IO loops are. -/
-private partial def revalidator (n : Node) : Async Unit := do
+/-- The maintenance task (discv5-theory.md, "Table Maintenance In
+Practice"): one liveness check every `revalidateMs`, and every
+`refreshEvery` rounds a lookup toward a random target, which refreshes
+the table. Park: the timer wakes it, and so does `stop`, which closes
+`stopping`. `partial`, as the IO loops are. -/
+private partial def revalidator (n : Node) (round : Nat := 0) : Async Unit := do
   let timer ← (Park.sleep n.revalidateMs false : BaseIO (Park Bool))
   if ← select #[Park.recv n.stopping (fun _ => true), timer] then return
   n.revalidateOnce
-  n.revalidator
+  if (round + 1) % refreshEvery == 0 then
+    discard <| n.lookup (← (random 32 : IO ByteArray))
+  n.revalidator (round + 1)
 
 /-- Start a node with `key`, bound to `ip`:`port` (0 for the system's
 pick). Its record is signed after the bind, so `udp` names the real

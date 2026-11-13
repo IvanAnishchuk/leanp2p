@@ -34,10 +34,14 @@ def idNat (id : ByteArray) : Nat := id.foldl (fun n b => n * 256 + b.toNat) 0
 def logDistance (a b : ByteArray) : Nat :=
   (Nat.xor (idNat a) (idNat b)).log2 + (if idNat a == idNat b then 0 else 1)
 
-/-- One table entry: the node id and its newest record. -/
+/-- One table entry: the node id, its newest record, and whether it has
+ever answered our PING. FINDNODE relays only live entries
+(discv5-theory.md, "Table Maintenance In Practice": "implementations must
+avoid relaying any nodes whose liveness has not been verified"). -/
 structure Entry where
   id : ByteArray
   record : Enr
+  live : Bool := false
 
 /-- The table. -/
 structure Table where
@@ -64,9 +68,10 @@ def insert (t : Table) (e : Entry) : Table :=
   | none => t
   | some i =>
     let b := t.buckets[i]!
-    if b.any (·.id == e.id) then
-      let old := (b.find? (·.id == e.id)).map (·.record.seq) |>.getD 0
-      let e := if e.record.seq ≥ old then e else (b.find? (·.id == e.id)).getD e
+    if let some prev := b.find? (·.id == e.id) then
+      -- The newer record wins; a node once live stays live.
+      let rec_ := if e.record.seq ≥ prev.record.seq then e.record else prev.record
+      let e : Entry := { e with record := rec_, live := e.live || prev.live }
       { t with buckets := t.buckets.set! i (e :: b.filter (·.id != e.id)) }
     else if b.length < bucketSize then
       { t with buckets := t.buckets.set! i (e :: b) }
@@ -85,10 +90,17 @@ def remove (t : Table) (id : ByteArray) : Table :=
     | r :: rs => { t with buckets := t.buckets.set! i (b ++ [r]), replacements := t.replacements.set! i rs }
     | [] => { t with buckets := t.buckets.set! i b }
 
-/-- The records at log distance `d` from us; `d = 0` is ours, which the
-caller adds. -/
+/-- Mark a node live: it answered our PING. A node not in a bucket is
+left as it is. -/
+def markLive (t : Table) (id : ByteArray) : Table :=
+  match t.bucketOf id with
+  | none => t
+  | some i => { t with buckets := t.buckets.modify i (·.map fun e => if e.id == id then { e with live := true } else e) }
+
+/-- The live records at log distance `d` from us; `d = 0` is ours, which
+the caller adds. -/
 def atDistance (t : Table) (d : Nat) : List Enr :=
-  if d = 0 || d > 256 then [] else (t.buckets[d - 1]!).map (·.record)
+  if d = 0 || d > 256 then [] else ((t.buckets[d - 1]!).filter (·.live)).map (·.record)
 
 /-- Every entry. -/
 def entries (t : Table) : List Entry := t.buckets.toList.flatten
