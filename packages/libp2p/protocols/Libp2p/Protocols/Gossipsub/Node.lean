@@ -238,13 +238,20 @@ closes the stream at the end. A failed open or write retires only this writer
 entry and closes its queue. The core peer stays connected. Stop resets an
 installed stream; a late open checks closing too. -/
 private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
-    (outbound : Conc.OnceRef (List (Peer × Outbound))) (peer : Peer) (ob : Outbound) : Conc.Async Unit := do
+    (outbound : Conc.OnceRef (List (Peer × Outbound))) (unsupported : Conc.OnceRef (List Peer))
+    (peer : Peer) (ob : Outbound) : Conc.Async Unit := do
   let fail : Conc.Async Unit := do
     (ob.queue.close : BaseIO Unit)
     (outbound.update (fun table => table.filter (fun e => e.2.id != ob.id)) : BaseIO Unit)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
     match ← host.newStream peer [Constants.meshsubId] with
+    | .error (.protocol _) =>
+      -- The peer speaks no meshsub: the next reconcile drops it from the
+      -- router, as go-libp2p-pubsub drops a peer whose stream fails to
+      -- negotiate.
+      (unsupported.update fun l => if l.contains peer then l else peer :: l : BaseIO Unit)
+      fail
     | .error _ => fail
     | .ok (_, stream) =>
       (ob.stream.set (some stream) : BaseIO Unit)
@@ -385,6 +392,9 @@ private structure Env where
   closing : Conc.OnceRef Bool
   /-- Frames refused by a full or closed outbound queue. -/
   drops : Conc.OnceRef Nat
+  /-- The peers whose meshsub negotiation failed; cleared by their next
+  `connected`. -/
+  unsupported : Conc.OnceRef (List Peer)
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
@@ -399,7 +409,7 @@ private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := d
       let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
       let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none }
       env.outbound.update (fun table => (peer, ob) :: table)
-      env.tasks.spawn (writer env.host env.closing env.outbound peer ob)
+      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported peer ob)
       pure ob
   if ← env.closing.get then
     ob.queue.close
@@ -529,6 +539,22 @@ private def stepAndAct (env : Env) (st : LoopState) (event : Core.Event) : BaseI
 private def dueOf (st : LoopState) : Millis :=
   st.pending.foldl (fun due p => Nat.min due p.due) st.nextTick
 
+/-- Bring the router's peers in line with the host's live peers, less
+the peers that speak no meshsub. A `peerJoined` or `peerLeft` lost to a
+full queue, or to the race at start, heals here. -/
+private def reconcile (env : Env) (st : LoopState) : BaseIO LoopState := do
+  let some livePeers := env.host.peers | return st
+  let live ← livePeers
+  let unsup ← env.unsupported.get
+  let known := st.router.peers.map (·.1)  let mut st := st
+  for q in known do
+    if !live.contains q || unsup.contains q then
+      st ← stepAndAct env st (.peerLeft q)
+  for q in live do
+    if !known.contains q && !unsup.contains q then
+      st ← stepAndAct env st (.peerJoined q .meshsub)
+  return st
+
 /-- Send due gossip before the heartbeat shifts the message cache. -/
 private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopState := do
   let (due, later) := st.pending.partition (fun p => decide (p.due ≤ now))
@@ -536,6 +562,7 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
     enqueue env p.peer p.rpc
   let st := { st with pending := later }
   if st.nextTick ≤ now then
+    let st ← reconcile env st
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
@@ -603,8 +630,11 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let nextOutbound ← Conc.OnceRef.new 0
   let closing ← Conc.OnceRef.new false
   let drops ← Conc.OnceRef.new 0
+  let unsupported ← Conc.OnceRef.new ([] : List Peer)
   tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
-  tasks.spawn <| loop { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops }
+  let env : Env :=
+    { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported }
+  tasks.spawn <| loop env
     { router := initialState config.params now
       pending := []
       nextTick := now + config.params.heartbeatInterval
@@ -621,13 +651,16 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   host.addNotifiee fun
     | .connected peer session _ _ => do
       current.update fun t => (peer, session) :: t.filter (·.1 != peer)
+      -- A new session may speak meshsub where the last did not.
+      unsupported.update (·.filter (· != peer))
       discard <| post (.peerJoined peer .meshsub)
     | .disconnected peer session => do
       let mine ← current.updateGet fun t =>
         if t.any (· == (peer, session)) then (true, t.filter (·.1 != peer)) else (false, t)
       if mine then discard <| post (.peerLeft peer)
-  for peer in ← host.peers do
-    discard <| post (.peerJoined peer .meshsub)
+  if let some livePeers := host.peers then
+    for peer in ← livePeers do
+      discard <| post (.peerJoined peer .meshsub)
   return {
     -- "MUST NOT emit" a message over the cap (phase0 "Maximum message
     -- sizes"): an oversize payload is refused here.

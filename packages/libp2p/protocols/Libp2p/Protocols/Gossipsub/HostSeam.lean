@@ -17,9 +17,12 @@ structure HostSeam where
   the router as `peerJoined` and `peerLeft`. The default registers
   nothing, for a seam whose test drives the joins itself. -/
   addNotifiee : (Libp2p.Host.ConnEvent → BaseIO Unit) → BaseIO Unit := fun _ => pure ()
-  /-- The peers connected now. The node reads them after it registers
-  its notifiee, so a peer connected before the start joins too. -/
-  peers : BaseIO (List Libp2p.Identity.PeerId) := pure []
+  /-- The peers connected now, when the seam knows them. The node joins
+them at start, and before each heartbeat it reconciles the router with
+  them: a join or leave lost to a full queue, or to the start's race,
+  heals within one heartbeat. `none` for a seam whose test drives the
+  joins itself. -/
+  peers : Option (BaseIO (List Libp2p.Identity.PeerId)) := none
 
 /-- Adapt a host to the node operations. -/
 def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
@@ -30,6 +33,6 @@ def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
     | .error (.stream e) => return .error e
     | .error e => return .error (.protocol e.render)
   addNotifiee := host.addNotifiee
-  peers := host.peers
+  peers := some host.peers
 
 end Libp2p.Protocols.Gossipsub
