@@ -128,15 +128,6 @@ private def subAll? {α : Type} [Pb.ProtoMessage α] (num : Nat) (fs : Pb.Fields
     Except Pb.Error (List α) :=
   decodeAll? (allBytesOf num fs.entries)
 
-/-- An optional nested field of the v1.3 extensions, read as the last of
-its occurrences. It goes through the repeated reader, so every copy must
-decode, and a copy of another wire type is skipped. The singular reader
-`subField?` is stricter on both; this one keeps the table law a short
-proof over the list lemmas. -/
-private def optSub? {α : Type} [Pb.ProtoMessage α] (num : Nat) (fs : Pb.Fields) :
-    Except Pb.Error (Option α) := do
-  return (← subAll? (α := α) num fs).getLast?
-
 /-- The wire view of a value, checked. Fail closed: a list whose entries
 do not fit the wire model gives the empty field table. -/
 private def fieldsOf? (es : List Pb.Entry) : Pb.Fields :=
@@ -200,6 +191,45 @@ private theorem decodeAll?Encode {α : Type} [Pb.ProtoMessage α] (l : List α)
       have hl : ∀ b ∈ l, Pb.decodeMessage? (α := α) (Pb.encodeMessage b) = .ok (b, []) :=
         fun b hb => h b (by simp [hb])
       simp [decodeAll?, ha, ih hl, Bind.bind, Except.bind]
+
+/-- The singular reader finds a nested value encoded as the last entry.
+`ofF` is the value's own table, and its law gives the value back. -/
+private theorem subFieldLast {α : Type} [Pb.ProtoMessage α] (k : Nat) (es : List Pb.Entry)
+    (x : α) (hv : ∀ e ∈ es ++ [(k, Pb.Value.bytes (Pb.encodeMessage x))], e.Valid)
+    (ofF : Pb.Fields → Except Pb.Error α) (hof : ofF (Pb.ProtoMessage.toFields x) = .ok x) :
+    subField? k ⟨es ++ [(k, Pb.Value.bytes (Pb.encodeMessage x))], hv⟩ ofF = .ok (some x) := by
+  have hhas : Pb.hasField k ⟨es ++ [(k, Pb.Value.bytes (Pb.encodeMessage x))], hv⟩ = true := by
+    simp [Pb.hasField]
+  have hsub : Pb.getSub? k ⟨es ++ [(k, Pb.Value.bytes (Pb.encodeMessage x))], hv⟩ =
+      .ok (some (Pb.ProtoMessage.toFields x)) := by
+    simp only [Pb.getSub?, Pb.getBytes?, Pb.lookupLastAppend]
+    simp [Pb.encodeMessage, Pb.decodeEncode, Bind.bind, Except.bind]
+  simp [subField?, hhas, hsub, hof, Bind.bind, Except.bind]
+
+/-- A last entry of another field number does not change the singular
+reader's answer. -/
+private theorem subFieldSkip {α : Type} (k n : Nat) (h : k ≠ n) (v : Pb.Value)
+    (es : List Pb.Entry) (hv : ∀ e ∈ es ++ [(n, v)], e.Valid) (hv' : ∀ e ∈ es, e.Valid)
+    (ofF : Pb.Fields → Except Pb.Error α) :
+    subField? k ⟨es ++ [(n, v)], hv⟩ ofF = subField? k ⟨es, hv'⟩ ofF := by
+  have hb : (k == n) = false := by simpa using h
+  have hn : (n == k) = false := by simp [Ne.symm h]
+  have hlast : Pb.lookupLast k (es ++ [(n, v)]) = Pb.lookupLast k es := by
+    simp [Pb.lookupLast, List.reverse_append, List.lookup, hb]
+  have hany : ((es ++ [(n, v)]).any fun e => e.fst == k) = (es.any fun e => e.fst == k) := by
+    rw [List.any_append]
+    simp [hn]
+  simp only [subField?, Pb.hasField, Pb.getSub?, Pb.getBytes?, hlast, hany]
+  rfl
+
+/-- The singular reader answers `none` when no entry has the field number. -/
+private theorem subFieldAbsent {α : Type} (k : Nat) (es : List Pb.Entry)
+    (hv : ∀ e ∈ es, e.Valid) (h : ∀ e ∈ es, e.1 ≠ k) (ofF : Pb.Fields → Except Pb.Error α) :
+    subField? k ⟨es, hv⟩ ofF = .ok none := by
+  have hhas : Pb.hasField k ⟨es, hv⟩ = false := by
+    simp only [Pb.hasField, List.any_eq_false, beq_iff_eq]
+    exact h
+  simp [subField?, hhas]
 
 /-- A `MessageId` is its payload, so a list of ids survives the wrapper. -/
 private theorem mapMessageIdMk (l : List MessageId) :
@@ -824,14 +854,14 @@ def toFields (c : ControlMessage) : Pb.Fields :=
   fieldsOf? c.entries
 
 /-- The field table. Each of the five lists decodes as nested messages,
-and the extensions as the last copy of field 6. -/
+and the extensions as one singular nested message. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error ControlMessage := do
   let ihave ← subAll? (α := ControlIHave) 1 fs
   let iwant ← subAll? (α := ControlIWant) 2 fs
   let graft ← subAll? (α := ControlGraft) 3 fs
   let prune ← subAll? (α := ControlPrune) 4 fs
   let idontwant ← subAll? (α := ControlIWant) 5 fs
-  let extensions ← optSub? (α := ControlExtensions) 6 fs
+  let extensions ← subField? 6 fs ControlExtensions.ofFields?
   .ok { ihave, iwant, graft, prune, idontwant, extensions }
 
 instance : Pb.ProtoMessage ControlMessage where
@@ -851,9 +881,35 @@ theorem ofFieldsToFields (c : ControlMessage) (h : Valid c) :
   have h3 := decodeAll?Encode gr (fun x hx => ControlGraft.decodeEncode x (hg x hx))
   have h4 := decodeAll?Encode pr (fun x hx => ControlPrune.decodeEncode x (hr x hx))
   have h5 := decodeAll?Encode dw (fun x hx => ControlIWant.decodeEncode x (hd x hx))
-  have h6 := decodeAll?Encode ex.toList (fun x h => ControlExtensions.decodeEncode x (hx x h))
-  cases ex <;> simp_all [ofFields?, subAll?, optSub?, entries, allBytesOfAppend,
-    allBytesOfMapBytes, allBytesOf, Bind.bind, Except.bind, pure, Except.pure]
+  cases ex with
+  | none =>
+      simp_all [ofFields?, subAll?, subField?, entries, allBytesOfAppend,
+        allBytesOfMapBytes, Pb.hasField, Bind.bind, Except.bind]
+  | some x =>
+      have hof : ControlExtensions.ofFields? x.toFields = .ok x :=
+        ControlExtensions.ofFieldsToFields x (hx x (by simp))
+      -- The five lists, then the extensions as the last entry.
+      have hent : entries ⟨ih, iw, gr, pr, dw, some x⟩ =
+          (ih.map (fun y => (1, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            iw.map (fun y => (2, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            gr.map (fun y => (3, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            pr.map (fun y => (4, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            dw.map (fun y => (5, Pb.Value.bytes (Pb.encodeMessage y)))) ++
+            [(6, Pb.Value.bytes (Pb.encodeMessage x))] := by
+        simp [entries]
+      have he₂ : ∀ e : Pb.Entry, e ∈ (ih.map (fun y => (1, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            iw.map (fun y => (2, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            gr.map (fun y => (3, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            pr.map (fun y => (4, Pb.Value.bytes (Pb.encodeMessage y))) ++
+            dw.map (fun y => (5, Pb.Value.bytes (Pb.encodeMessage y)))) ++
+            [(6, Pb.Value.bytes (Pb.encodeMessage x))] → e.Valid :=
+        fun e hm => he' e (hent ▸ hm)
+      simp only [hent]
+      rw [show (⟨_, _⟩ : Pb.Fields) = ⟨_, he₂⟩ from rfl]
+      simp only [ofFields?]
+      rw [subFieldLast 6 _ x he₂ ControlExtensions.ofFields? hof]
+      simp [subAll?, h1, h2, h3, h4, h5, allBytesOfAppend, allBytesOfMapBytes, allBytesOf,
+        Bind.bind, Except.bind]
 
 /-- An encode decodes back to the value. -/
 theorem decodeEncode (c : ControlMessage) (h : Valid c) :
@@ -890,14 +946,12 @@ structure RPC where
 
 namespace RPC
 
-/-- The wire view. Field 10 goes before field 3: protobuf takes fields
-in any order, and the control entry stays last, where the singular
-reader's proof finds it. -/
+/-- The wire view, in field-number order, as go and rust write it. -/
 def entries (r : RPC) : List Pb.Entry :=
   r.subscriptions.map (fun s => (1, Pb.Value.bytes (Pb.encodeMessage s)))
   ++ r.publish.map (fun m => (2, Pb.Value.bytes (Pb.encodeMessage m)))
-  ++ r.partialRpc.toList.map (fun p => (10, Pb.Value.bytes (Pb.encodeMessage p)))
   ++ r.control.toList.map (fun c => (3, Pb.Value.bytes (Pb.encodeMessage c)))
+  ++ r.partialRpc.toList.map (fun p => (10, Pb.Value.bytes (Pb.encodeMessage p)))
 
 def entriesValid (r : RPC) : Prop := ∀ e ∈ r.entries, e.Valid
 
@@ -928,13 +982,13 @@ def toFields (r : RPC) : Pb.Fields :=
   fieldsOf? r.entries
 
 /-- The field table. The subscriptions and the messages decode as nested
-messages, the control field as one nested message, and the partial
-field as the last copy of field 10. -/
+messages, and the control and partial fields as singular nested
+messages. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error RPC := do
   let subscriptions ← subAll? (α := SubOpts) 1 fs
   let publish ← subAll? (α := Message) 2 fs
   let control ← subField? 3 fs ControlMessage.ofFields?
-  let partialRpc ← optSub? (α := PartialMessage) 10 fs
+  let partialRpc ← subField? 10 fs PartialMessage.ofFields?
   .ok { subscriptions, publish, control, partialRpc }
 
 instance : Pb.ProtoMessage RPC where
@@ -951,39 +1005,66 @@ theorem ofFieldsToFields (r : RPC) (h : Valid r) :
   obtain ⟨subs, pubs, ctl, par⟩ := r
   have h1 := decodeAll?Encode subs (fun s hmem => SubOpts.decodeEncode s (hsub s hmem))
   have h2 := decodeAll?Encode pubs (fun m hmem => Message.decodeEncode m (hpub m hmem))
-  have h3 := decodeAll?Encode par.toList (fun p hmem => PartialMessage.decodeEncode p (hpar p hmem))
-  -- The partial entries, as one segment: none holds field 3.
-  let parts := par.toList.map (fun p => (10, Pb.Value.bytes (Pb.encodeMessage p)))
+  -- The two list segments every case starts with.
+  let pre : List Pb.Entry :=
+    subs.map (fun s => (1, Pb.Value.bytes (Pb.encodeMessage s))) ++
+      pubs.map (fun m => (2, Pb.Value.bytes (Pb.encodeMessage m)))
+  have hofp : ∀ p, p ∈ par.toList → PartialMessage.ofFields? p.toFields = .ok p :=
+    fun p hp => PartialMessage.ofFieldsToFields p (hpar p hp)
   cases ctl with
   | none =>
-      cases par <;> simp_all [ofFields?, subAll?, subField?, optSub?, entries, allBytesOfAppend,
-        allBytesOfMapBytes, allBytesOf, Pb.hasField, Bind.bind, Except.bind, pure, Except.pure]
+      cases par with
+      | none =>
+          simp_all [ofFields?, subAll?, subField?, entries, allBytesOfAppend,
+            allBytesOfMapBytes, Pb.hasField, Bind.bind, Except.bind]
+      | some p =>
+          have hent : entries ⟨subs, pubs, none, some p⟩ =
+              pre ++ [(10, Pb.Value.bytes (Pb.encodeMessage p))] := by
+            simp [entries, pre]
+          have he₂ : ∀ e ∈ pre ++ [(10, Pb.Value.bytes (Pb.encodeMessage p))], e.Valid :=
+            fun e hm => he' e (hent ▸ hm)
+          simp only [hent]
+          rw [show (⟨_, _⟩ : Pb.Fields) = ⟨_, he₂⟩ from rfl]
+          simp only [ofFields?]
+          rw [subFieldLast 10 _ p he₂ PartialMessage.ofFields? (hofp p (by simp))]
+          simp [pre, subAll?, subField?, h1, h2, Pb.hasField, allBytesOfAppend,
+            allBytesOfMapBytes, allBytesOf, Bind.bind, Except.bind]
   | some c =>
-      have hcv : c.Valid := hctl
       have h4 : ControlMessage.ofFields? c.toFields = .ok c :=
-        ControlMessage.ofFieldsToFields c hcv
-      have he₂ : ∀ e : Pb.Entry,
-          e ∈ (List.map (fun s => (1, Pb.Value.bytes (Pb.encodeMessage s))) subs ++
-            List.map (fun m => (2, Pb.Value.bytes (Pb.encodeMessage m))) pubs ++ parts) ++
-              [(3, Pb.Value.bytes (Pb.encodeMessage c))] → e.Valid := by
-        intro e hmem
-        exact he' e (by simpa [entries, parts, List.append_assoc] using hmem)
-      have hsub3 : Pb.getSub? 3 ⟨(List.map (fun s => (1, Pb.Value.bytes (Pb.encodeMessage s))) subs ++
-          List.map (fun m => (2, Pb.Value.bytes (Pb.encodeMessage m))) pubs ++ parts) ++
-            [(3, Pb.Value.bytes (Pb.encodeMessage c))], he₂⟩ =
-          .ok (some (ControlMessage.toFields c)) := by
-        simp only [Pb.getSub?, Pb.getBytes?, Pb.lookupLastAppend]
-        simp [Pb.encodeMessage, Pb.decodeEncode, Bind.bind, Except.bind]
-        rfl
-      have hent : RPC.entries ⟨subs, pubs, some c, par⟩ =
-          (List.map (fun s => (1, Pb.Value.bytes (Pb.encodeMessage s))) subs ++
-            List.map (fun m => (2, Pb.Value.bytes (Pb.encodeMessage m))) pubs ++ parts) ++
-              [(3, Pb.Value.bytes (Pb.encodeMessage c))] := by
-        simp [entries, parts, List.append_assoc]
-      simp only [hent]
-      rw [show (⟨_, _⟩ : Pb.Fields) = ⟨_, he₂⟩ from rfl]
-      cases par <;> simp_all [ofFields?, subAll?, subField?, optSub?, parts, allBytesOfAppend,
-        allBytesOfMapBytes, allBytesOf, Pb.hasField, Bind.bind, Except.bind, pure, Except.pure]
+        ControlMessage.ofFieldsToFields c hctl
+      cases par with
+      | none =>
+          have hent : entries ⟨subs, pubs, some c, none⟩ =
+              pre ++ [(3, Pb.Value.bytes (Pb.encodeMessage c))] := by
+            simp [entries, pre]
+          have he₂ : ∀ e ∈ pre ++ [(3, Pb.Value.bytes (Pb.encodeMessage c))], e.Valid :=
+            fun e hm => he' e (hent ▸ hm)
+          simp only [hent]
+          rw [show (⟨_, _⟩ : Pb.Fields) = ⟨_, he₂⟩ from rfl]
+          simp only [ofFields?]
+          rw [subFieldLast 3 _ c he₂ ControlMessage.ofFields? h4]
+          simp [pre, subAll?, subField?, h1, h2, Pb.hasField, allBytesOfAppend,
+            allBytesOfMapBytes, allBytesOf, Bind.bind, Except.bind]
+      | some p =>
+          -- Field 3, then field 10 last: the control reader skips the
+          -- partial entry, and the partial reader finds it.
+          have hent : entries ⟨subs, pubs, some c, some p⟩ =
+              (pre ++ [(3, Pb.Value.bytes (Pb.encodeMessage c))]) ++
+                [(10, Pb.Value.bytes (Pb.encodeMessage p))] := by
+            simp [entries, pre]
+          have he₂ : ∀ e ∈ (pre ++ [(3, Pb.Value.bytes (Pb.encodeMessage c))]) ++
+              [(10, Pb.Value.bytes (Pb.encodeMessage p))], e.Valid :=
+            fun e hm => he' e (hent ▸ hm)
+          have hv' : ∀ e ∈ pre ++ [(3, Pb.Value.bytes (Pb.encodeMessage c))], e.Valid :=
+            fun e hm => he₂ e (List.mem_append_left _ hm)
+          simp only [hent]
+          rw [show (⟨_, _⟩ : Pb.Fields) = ⟨_, he₂⟩ from rfl]
+          simp only [ofFields?]
+          rw [subFieldSkip 3 10 (by decide) _ _ he₂ hv' ControlMessage.ofFields?,
+            subFieldLast 3 _ c hv' ControlMessage.ofFields? h4,
+            subFieldLast 10 _ p he₂ PartialMessage.ofFields? (hofp p (by simp))]
+          simp [pre, subAll?, h1, h2, allBytesOfAppend, allBytesOfMapBytes, allBytesOf,
+            Bind.bind, Except.bind]
 
 /-- An encode decodes back to the value. -/
 theorem decodeEncode (r : RPC) (h : Valid r) :

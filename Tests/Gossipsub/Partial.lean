@@ -175,6 +175,14 @@ def run (r : Runner) : IO Unit := do
     (decodesTo (rpcOf prpc) prpc)
   r.check "wire: the partial RPC is RPC field 10"
     ((rpcOf prpc).head? == some 0x52)
+  -- Field-number order, as go and rust write it: control (3) first.
+  let both : Rpc.RPC := { prpc with control := some ctl }
+  let bothBytes := rpcOf both
+  r.check "wire: control (field 3) comes before partial (field 10)"
+    -- Tag 0x1a, length 4, the four control bytes, then tag 0x52.
+    (bothBytes.head? == some 0x1a && (bothBytes.drop 6).head? == some 0x52)
+  r.check "wire: an RPC with control and partial round trips"
+    (decodesTo bothBytes both)
 
   -- The SubOpts behavior table: the core records each peer's choice.
   let s1 := stateOf (step params start (.rpc pa (rpcOf (subsRpc true false))))
