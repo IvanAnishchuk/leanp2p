@@ -49,7 +49,7 @@ def run (r : Runner) : IO Unit := do
         (pb, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] })]
       mesh := [(ta, [pa, pb])], fanout := []
       mcache := Cache.MessageCache.empty params.window
-      seen := Cache.SeenCache.empty params.seen
+      seen := Cache.SeenIndex.empty params.seen
       backoff := [], iwant := [], topics := [ta], now := 0, lastHeartbeat := 0 }
   match step params s (.rpc pa bytes) with
   | .error e => r.check s!"bigmsg: the step decodes ({repr e})" false
@@ -86,5 +86,20 @@ def scale (r : Runner) (steps : Nat := 500) : IO Unit := do
     let t2 ← IO.monoMsNow
     IO.println s!"scale: {fill} ids filled in {t1 - t0} ms; then {steps} messages in {t2 - t1} ms, {(t2 - t1) * 1000 / steps} us each"
     r.check s!"scale {fill}: no false hit" (hits == 0)
+  -- The production `SeenIndex` at the full capacity the model cannot reach.
+  let p : Cache.SeenParams := { capacity := 65536, ttl := 768000, valid := by decide }
+  let mut c := Cache.SeenIndex.empty p
+  let t0 ← IO.monoMsNow
+  for i in [0:65536] do
+    c := c.add (idOf i) 0
+  let t1 ← IO.monoMsNow
+  let mut hits := 0
+  let n := 20000
+  for i in [0:n] do
+    if c.contains (idOf (100000 + i)) 1 then hits := hits + 1
+    c := c.add (idOf (100000 + i)) 1
+  let t2 ← IO.monoMsNow
+  IO.println s!"scale index: 65536 ids filled in {t1 - t0} ms; then {n} messages in {t2 - t1} ms, {(t2 - t1) * 1000 / n} us each, {c.index.size} held"
+  r.check "scale index: no false hit, capacity held" (hits == 0 && c.index.size == 65536)
 
 end Tests.Gossipsub.BigMessage

@@ -58,9 +58,42 @@ def promiseOf (p : Peer) (i : MessageId) (d : Millis) : IwantPromise :=
 def backoffOf (p : Peer) (t : TopicId) (u : Millis) : BackoffEntry :=
   { peer := p, topic := t, «until» := u }
 
+/-- One pseudo-random step of a linear congruential generator. -/
+private def lcg (x : Nat) : Nat := (x * 6364136223846793005 + 1442695040888963407) % 2 ^ 64
+
+/-- The property pin of `SeenIndex` to the model `SeenCache` (CLAUDE.md,
+"Proofs and tests", rule 2): `rounds` random runs of `ops` operations
+each, with capacity 8, a TTL of 50 ms, ids from 0 to 19, and times
+that step forward by 0 to 9 ms. An operation is an add or a prune, and
+after each one every id must agree on `contains`. -/
+private def seenIndexPin (rounds ops : Nat) : Bool := Id.run do
+  let p : SeenParams := { capacity := 8, ttl := 50, valid := by decide }
+  let mut seed := 7
+  for _ in [0:rounds] do
+    let mut model := SeenCache.empty p
+    let mut index := SeenIndex.empty p
+    let mut now := 0
+    for _ in [0:ops] do
+      seed := lcg seed
+      now := now + (seed / 7) % 10
+      seed := lcg seed
+      let id := mid ((seed / 11) % 20)
+      seed := lcg seed
+      if (seed / 13) % 4 == 0 then
+        model := model.prune now
+        index := index.prune now
+      else
+        model := model.add id now
+        index := index.add id now
+      for k in [0:20] do
+        if model.contains (mid k) now != index.contains (mid k) now then return false
+  return true
+
 /-- Run the checks of this module. -/
 def run (r : Runner) : IO Unit := do
   r.section "gossipsub Cache" "vendor/specs/pubsub"
+  r.check "SeenIndex agrees with SeenCache on contains over random add and prune runs"
+    (seenIndexPin 200 200)
 
   -- Message cache: one message, then shifts.
   let c0 : MessageCache := MessageCache.empty window5

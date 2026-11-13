@@ -405,6 +405,89 @@ theorem prune_removes_expired (c : SeenCache) (now : Millis) :
   simp only [SeenCache.prune, List.mem_filter] at he
   exact of_decide_eq_true he.2
 
+/-! ## The seen index: the production seen cache
+
+`SeenCache` is the model: a list, and the theorems above. Each of its
+operations walks the whole list, so a cache at its capacity costs tens
+of milliseconds per message (spike P8). `SeenIndex` is the structure the
+router runs: a `HashMap` from id to its add time, and a queue of
+`(id, time)` in add order. A re-add leaves its old queue entry behind;
+an entry whose time no longer matches the map is stale, and the front
+of the queue skips it (lazy deletion).
+
+The two agree on `contains` for every sequence of `add` and `prune`
+whose times never go back, which is how the router calls them; the
+property test in `Tests/Gossipsub/Cache.lean` pins it (CLAUDE.md,
+"Proofs and tests", rule 2). With times that go back, a model `prune`
+can drop an entry from the middle, and the index keeps it until it
+reaches the front. -/
+
+/-- The production seen cache. -/
+structure SeenIndex where
+  /-- The bounds, shared with the model. -/
+  params : SeenParams
+  /-- Each live id: its add time, and the number of its queue entry. -/
+  index : Std.HashMap MessageId (Millis × Nat) := {}
+  /-- `(id, number)` in add order, oldest first; stale entries included.
+  The number tells a stale entry: a re-add in the same millisecond
+  leaves two entries with one id and one time. The queue is two lists:
+  `front` oldest first, and `back` newest first. A peek that finds
+  `front` empty moves `back` over once and keeps the result, so each
+  entry is reversed at most once. -/
+  front : List (MessageId × Nat) := []
+  /-- The newer half of the queue, newest first. -/
+  back : List (MessageId × Nat) := []
+  /-- The queue's length, stale entries included: the fuel of a walk. -/
+  len : Nat := 0
+  /-- The next entry number. -/
+  next : Nat := 0
+
+namespace SeenIndex
+
+/-- An empty index. -/
+def empty (p : SeenParams) : SeenIndex := { params := p }
+
+/-- Whether the id is seen at `now`: `SeenCache.contains`. -/
+def contains (c : SeenIndex) (id : MessageId) (now : Millis) : Bool :=
+  match c.index.get? id with
+  | some (t, _) => decide (t + c.params.ttl > now)
+  | none => false
+
+/-- Drop queue entries from the front while `drop` holds for the live
+ones, at their add time, erasing each live one from the map. A stale
+entry always goes. `fuel` bounds the walk by the queue's length. -/
+def popWhile (fuel : Nat) (drop : SeenIndex → Millis → Bool) (c : SeenIndex) : SeenIndex :=
+  match fuel with
+  | 0 => c
+  | fuel + 1 =>
+    -- Move `back` over once when `front` runs out, and keep the move.
+    let c := if c.front.isEmpty then { c with front := c.back.reverse, back := [] } else c
+    match c.front with
+    | [] => c
+    | (id, n) :: rest =>
+      match c.index.get? id with
+      | some (t, n') =>
+        if n' != n then popWhile fuel drop { c with front := rest, len := c.len - 1 }
+        else if drop c t then
+          popWhile fuel drop { c with index := c.index.erase id, front := rest, len := c.len - 1 }
+        else c
+      | none => popWhile fuel drop { c with front := rest, len := c.len - 1 }
+
+/-- Record the id at `now`: `SeenCache.add`. Past the capacity, the
+oldest live ids go. -/
+def add (c : SeenIndex) (id : MessageId) (now : Millis) : SeenIndex :=
+  let c := { c with index := c.index.insert id (now, c.next), back := (id, c.next) :: c.back,
+                    len := c.len + 1, next := c.next + 1 }
+  if c.index.size ≤ c.params.capacity then c
+  else popWhile c.len (fun c _ => c.params.capacity < c.index.size) c
+
+/-- Drop the expired ids: `SeenCache.prune`, for times that never go
+back. -/
+def prune (c : SeenIndex) (now : Millis) : SeenIndex :=
+  popWhile c.len (fun c t => !(decide (t + c.params.ttl > now))) c
+
+end SeenIndex
+
 /-! ## Backoff table
 
 The backoff table holds the period after a prune during which the router
