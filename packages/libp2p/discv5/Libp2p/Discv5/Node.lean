@@ -35,11 +35,18 @@ namespace Libp2p.Discv5
 
 open Conc Libp2p.Identity
 
-/-- The endpoint a record names for discv5: `ip` and `udp`. -/
-def endpointOf? (e : Enr) : Option Endpoint := do
-  let ip ← (e.ip?).toOption.join
-  let port ← (e.port? .udp).toOption.join
-  return { ip, port }
+/-- The endpoint a record names for discv5: `ip` and `udp`, else `ip6`
+and `udp6`. -/
+def endpointOf? (e : Enr) : Option Endpoint :=
+  let v4 : Option Endpoint := do
+    let ip ← (e.ip?).toOption.join
+    let port ← (e.port? .udp).toOption.join
+    return { ip, port }
+  let v6 : Option Endpoint := do
+    let ip ← (e.ip6?).toOption.join
+    let port ← (e.port? .udp6).toOption.join
+    return { ip, port }
+  v4 <|> v6
 
 /-- A running node. -/
 structure Node where
@@ -265,9 +272,11 @@ port; `extra` adds the client's pairs, such as `eth2` and `tcp`.
 def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pair := [])
     (seq : Nat := 1) (revalidateMs : Nat := 1000) : Async Node := do
   let socket ← (Streams.Udp.bind ip port : IO Streams.Udp.Socket)
+  -- An IPv6 bind names itself in `ip6` and `udp6`.
+  let (ipKey, portKey) : Enr.Key × Enr.Key := if ip.length == 16 then (.ip6, .udp6) else (.ip, .udp)
   let pairs : List Enr.Pair :=
-    [⟨.ip, .bytes ip⟩, ⟨.udp, .bytes (Rlp.ofScalar socket.port)⟩] ++
-      extra.filter fun p => p.key != .ip && p.key != .udp
+    [⟨ipKey, .bytes ip⟩, ⟨portKey, .bytes (Rlp.ofScalar socket.port)⟩] ++
+      extra.filter fun p => p.key != ipKey && p.key != portKey
   let record ← match Enr.sign key seq pairs with
     | .ok r => pure r
     | .error e => throw (IO.userError s!"discv5: the record does not sign ({repr e})")

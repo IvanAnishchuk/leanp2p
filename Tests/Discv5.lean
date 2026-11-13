@@ -410,6 +410,28 @@ private def socketChecks (r : Runner) : IO Unit := Conc.Async.run do
   r.check "udp: close wakes a receive on a socket bound to 0.0.0.0"
     (← closeWakes [0, 0, 0, 0])
 
+/-! ## IPv6 over UDP -/
+
+/-- Two nodes bound to `::1` find each other through `ip6`/`udp6`. -/
+private def ipv6Checks (r : Runner) : IO Unit := Conc.Async.run do
+  let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "ipv6: key A" false
+  let some kb := key32 nodeBKey | r.check "ipv6: key B" false
+  let lo6 := List.replicate 15 0 ++ [1]
+  let a ← Node.start ka lo6 0
+  let b ← Node.start kb lo6 0
+  let eb ← (b.localEnr : BaseIO _)
+  r.check "ipv6: the record names its endpoint in ip6 and udp6"
+    (endpointOf? eb == some { ip := lo6, port := b.port } && (eb.ip?).toOption.join.isNone)
+  match ← a.ping eb with
+  | some (.pong _ _ ip port) =>
+    r.check "ipv6: a PING over ::1 gets a PONG naming the IPv6 endpoint" (ip == lo6 && port == a.port)
+  | _ => r.check "ipv6: a PING over ::1 gets a PONG" false
+  let found ← a.findNode eb [0]
+  r.check "ipv6: FINDNODE at distance 0 returns the record" (found.any (·.nodeId == eb.nodeId))
+  a.stop
+  b.stop
+
 /-! ## Liveness over UDP -/
 
 /-- A node that checks its table every 100 ms keeps a live peer and
@@ -461,6 +483,7 @@ def run (r : Runner) : IO Unit := do
   gethChecks r
   udpChecks r
   socketChecks r
+  ipv6Checks r
   livenessChecks r
   -- ECDH.
   match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
