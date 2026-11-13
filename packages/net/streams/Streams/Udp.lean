@@ -12,8 +12,9 @@ placement is the spike's, and the root docs have not made it.
 The receive parks on `Std.Async.UDP.Socket.recv`, a promise, so a wait
 holds no pool thread (`Std`'s receive *selector* would; see the quic
 ARCHITECTURE, "Decisions"). `close` sets a flag, then sends an empty
-datagram to the socket's own address, which wakes a parked receive; the
-receive then answers `none`, as QUIC's loop does at its stop.
+datagram to the socket's own address (the loopback for a bind to
+`0.0.0.0`), which wakes a parked receive; the receive then answers
+`none`, as QUIC's loop does at its stop.
 
 IPv4 only in the spike.
 -/
@@ -32,6 +33,9 @@ def maxDatagram : Nat := 2048
 structure Socket where
   private native : Std.Async.UDP.Socket
   private closed : OnceRef Bool
+  /-- The address `close` sends its wake datagram to: the bound one, or
+  the loopback for an unspecified bind. -/
+  private wakeIp : List Nat
   /-- The port the socket is bound to, with the system's pick for 0. -/
   port : Nat
 
@@ -47,7 +51,10 @@ def bind (ip : List Nat) (port : Nat) : IO Socket := do
   let s ← Std.Async.UDP.Socket.mk
   s.bind addr
   let bound ← s.getSockName
-  return { native := s, closed := ← OnceRef.new false, port := bound.port.toNat }
+  -- A datagram to the loopback never reaches a socket bound to another
+  -- address, so the wake goes to the bound address itself.
+  let wakeIp := if ip == [0, 0, 0, 0] then [127, 0, 0, 1] else ip
+  return { native := s, closed := ← OnceRef.new false, wakeIp, port := bound.port.toNat }
 
 /-- Send one datagram. A send to an address of the wrong shape, or one
 the system refuses, is dropped: UDP promises no delivery. -/
@@ -72,6 +79,6 @@ partial def recv (s : Socket) : Async (Option (ByteArray × List Nat × Nat)) :=
 /-- Close: later receives answer `none`, and a parked one wakes. -/
 def close (s : Socket) : Async Unit := do
   (s.closed.set true : BaseIO Unit)
-  send s .empty [127, 0, 0, 1] s.port
+  send s .empty s.wakeIp s.port
 
 end Streams.Udp

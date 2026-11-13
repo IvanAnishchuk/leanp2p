@@ -182,10 +182,43 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
   c.stop
   r.check "discv5 udp: the nodes stop" true
 
+/-! ## The UDP socket's close -/
+
+/-- `close` wakes a parked receive with `none`, within one second of
+real time, for a socket bound to `ip`. -/
+private def closeWakes (ip : List Nat) : Conc.Async Bool := do
+  let s ← (Streams.Udp.bind ip 0 : IO Streams.Udp.Socket)
+  let woke : Conc.Chan Bool ← Conc.Chan.new 1
+  let ts ← Conc.TaskSet.new
+  ts.spawn do discard <| woke.send (← Streams.Udp.recv s).isNone
+  -- Give the receive time to park, then close.
+  Conc.select #[← (Conc.Park.sleep 50 () : BaseIO (Conc.Park Unit))]
+  Streams.Udp.close s
+  let timer ← (Conc.Park.sleep 1000 none : BaseIO (Conc.Park (Option Bool)))
+  let answer ← Conc.select #[Conc.Park.recv woke id, timer]
+  if answer.isNone then
+    -- The close did not wake it: a datagram from another socket to the
+    -- bound address does, so the join below returns and the check fails.
+    let other ← (Streams.Udp.bind [127, 0, 0, 1] 0 : IO Streams.Udp.Socket)
+    let target := if ip == [0, 0, 0, 0] then [127, 0, 0, 1] else ip
+    Streams.Udp.send other .empty target s.port
+    Streams.Udp.close other
+  ts.joinAll
+  return answer == some true
+
+private def socketChecks (r : Runner) : IO Unit := Conc.Async.run do
+  -- 127.0.0.2 is a loopback address on Linux, and a datagram to
+  -- 127.0.0.1 never reaches a socket bound to it.
+  r.check "udp: close wakes a receive on a socket bound to 127.0.0.2"
+    (← closeWakes [127, 0, 0, 2])
+  r.check "udp: close wakes a receive on a socket bound to 0.0.0.0"
+    (← closeWakes [0, 0, 0, 0])
+
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
   memoryChecks r
   udpChecks r
+  socketChecks r
   -- ECDH.
   match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
   | none => r.check "discv5: the ECDH key builds" false
