@@ -537,6 +537,35 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', _) => invalidCount s' pa ta = 1 && invalidCount s' pb ta = 1
      | _ => false)
 
+  -- The spam measures. An IHAVE past `maxIhaveMessages` in one heartbeat
+  -- gets no IWANT; the ids are fresh, so each earlier one does.
+  let ihaveOf (n : Nat) : Event :=
+    .rpc pa (Pb.encodeMessage (rpcOfControl
+      { ihave := [{ topicId := "t", messageIds := [⟨[100 + n]⟩] }], iwant := [], graft := [],
+        prune := [] }))
+  let capped : Params := { baseParams with maxIhaveMessages := 2 }
+  r.check "core.spam.ihave-cap"
+    (match Libp2p.Protocols.Gossipsub.Core.run capped known [ihaveOf 1, ihaveOf 2, ihaveOf 3] with
+     | .ok (_, acts) => sendsTo pa acts = 2
+     | _ => false)
+  -- An IWANT for one id is answered `gossipRetransmission` times, no more.
+  let cachedState : State :=
+    { known with mcache := (Cache.MessageIndex.empty baseParams.window).put ⟨[7]⟩ (msgOf ta [7]) }
+  let iwant7 : Event := .rpc pa (Pb.encodeMessage (iwantRpc [⟨[7]⟩]))
+  r.check "core.spam.iwant-retransmission-cap"
+    (match Libp2p.Protocols.Gossipsub.Core.run baseParams cachedState
+        [iwant7, iwant7, iwant7, iwant7] with
+     | .ok (_, acts) => publishCount acts = 3
+     | _ => false)
+  -- Score retention: `pa` leaves with one invalid delivery and comes back
+  -- within `retainScore` to the same count, not to zero.
+  r.check "core.retain.score-survives-reconnect"
+    (match Libp2p.Protocols.Gossipsub.Core.run cfgParams known
+        [.rpc pa (Pb.encodeMessage (rpcOfPublish [badMsg])), .peerLeft pa,
+         .peerJoined pa .meshsub] with
+     | .ok (s', _) => invalidCount s' pa ta = 1
+     | _ => false)
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }

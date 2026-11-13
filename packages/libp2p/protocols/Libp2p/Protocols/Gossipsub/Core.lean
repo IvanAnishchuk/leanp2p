@@ -156,6 +156,18 @@ structure Params where
   /-- The most IDONTWANT pairs the router keeps; the oldest go first. The
   spec leaves the prune strategy to the implementation. -/
   dontSendCap : Nat := 4096
+  /-- The spam measures (`gossipsub-v1.1.md`, lines 621 to 644): the most
+  IHAVE messages one peer may send per heartbeat (rust-libp2p's
+  `max_ihave_messages_heartbeat`, 10), the most ids we ask one peer for
+  per heartbeat (rust's control cap, 5000), and the most times we answer
+  one peer's IWANT for one id (rust's `gossip_retransimission`, 3). -/
+  maxIhaveMessages : Nat := 10
+  maxIhaveLength : Nat := 5000
+  gossipRetransmission : Nat := 3
+  /-- How long a departed peer's score stays (`gossipsub-v1.1.md`, lines
+  212 to 214: "the score is retained for some period of time when a peer
+  disconnects"). rust's default is 1 h; Lighthouse sets 100 epochs. -/
+  retainScore : Millis := 3600000
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -209,6 +221,13 @@ structure State where
   P₄ for every sender of a rejected message read it, as go-libp2p's
   `deliveries` table does. -/
   deliveries : Std.HashMap MessageId (Millis × List Peer) := {}
+  /-- Per peer this heartbeat: the IHAVE messages it sent and the ids we
+  asked it for. `maintain` clears it. -/
+  ihaveSeen : Std.HashMap Peer (Nat × Nat) := {}
+  /-- How many times we answered each peer's IWANT for each id. -/
+  served : Std.HashMap (Peer × MessageId) Nat := {}
+  /-- The records of departed peers and when each expires (`retainScore`). -/
+  retained : List (Peer × PeerData × Millis) := []
 
 /-- The application's answer on one held message
 (`gossipsub-v1.1.md`, "Extended Validators"). -/
@@ -634,22 +653,33 @@ def heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
 
 /-- A peer joins: record it, and send the hello RPC with our topics. A
 known peer keeps its record. -/
-def join (_p : Params) (s : State) (peer : Peer) (proto : PubsubProto) :
+def join (p : Params) (s : State) (peer : Peer) (proto : PubsubProto) :
     State × List Action :=
+  -- A peer back within `retainScore` of its departure gets its old score
+  -- (`gossipsub-v1.1.md`, lines 212 to 214), so a reconnect does not wash
+  -- a bad score.
+  let kept := (s.retained.find? (fun e => decide (e.1 = peer ∧ s.now < e.2.2 + p.retainScore))).map
+    (·.2.1)
+  let s0 : State := { s with retained := s.retained.filter (fun e => decide (e.1 ≠ peer)) }
   let s1 :=
     if (peerOf s peer).isSome then s
-    else setPeer s peer { score := Score.PeerState.zero, proto := proto, subs := [] }
+    else setPeer s0 peer
+      { score := (kept.map (·.score)).getD Score.PeerState.zero, proto := proto, subs := [] }
   (s1, [Action.sendRpc peer (helloRpc s.topics)])
 
 /-- A peer leaves: drop it from the peers, the meshes, the fanout
-records, and the promise table. -/
+records, and the promise table, and keep its record with the departure
+time for `retainScore` (`join`). -/
 def leave (s : State) (peer : Peer) : State × List Action :=
   ({ s with
      peers := s.peers.filter (fun e => decide (e.1 ≠ peer)),
      mesh := s.mesh.map (fun e => (e.1, e.2.filter (fun q => decide (q ≠ peer)))),
      fanout := s.fanout.map (fun e =>
        (e.1, { e.2 with peers := e.2.peers.filter (fun q => decide (q ≠ peer)) })),
-     iwant := s.iwant.filter (fun e => decide (e.peer ≠ peer)) },
+     iwant := s.iwant.filter (fun e => decide (e.peer ≠ peer)),
+     retained := match peerOf s peer with
+       | some pd => (peer, pd, s.now) :: s.retained.filter (fun e => decide (e.1 ≠ peer))
+       | none => s.retained },
    [])
 
 /-- One subscription option against the announced list. -/
@@ -837,7 +867,13 @@ def maintain (p : Params) (s : State) (now : Millis) : State :=
     iwant := s1.iwant.filter (fun e => decide (now < e.deadline))
     fanout := s1.fanout.filter (fun e => decide (now < e.2.lastPublished + p.fanoutTtl))
     -- A delivery record lives as long as the seen cache remembers its id.
-    deliveries := s1.deliveries.filter (fun _ (t, _) => decide (now < t + p.seen.ttl)) }
+    deliveries := s1.deliveries.filter (fun _ (t, _) => decide (now < t + p.seen.ttl))
+    -- The IHAVE counts are per heartbeat.
+    ihaveSeen := {}
+    -- A retransmission count lives as long as its message is cached.
+    served := s1.served.filter (fun k _ => (Cache.MessageIndex.get s1.mcache k.2).isSome)
+    -- A departed peer's record lives `retainScore`.
+    retained := s1.retained.filter (fun e => decide (now < e.2.2 + p.retainScore)) }
 
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
@@ -847,24 +883,34 @@ def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
 promised, and record the promise. -/
 def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) :
     State × List Action :=
-  let wanted := i.messageIds.filter (fun id =>
+  -- The spam measures: past `maxIhaveMessages` IHAVEs this heartbeat the
+  -- peer is ignored, and we ask it for at most `maxIhaveLength` ids.
+  let (count, asked) := s.ihaveSeen.getD sender (0, 0)
+  if p.maxIhaveMessages ≤ count then (s, [])
+  else
+  let wanted := (i.messageIds.filter (fun id =>
     !(s.seen.contains id s.now) && (Cache.MessageIndex.get s.mcache id).isNone &&
-      !(promised s.iwant sender id))
+      !(promised s.iwant sender id))).take (p.maxIhaveLength - asked)
   let s1 : State :=
     { s with
       iwant := wanted.foldl
-        (fun ps id => ps.promise sender id (s.now + p.iwantDeadline)) s.iwant }
+        (fun ps id => ps.promise sender id (s.now + p.iwantDeadline)) s.iwant
+      ihaveSeen := s.ihaveSeen.insert sender (count + 1, asked + wanted.length) }
   (s1, if wanted = [] then [] else [Action.sendRpc sender (iwantRpc wanted)])
 
 /-- Handle one IWANT: answer each id that the message cache holds under
-the same id. -/
+the same id, at most `gossipRetransmission` times per peer and id. -/
 def handleIwant (p : Params) (s : State) (sender : Peer) (w : Rpc.ControlIWant) :
     State × List Action :=
   let answers := w.messageIds.filterMap (fun id =>
     match Cache.MessageIndex.get s.mcache id with
-    | some m => if p.msgId m = id then some m else none
+    | some m =>
+      if p.msgId m = id && decide (s.served.getD (sender, id) 0 < p.gossipRetransmission) then some m
+      else none
     | none => none)
-  (s, answers.map (fun m => Action.sendRpc sender (publishRpc m)))
+  let s1 : State := { s with served := answers.foldl (fun t m =>
+    t.insert (sender, p.msgId m) (t.getD (sender, p.msgId m) 0 + 1)) s.served }
+  (s1, answers.map (fun m => Action.sendRpc sender (publishRpc m)))
 
 /-- Handle one GRAFT. An unknown topic is ignored. A member is a no-op.
 A peer in backoff, or a mesh at `dHigh`, gets a prune. Otherwise the
@@ -1514,12 +1560,14 @@ private theorem handlePrunes_mesh (p : Params) (s : State) (sender : Peer)
 private theorem handleIhave_mesh (p : Params) (s : State) (sender : Peer)
     (i : Rpc.ControlIHave) (topic : TopicId) :
     meshOf (handleIhave p s sender i).1 topic = meshOf s topic := by
-  simp [handleIhave, meshOf]
+  unfold handleIhave
+  split
+  split <;> simp [meshOf]
 
 private theorem handleIwant_mesh (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) (topic : TopicId) :
     meshOf (handleIwant p s sender w).1 topic = meshOf s topic := by
-  simp [handleIwant]
+  simp [handleIwant, meshOf]
 
 private theorem handleIhaves_mesh (p : Params) (s : State) (sender : Peer)
     (is : List Rpc.ControlIHave) (topic : TopicId) :
@@ -1551,7 +1599,9 @@ private theorem topics_mapHandlers {β : Type} (f : State → β → State × Li
 
 private theorem handleIhave_topics (p : Params) (s : State) (sender : Peer)
     (i : Rpc.ControlIHave) : (handleIhave p s sender i).1.topics = s.topics := by
-  simp [handleIhave]
+  unfold handleIhave
+  split
+  split <;> simp
 
 private theorem handleIwant_topics (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) : (handleIwant p s sender w).1.topics = s.topics := by
