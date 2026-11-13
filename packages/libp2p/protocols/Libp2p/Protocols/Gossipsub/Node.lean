@@ -694,6 +694,7 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
         pure { st with nextExplicitCheck := now + env.config.explicitCheckMs }
       else pure st
     let st := { st with router := Core.expirePending st.params st.router now }
+    let st := { st with router := Core.maintain st.params st.router now }
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }

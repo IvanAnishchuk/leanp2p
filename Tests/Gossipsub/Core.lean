@@ -495,6 +495,48 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', _) => !(memB pa (meshOf s' ta)) && (meshOf s' ta).length = 2
      | _ => false)
 
+  -- #95 upkeep (`maintain`). A fanout idle past `fanoutTtl` goes.
+  let withFanout : State :=
+    { known with fanout := [(tb, { peers := [pa], lastPublished := 0 })] }
+  r.check "core.maintain.fanout-expires"
+    ((maintain cfgParams withFanout (cfgParams.fanoutTtl - 1)).fanout.length = 1 &&
+      (maintain cfgParams withFanout cfgParams.fanoutTtl).fanout.isEmpty)
+  -- A promise past its deadline is one P₇ penalty, and leaves the table.
+  let promised : State := { known with iwant := Cache.PromiseTable.promise [] pa ⟨[7]⟩ 100 }
+  let penalty (s : State) (q : Peer) : Nat := ((peerOf s q).map (·.score.behaviourPenalty)).getD 0
+  r.check "core.maintain.broken-promise-penalised"
+    (penalty (maintain cfgParams promised 99) pa = 0 &&
+      penalty (maintain cfgParams promised 100) pa = 1 &&
+      (maintain cfgParams promised 100).iwant.isEmpty)
+  -- A delivered id keeps its promise: no penalty.
+  r.check "core.maintain.delivered-promise-kept"
+    (match step cfgParams promised (.rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [7]]))) with
+     | .ok (s', _) => penalty (maintain cfgParams s' 100) pa = 0
+     | _ => false)
+  -- The delivery record. A duplicate from mesh peer `pb` within the
+  -- window counts toward P₃; the topic's window is 10 ms here.
+  -- `scoreTopic` caps the P₃ counter at 0, so this topic lifts the cap.
+  let windowTopic : Score.TopicParams :=
+    { scoreTopic with meshMessageDeliveriesWindow := 10, meshMessageDeliveriesCap := 10 }
+  let windowTopics : TopicId → Option Score.TopicParams := fun t =>
+    if t = ta then some windowTopic else none
+  let windowParams : Params :=
+    { cfgParams with score := { cfgParams.score with topics := windowTopics } }
+  let meshCount (s : State) (q : Peer) : Nat :=
+    ((peerOf s q).map fun pd => (Score.countersOf pd.score ta).meshMessageDeliveries).getD 0
+  r.check "core.deliveries.near-first-credit"
+    (match Libp2p.Protocols.Gossipsub.Core.run windowParams meshed
+        [inbound, .rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))] with
+     | .ok (s', _) => meshCount s' pb = 1
+     | _ => false)
+  -- A rejected message penalises every peer that sent it during the wait.
+  r.check "core.deliveries.reject-penalises-every-sender"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, .rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]])),
+         .validated ⟨[1]⟩ pa .reject] with
+     | .ok (s', _) => invalidCount s' pa ta = 1 && invalidCount s' pb ta = 1
+     | _ => false)
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }

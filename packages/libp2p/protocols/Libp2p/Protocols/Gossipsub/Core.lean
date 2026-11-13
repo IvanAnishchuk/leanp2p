@@ -204,6 +204,11 @@ structure State where
   /-- The explicit peers (`gossipsub-v1.1.md`, "Explicit Peering
   Agreements"): outside every mesh, and sent every valid message. -/
   explicit : List Peer := []
+  /-- The delivery record of each recent id: the time of its first
+  arrival and every peer that sent it. P₃'s near-first deliveries and
+  P₄ for every sender of a rejected message read it, as go-libp2p's
+  `deliveries` table does. -/
+  deliveries : Std.HashMap MessageId (Millis × List Peer) := {}
 
 /-- The application's answer on one held message
 (`gossipsub-v1.1.md`, "Extended Validators"). -/
@@ -659,6 +664,28 @@ def handleSubs (s : State) (sender : Peer) (subs : List Rpc.SubOpts) : State :=
   | some pd => setPeer s sender { pd with subs := subs.foldl applySubOpts pd.subs }
   | none => s
 
+/-- Note `sender` in the delivery record of each message. A first
+arrival starts the record. With `credit`, a later arrival from a mesh
+peer within the topic's `meshMessageDeliveriesWindow` of the first is a
+near-first delivery, and counts toward P₃ (`gossipsub-v1.1.md`, "P₃"),
+once per peer. -/
+def recordOne (p : Params) (credit : Bool) (sender : Peer) (st : State) (m : Message) : State :=
+  match st.deliveries.get? (p.msgId m) with
+  | none => { st with deliveries := st.deliveries.insert (p.msgId m) (st.now, [sender]) }
+  | some (t, senders) =>
+    if memB sender senders then st
+    else
+      let window := ((p.score.topics m.topic).map (·.meshMessageDeliveriesWindow)).getD 0
+      if credit && memB sender (meshOf st m.topic) && decide (st.now ≤ t + window) then
+        updateScoreOf { st with deliveries := st.deliveries.insert (p.msgId m) (t, sender :: senders) }
+          sender (fun sc => Score.meshDelivery p.score sc m.topic)
+      else { st with deliveries := st.deliveries.insert (p.msgId m) (t, sender :: senders) }
+
+/-- `recordOne` over the messages of an RPC, in order. -/
+def recordDeliveries (p : Params) (credit : Bool) (sender : Peer) (s : State)
+    (ms : List Message) : State :=
+  ms.foldl (recordOne p credit sender) s
+
 /-- Handle the published messages of an RPC: validate, accept, cache,
 score, deliver, and forward. -/
 def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
@@ -669,14 +696,16 @@ def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
   let s1 : State :=
     { s with
       seen := r.cache,
-      mcache := r.accepted.foldl (fun c m => c.put (p.msgId m) m) s.mcache }
+      mcache := r.accepted.foldl (fun c m => c.put (p.msgId m) m) s.mcache,
+      -- Any arrival of an id keeps every IWANT promise for it.
+      iwant := valid.foldl (fun ps m => ps.deliver (p.msgId m)) s.iwant }
   let s2 := invalid.foldl (fun st m =>
     updateScoreOf st sender (fun sc => Score.invalidDelivery p.score sc m.topic)) s1
   let s3 := r.accepted.foldl (fun st m =>
     updateScoreOf st sender (fun sc =>
       let sc' := Score.firstDelivery p.score sc m.topic
       if memB sender (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')) s2
-  (s3, r.accepted.map (fun m => Action.deliver m) ++
+  (recordDeliveries p true sender s3 valid, r.accepted.map (fun m => Action.deliver m) ++
     forwardPubs s sender r.accepted)
 
 /-- An IDONTWANT of the ids. -/
@@ -723,7 +752,8 @@ def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
     { s with
       seen := r.cache,
       pending := s.pending ++ r.accepted.map (fun m => (p.msgId m, sender, m))
-      pendingAt := s.pendingAt ++ r.accepted.map (fun m => (p.msgId m, s.now)) }
+      pendingAt := s.pendingAt ++ r.accepted.map (fun m => (p.msgId m, s.now))
+      iwant := valid.foldl (fun ps m => ps.deliver (p.msgId m)) s.iwant }
   let s2 := invalid.foldl (fun st m =>
     updateScoreOf st sender (fun sc => Score.invalidDelivery p.score sc m.topic)) s1
   -- "When the peer receives the first message instance it immediately
@@ -735,7 +765,10 @@ def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
     | none => false
   let dontWants := large.flatMap fun m =>
     (inboundTargets s sender m.topic).map fun q => Action.sendRpc q (idontwantRpc [p.msgId m])
-  (s2, r.accepted.map (fun m => Action.validate m (p.msgId m) sender) ++ dontWants)
+  -- The record notes every sender; the credit and the penalty wait for
+  -- the answer (`handleValidated`).
+  (recordDeliveries p false sender s2 valid,
+    r.accepted.map (fun m => Action.validate m (p.msgId m) sender) ++ dontWants)
 
 /-- The application's answer on a held message. An unknown id is a
 no-op: the answer came twice, or for a message never held. Accept
@@ -751,17 +784,27 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
                                pendingAt := s.pendingAt.filter (fun e => decide (e.1 ≠ id)) }
     -- The score goes to the peer the core recorded at receipt. The
     -- answer's source is the application's copy of the same value.
+    -- Every peer that sent the message while it waited, from the record.
+    let others := ((s.deliveries.get? id).map (·.2)).getD [] |>.filter (· != src)
     match outcome with
     | .accept =>
       let s2 : State := { s1 with mcache := s1.mcache.put id m }
       let s3 := updateScoreOf s2 src (fun sc =>
         let sc' := Score.firstDelivery p.score sc m.topic
         if memB src (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')
+      -- The mesh peers that sent it during the wait delivered near-first.
+      let s4 := others.foldl (fun st q =>
+        if memB q (meshOf s m.topic) then
+          updateScoreOf st q (fun sc => Score.meshDelivery p.score sc m.topic)
+        else st) s3
       -- The forward skips the IDONTWANT peers; the seen cache stops a
       -- second forward, so the pairs of this id go.
-      (forgetDontWant s3 id, dropDontWant p s (forwardPubs s src [m]))
+      (forgetDontWant s4 id, dropDontWant p s (forwardPubs s src [m]))
     | .reject =>
-      (updateScoreOf s1 src (fun sc => Score.invalidDelivery p.score sc m.topic), [])
+      -- Every sender of an invalid message takes P₄, as go's
+      -- `markInvalidMessageDelivery` does for each peer of the record.
+      ((src :: others).foldl (fun st q =>
+        updateScoreOf st q (fun sc => Score.invalidDelivery p.score sc m.topic)) s1, [])
     | .ignore => (s1, [])
 
 /-- Drop the held messages older than the message cache's history,
@@ -776,6 +819,25 @@ def expirePending (p : Params) (s : State) (now : Millis) : State :=
   if old.isEmpty then s
   else { s with pending := s.pending.filter (fun e => !memB e.1 old),
                 pendingAt := s.pendingAt.filter (fun e => !memB e.1 old) }
+
+/-- Heartbeat upkeep that the spike runs outside `step` (the loop calls it
+before each tick), so the heartbeat theorems hold unchanged. Each part
+cites #95:
+
+* fanout expiry (`gossipsub-v1.0.md`, lines 449 to 473): a topic with no
+  publish for `fanoutTtl` loses its fanout;
+* broken IWANT promises (`gossipsub-v1.1.md`, spam measures): each
+  promise past its deadline adds one P₇ behaviour penalty to its peer,
+  and leaves the table. -/
+def maintain (p : Params) (s : State) (now : Millis) : State :=
+  let broken := Cache.PromiseTable.broken s.iwant now
+  let s1 := broken.foldl (fun st (q, n) =>
+    updateScoreOf st q (fun sc => (List.replicate n ()).foldl (fun sc _ => Score.behaviourPenalty sc) sc)) s
+  { s1 with
+    iwant := s1.iwant.filter (fun e => decide (now < e.deadline))
+    fanout := s1.fanout.filter (fun e => decide (now < e.2.lastPublished + p.fanoutTtl))
+    -- A delivery record lives as long as the seen cache remembers its id.
+    deliveries := s1.deliveries.filter (fun _ (t, _) => decide (now < t + p.seen.ttl)) }
 
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
@@ -1693,17 +1755,60 @@ private theorem handleSubs_topics (s : State) (sender : Peer) (subs : List Rpc.S
     (handleSubs s sender subs).topics = s.topics := by
   cases h : peerOf s sender <;> simp [handleSubs, h, setPeer]
 
+private theorem recordOne_mesh (p : Params) (credit : Bool) (sender : Peer) (s : State)
+    (m : Message) (topic : TopicId) :
+    meshOf (recordOne p credit sender s m) topic = meshOf s topic := by
+  unfold recordOne
+  split
+  · simp [meshOf]
+  · split
+    · rfl
+    · dsimp only
+      split
+      · rw [updateScoreOf_mesh]; simp [meshOf]
+      · simp [meshOf]
+
+private theorem recordOne_topics (p : Params) (credit : Bool) (sender : Peer) (s : State)
+    (m : Message) : (recordOne p credit sender s m).topics = s.topics := by
+  unfold recordOne
+  split
+  · rfl
+  · split
+    · rfl
+    · dsimp only
+      split
+      · rw [updateScoreOf_topics]
+      · rfl
+
+/-- The delivery record changes scores and the record, never a mesh. -/
+private theorem recordDeliveries_mesh (p : Params) (credit : Bool) (sender : Peer)
+    (ms : List Message) (s : State) (topic : TopicId) :
+    meshOf (recordDeliveries p credit sender s ms) topic = meshOf s topic := by
+  unfold recordDeliveries
+  induction ms generalizing s with
+  | nil => rfl
+  | cons m ms ih => rw [List.foldl_cons, ih, recordOne_mesh]
+
+/-- The delivery record never changes the subscribed topics. -/
+private theorem recordDeliveries_topics (p : Params) (credit : Bool) (sender : Peer)
+    (ms : List Message) (s : State) :
+    (recordDeliveries p credit sender s ms).topics = s.topics := by
+  unfold recordDeliveries
+  induction ms generalizing s with
+  | nil => rfl
+  | cons m ms ih => rw [List.foldl_cons, ih, recordOne_topics]
+
 private theorem handlePubs_mesh (p : Params) (s : State) (sender : Peer)
     (ms : List Message) (topic : TopicId) :
     meshOf (handlePubs p s sender ms).1 topic = meshOf s topic := by
   simp only [handlePubs]
-  rw [foldl_updateScoreOf_mesh, foldl_updateScoreOf_mesh]
+  rw [recordDeliveries_mesh, foldl_updateScoreOf_mesh, foldl_updateScoreOf_mesh]
   simp [meshOf]
 
 private theorem handlePubs_topics (p : Params) (s : State) (sender : Peer)
     (ms : List Message) : (handlePubs p s sender ms).1.topics = s.topics := by
   simp only [handlePubs]
-  rw [foldl_updateScoreOf_topics, foldl_updateScoreOf_topics]
+  rw [recordDeliveries_topics, foldl_updateScoreOf_topics, foldl_updateScoreOf_topics]
 
 /-- The record of a peer after the heartbeat mesh write. -/
 theorem peerOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (q : Peer) :
