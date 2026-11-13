@@ -638,6 +638,25 @@ def simChecks (r : Runner) : Async Unit := do
     r.check s!"sim (split {split}): the limiter slot came back" ((← limiter.take m.id) && (← limiter.take m.id))
     r.check s!"sim (split {split}): the hosts close with no fault" (← p.close).isNone
     tc.close
+  -- The streaming responder (spike P10): it learns the requesting peer,
+  -- and its chunks reach the requester as it emits them.
+  do
+    let tc ← TestClock.new
+    let p ← hostPair
+    let peerSeen : OnceRef (Option Libp2p.Identity.PeerId) ← OnceRef.new none
+    p.server.setHandler (streamingHandler m tc.clock 1000 fun ctx _ emit => do
+      peerSeen.set (some ctx.remotePeer)
+      for c in answer do
+        if let .error _ ← emit c then return)
+    let got : OnceRef (List Chunk) ← OnceRef.new []
+    let res ← requestPeer (openStreamOf p) (← Limiter.new) m tc.clock 1000 (some (noise 3 200))
+      fun c => got.update (· ++ [c])
+    r.check "sim: a streaming responder's chunks arrive in order"
+      (succeedsWith () res && (← got.get).map (·.payload) == answer.map (·.payload))
+    r.check "sim: the streaming responder learns the requesting peer"
+      ((← peerSeen.get) == some p.client.localPeer)
+    r.check "sim: a streaming responder, the hosts close with no fault" (← p.close).isNone
+    tc.close
   -- An id the peer does not serve: multistream-select answers `na`, so
   -- the stream never opens for it.
   do

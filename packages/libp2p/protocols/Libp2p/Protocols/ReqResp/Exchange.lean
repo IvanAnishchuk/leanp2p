@@ -204,6 +204,57 @@ def serve (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Na
     let chunks ← respond (← got.get)
     writeAnswer s m chunks
 
+/-- Write one chunk of an answer. A chunk the encoder refuses becomes a
+`ServerError` chunk, and the answer ends there (`.error`). -/
+def writeChunk (s : Streams.Stream) (m : Method) (c : Chunk) : Async (Except Error Unit) := do
+  match encodeChunkB m c with
+  | .ok bytes =>
+    if let .error e ← s.write bytes then return .error (.stream e)
+    return .ok ()
+  | .error e =>
+    if let .ok bytes := encodeChunkB m ⟨.serverError, ByteArray.empty, errorMessageOf e⟩ then
+      if let .error e ← s.write bytes then return .error (.stream e)
+    return .error e
+
+/-- Serve one request on `s`, chunk by chunk. `respond` gets the
+stream's context (the requesting peer and its address), the payload,
+and `emit`, which writes one chunk at once. So the answer never sits
+in memory whole, and the responder may wait between chunks to
+rate-limit: "The responder MAY rate-limit chunks by withholding each
+chunk until capacity is available" (phase0, "Responding side"). An
+`emit` that fails ends the answer; `respond` should stop then. The
+stream closes after `respond` returns. -/
+def serveStreaming (ctx : Libp2p.Core.StreamContext) (s : Streams.Stream) (m : Method)
+    (clock : Conc.Clock) (timeoutMs : Nat)
+    (respond : Libp2p.Core.StreamContext → Option ByteArray →
+      (Chunk → Async (Except Error Unit)) → Async Unit) :
+    Async (Except Error Unit) := do
+  let got ← Conc.OnceRef.new (none : Option ByteArray)
+  let read : Async (Except Error Bool) :=
+    pump s (Core.init m.requestConfig m.request.isSome) fun c => got.set (some c.payload)
+  match ← underDeadline s clock timeoutMs read with
+  | .error (.stream e) => return .error (.stream e)
+  | .error .timeout => return .error .timeout
+  | .error e =>
+    if let .ok bytes := encodeChunkB m ⟨.invalidRequest, ByteArray.empty, errorMessageOf e⟩ then
+      discard <| s.write bytes
+    s.close
+    return .error e
+  | .ok _ =>
+    -- The first failure of `emit` is the answer of the exchange; later
+    -- calls write nothing.
+    let failed ← Conc.OnceRef.new (none : Option Error)
+    let emit (c : Chunk) : Async (Except Error Unit) := do
+      if let some e ← (failed.get : BaseIO (Option Error)) then return .error e
+      let r ← writeChunk s m c
+      if let .error e := r then (failed.set (some e) : BaseIO Unit)
+      return r
+    respond ctx (← got.get) emit
+    s.close
+    match ← (failed.get : BaseIO (Option Error)) with
+    | some e => return .error e
+    | none => return .ok ()
+
 /-- The one map from a req/resp error into the coarse core error. -/
 def mapError : Error → Libp2p.Core.Error
   | .stream e => mapStreamError e
@@ -215,5 +266,15 @@ def mapError : Error → Libp2p.Core.Error
 def handler (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
     (respond : Option ByteArray → Async (List Chunk)) : Libp2p.Core.StreamHandler :=
   ⟨m.id, fun _ s => ExceptT.mk do return (← serve s m clock timeoutMs respond).mapError mapError⟩
+
+/-- The handler value of `serveStreaming`: the responder learns the
+requesting peer, so the client can count, limit, and penalise per peer
+(phase0: "The responder MAY penalise peers that concurrently open more
+than `MAX_CONCURRENT_REQUESTS` streams"). -/
+def streamingHandler (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
+    (respond : Libp2p.Core.StreamContext → Option ByteArray →
+      (Chunk → Async (Except Error Unit)) → Async Unit) : Libp2p.Core.StreamHandler :=
+  ⟨m.id, fun ctx s => ExceptT.mk do
+    return (← serveStreaming ctx s m clock timeoutMs respond).mapError mapError⟩
 
 end Libp2p.Protocols.ReqResp
