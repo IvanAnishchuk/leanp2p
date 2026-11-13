@@ -172,6 +172,8 @@ structure Stats where
   /-- Frames dropped by a full or closed peer queue, or by the pending
   gossip bound (`Node.dropped`). -/
   dropped : Nat
+  /-- The peers known to speak `/meshsub/1.2.0`. -/
+  v12Peers : Nat
 
 /-- A running node. Every field is a seam over the loop task, which is the
 only owner of the router state. -/
@@ -264,21 +266,18 @@ entry and closes its queue. The core peer stays connected. Stop resets an
 installed stream; a late open checks closing too. -/
 private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     (outbound : Conc.OnceRef (List (Peer × Outbound))) (unsupported : Conc.OnceRef (List Peer))
+    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit)
     (peer : Peer) (ob : Outbound) : Conc.Async Unit := do
   let fail : Conc.Async Unit := do
     (ob.queue.close : BaseIO Unit)
     (outbound.update (fun table => table.filter (fun e => e.2.id != ob.id)) : BaseIO Unit)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
-    match ← host.newStream peer [Constants.meshsubId] with
-    | .error (.protocol _) =>
-      -- The peer speaks no meshsub: the next reconcile drops it from the
-      -- router, as go-libp2p-pubsub drops a peer whose stream fails to
-      -- negotiate.
-      (unsupported.update fun l => if l.contains peer then l else peer :: l : BaseIO Unit)
-      fail
-    | .error _ => fail
-    | .ok (_, stream) =>
+    -- v1.2 first: a peer answers `na` to an id it lacks, and the
+    -- negotiation falls back to v1.1.
+    match ← host.newStream peer [Constants.meshsubV12Id, Constants.meshsubId] with
+    | .ok (id, stream) =>
+      (onVersion peer id : BaseIO Unit)
       (ob.stream.set (some stream) : BaseIO Unit)
       if ← (closing.get : BaseIO Bool) then stream.reset
       repeat
@@ -289,6 +288,13 @@ private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
             fail
             break
       stream.close
+    | .error (.protocol _) =>
+      -- The peer speaks no meshsub: the next reconcile drops it from the
+      -- router, as go-libp2p-pubsub drops a peer whose stream fails to
+      -- negotiate.
+      (unsupported.update fun l => if l.contains peer then l else peer :: l : BaseIO Unit)
+      fail
+    | .error _ => fail
   catch _ => fail
 
 /-! ## The inbound handler -/
@@ -354,11 +360,15 @@ private def readFrames (events : Conc.Chan Input) (cap : Nat) (peer : Peer)
 /-- Serve every RPC of a peer's stream in arrival order. Frame errors reset
 both directions. A clean EOF closes our write direction. The host owns and
 joins this handler task. -/
-def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap) :
+def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
+    (id : Libp2p.Core.ProtocolId := Constants.meshsubId)
+    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit := fun _ _ => pure ()) :
     Libp2p.Core.StreamHandler where
-  id := Constants.meshsubId
+  id := id
   handle ctx stream := ExceptT.mk do
     let peer := ctx.remotePeer
+    -- The id this handler serves is the version the peer chose.
+    (onVersion peer id : BaseIO Unit)
     -- The opener joins before its first RPC. Repeat joins are loop no-ops.
     if let .error _ ← events.send (.event (.peerJoined peer .meshsub)) then
       stream.close
@@ -420,11 +430,29 @@ private structure Env where
   /-- The peers whose meshsub negotiation failed; cleared by their next
   `connected`. -/
   unsupported : Conc.OnceRef (List Peer)
+  /-- The meshsub version each peer negotiated, from our writer's open
+  or from the handler that served its stream. -/
+  versions : Conc.OnceRef (List (Peer × Libp2p.Core.ProtocolId))
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
-private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := do
+private def enqueue (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Unit := do
   if ← env.closing.get then return ()
+  -- IDONTWANT goes to a v1.2 peer only (`gossipsub-v1.2.md`); for any
+  -- other peer, and before the version is known, the control drops it.
+  let v12 := ((← env.versions.get).lookup peer) == some Constants.meshsubV12Id
+  let rpc := match rpc0.control with
+    | some c => if v12 || c.idontwant.isEmpty then rpc0
+      else { rpc0 with control := some { c with idontwant := [] } }
+    | none => rpc0
+  if rpc.subscriptions.isEmpty && rpc.publish.isEmpty &&
+      (match rpc.control with
+       | some c => c.ihave.isEmpty && c.iwant.isEmpty && c.graft.isEmpty && c.prune.isEmpty &&
+           c.idontwant.isEmpty
+       | none => true) &&
+      !(match rpc0.control with | some c => c.idontwant.isEmpty | none => true) then
+    -- Only an IDONTWANT, and the peer cannot take it.
+    return ()
   (env.config.onSend peer rpc : BaseIO Unit)
   let some frame := Rpc.encodeFrame? rpc env.config.maxRpcSize | return ()
   let table ← env.outbound.get
@@ -434,7 +462,9 @@ private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := d
       let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
       let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none }
       env.outbound.update (fun table => (peer, ob) :: table)
-      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported peer ob)
+      let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
+        env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
+      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record peer ob)
       pure ob
   if ← env.closing.get then
     ob.queue.close
@@ -656,7 +686,12 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let now ← config.clock.nowMs
   let subs : Conc.OnceRef Subscriptions ← Conc.OnceRef.new { next := 0, entries := [] }
   let events : Conc.Chan Input ← Conc.Chan.new 64
-  host.setHandler (handler events config.maxRpcSize)
+  let versions ← Conc.OnceRef.new ([] : List (Peer × Libp2p.Core.ProtocolId))
+  let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
+    versions.update fun l => (q, id) :: l.filter (·.1 != q)
+  -- Both versions are served; the handler's id tells the peer's choice.
+  host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record)
+  host.setHandler (handler events config.maxRpcSize Constants.meshsubId record)
   let tasks ← Conc.TaskSet.new
   let alarm ← Conc.Alarm.new
   let outbound ← Conc.OnceRef.new ([] : List (Peer × Outbound))
@@ -666,7 +701,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let unsupported ← Conc.OnceRef.new ([] : List Peer)
   tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
   let env : Env :=
-    { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported }
+    { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
+      versions }
   tasks.spawn <| loop env
     { router := initialState config.params now
       pending := []
@@ -739,7 +775,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           cached := s.mcache.entries.length
           pending := s.pending.length
           dontSend := s.dontSend.length
-          dropped := ← drops.get }
+          dropped := ← drops.get
+          v12Peers := ((← versions.get).filter (·.2 == Constants.meshsubV12Id)).length }
       if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv

@@ -29,6 +29,11 @@ namespace Libp2p.Protocols.Constants
 /-- The gossipsub v1.1 protocol id, `/meshsub/1.1.0`. -/
 def meshsubId : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.1.0"⟩
 
+/-- The gossipsub v1.2 protocol id, `/meshsub/1.2.0` (`gossipsub-v1.2.md`,
+"Protocol Id"). A peer sends IDONTWANT only to a peer that negotiated
+it. -/
+def meshsubV12Id : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.2.0"⟩
+
 /-- The gossipsub v1.0 protocol id, `/meshsub/1.0.0`. A v1.1 router speaks v1.0 to a peer that
 offers only this id. -/
 def meshsubV10Id : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.0.0"⟩

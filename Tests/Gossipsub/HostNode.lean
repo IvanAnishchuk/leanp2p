@@ -68,6 +68,8 @@ def run (r : Runner) : IO Unit := Async.run do
     | some s =>
       r.check "hosts: stats count one peer, no topic, no drop"
         (s.peers == 1 && s.topics == 0 && s.pending == 0 && s.dropped == 0)
+      -- Both nodes serve /meshsub/1.2.0, so the pair negotiates it.
+      r.check "hosts: the pair negotiates meshsub 1.2.0" (s.v12Peers == 1)
     | none => r.check "hosts: stats answer" false
     r.check "hosts: a meshsub peer stays across heartbeats"
       ((← waitPeers p.clock server (!·.contains clientPeer) 5) == false)
