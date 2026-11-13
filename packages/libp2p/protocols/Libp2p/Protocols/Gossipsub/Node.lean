@@ -150,6 +150,14 @@ structure Config where
   sets `Constants.gossipMaxMessageSize` (phase0 "Maximum message
   sizes"). -/
   maxRpcSize : Nat := Constants.rpcCap
+  /-- The explicit peers (`gossipsub-v1.1.md`, "Explicit Peering
+  Agreements"). The node dials them at start and at every
+  `explicitCheckMs`, and the router forwards every valid message to
+  them and never meshes them. Their addresses come from the host's
+  peerstore. -/
+  explicitPeers : List Peer := []
+  /-- "The recommended period for connectivity checks is 5 minutes." -/
+  explicitCheckMs : Millis := 300000
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
 Lighthouse's `lighthouse_network` metrics are off in the shadow node
@@ -507,6 +515,8 @@ private structure LoopState where
   this map over the config's own function, so a replacement never
   wraps the one before it. -/
   topicOverrides : Std.HashMap TopicId (Option Score.TopicParams) := {}
+  /-- The time of the next explicit-peer connectivity check. -/
+  nextExplicitCheck : Millis := 0
 
 /-- Run the actions of one core step, in order, and answer the delayed
 sends. `gossipAt` is the time of the tick when a tick made the actions. The
@@ -614,6 +624,17 @@ private def reconcile (env : Env) (st : LoopState) : BaseIO LoopState := do
       st ← stepAndAct env st (.peerJoined q .meshsub)
   return st
 
+/-- Dial each explicit peer the host does not serve, each on a task of
+the node, so the loop never parks on a dial. -/
+private def dialExplicit (env : Env) : BaseIO Unit := do
+  if env.config.explicitPeers.isEmpty then return ()
+  let live ← match env.host.peers with
+    | some get => get
+    | none => pure []
+  for q in env.config.explicitPeers do
+    if !live.contains q then
+      env.tasks.spawn (discard (env.host.dial q))
+
 /-- Send due gossip before the heartbeat shifts the message cache. -/
 private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopState := do
   let (due, later) := st.pending.partition (fun p => decide (p.due ≤ now))
@@ -622,6 +643,10 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
   let st := { st with pending := later }
   if st.nextTick ≤ now then
     let st ← reconcile env st
+    let st ← if st.nextExplicitCheck ≤ now then do
+        dialExplicit env
+        pure { st with nextExplicitCheck := now + env.config.explicitCheckMs }
+      else pure st
     let st := { st with router := Core.expirePending st.params st.router now }
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
@@ -704,7 +729,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
       versions }
   tasks.spawn <| loop env
-    { router := initialState config.params now
+    { router := { initialState config.params now with explicit := config.explicitPeers }
       pending := []
       nextTick := now + config.params.heartbeatInterval
       ticks := 0

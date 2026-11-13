@@ -474,6 +474,27 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', acts) => sendsTo pb acts = 0 && sendsTo pc acts = 1 && s'.dontSend.isEmpty
      | _ => false)
 
+  -- Explicit peers (`gossipsub-v1.1.md`, "Explicit Peering Agreements").
+  -- `pd` announced `t` and sits outside the mesh, yet takes the forward.
+  let withExplicit : State := { meshed with explicit := [pd] }
+  r.check "core.explicit.forwarded-outside-mesh"
+    (match step baseParams withExplicit
+        (.rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))) with
+     | .ok (_, acts) => sendsTo pd acts = 1 && sendsTo pb acts = 1
+     | _ => false)
+  -- A GRAFT from an explicit peer is rejected with a PRUNE.
+  r.check "core.explicit.graft-pruned"
+    (match step baseParams { known with explicit := [pa] }
+        (.rpc pa (Pb.encodeMessage (rpcOfControl (controlOf [graftOf ta] [])))) with
+     | .ok (s', acts) => pruneCount ta acts = 1 && !(memB pa (meshOf s' ta))
+     | _ => false)
+  -- The heartbeat fills the mesh from the order but never with `pa`.
+  r.check "core.explicit.never-meshed"
+    (match step baseParams { known with explicit := [pa], mesh := [(ta, [])] }
+        (.tick 1000 [pa, pb, pc]) with
+     | .ok (s', _) => !(memB pa (meshOf s' ta)) && (meshOf s' ta).length = 2
+     | _ => false)
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }

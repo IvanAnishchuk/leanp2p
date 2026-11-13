@@ -23,6 +23,9 @@ them at start, and before each heartbeat it reconciles the router with
   heals within one heartbeat. `none` for a seam whose test drives the
   joins itself. -/
   peers : Option (BaseIO (List Libp2p.Identity.PeerId)) := none
+  /-- Dial a peer through the host's peerstore, for the explicit peers
+  the router must keep connected. `true` once a session is live. -/
+  dial : Libp2p.Identity.PeerId → Conc.Async Bool := fun _ => pure false
 
 /-- Adapt a host to the node operations. -/
 def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
@@ -34,5 +37,6 @@ def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
     | .error e => return .error (.protocol e.render)
   addNotifiee := host.addNotifiee
   peers := some host.peers
+  dial := fun peer => do return (← host.dialPeer peer) matches .ok _
 
 end Libp2p.Protocols.Gossipsub

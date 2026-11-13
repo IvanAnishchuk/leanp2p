@@ -201,6 +201,9 @@ structure State where
   /-- The IDONTWANT pairs (gossipsub v1.2): a forward of the id skips
   the peer. Newest first. -/
   dontSend : List (Peer × MessageId) := []
+  /-- The explicit peers (`gossipsub-v1.1.md`, "Explicit Peering
+  Agreements"): outside every mesh, and sent every valid message. -/
+  explicit : List Peer := []
 
 /-- The application's answer on one held message
 (`gossipsub-v1.1.md`, "Extended Validators"). -/
@@ -403,10 +406,18 @@ def iwantRpc (ids : List MessageId) : Rpc.RPC :=
 def publishRpc (m : Message) : Rpc.RPC :=
   { subscriptions := [], publish := [m], control := none }
 
-/-- The mesh peers that receive a forwarded inbound message. The sender
-already holds the message, so the list drops the sender. -/
+/-- The explicit peers that announced the topic and sit outside its mesh:
+"every new valid incoming message is forwarded to the direct peers"
+(`gossipsub-v1.1.md`, "Explicit Peering Agreements"). -/
+def explicitTargets (s : State) (topic : TopicId) : List Peer :=
+  s.explicit.filter fun q =>
+    ((peerOf s q).map (fun pd => memB topic pd.subs)).getD false && !memB q (meshOf s topic)
+
+/-- The peers that receive a forwarded inbound message: the mesh and the
+explicit peers. The sender already holds the message, so the list drops
+the sender. -/
 def inboundTargets (s : State) (sender : Peer) (topic : TopicId) : List Peer :=
-  (meshOf s topic).filter (fun q => decide (q ≠ sender))
+  (meshOf s topic ++ explicitTargets s topic).filter (fun q => decide (q ≠ sender))
 
 /-- One publish RPC per accepted message, to each mesh peer other than
 the sender. The targets are read from the pre-state mesh. -/
@@ -503,7 +514,7 @@ def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
   let need := if kept0.length < p.mesh.dLow then p.mesh.d - kept0.length else 0
   let cands := order.filter (fun q =>
     !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
-      (peerOf s q).isSome && decide (0 ≤ scoreOf p s q))
+      (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit)
   let added := cands.take need
   { topic := topic, kept := (kept0 ++ added).take p.mesh.dHigh, pruned := over, added := added }
 
@@ -803,6 +814,10 @@ def handleGraft (p : Params) (s : State) (sender : Peer) (g : Rpc.ControlGraft) 
     else if Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = true then
       (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)])
     else if p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length then
+      (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)])
+    -- "It is an error to GRAFT on an explicit peer, and such an attempt
+    -- should be logged and rejected with a PRUNE."
+    else if memB sender s.explicit then
       (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)])
     else
       match peerOf s sender with
@@ -1243,26 +1258,38 @@ private theorem handleGraft_overfull (p : Params) (s : State) (sender : Peer)
       (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)]) := by
   simp [handleGraft, hsub, hm, hb, hd]
 
+private theorem handleGraft_explicit (p : Params) (s : State) (sender : Peer)
+    (g : Rpc.ControlGraft) (hsub : memB (⟨g.topicId⟩ : TopicId) s.topics = true)
+    (hm : memB sender (meshOf s ⟨g.topicId⟩) = false)
+    (hb : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = false)
+    (hd : ¬ p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length)
+    (he : memB sender s.explicit = true) :
+    handleGraft p s sender g =
+      (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)]) := by
+  simp [handleGraft, hsub, hm, hb, hd, he]
+
 private theorem handleGraft_add (p : Params) (s : State) (sender : Peer)
     (g : Rpc.ControlGraft) (pd : PeerData)
     (hsub : memB (⟨g.topicId⟩ : TopicId) s.topics = true)
     (hm : memB sender (meshOf s ⟨g.topicId⟩) = false)
     (hb : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = false)
     (hd : ¬ p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length)
+    (he : memB sender s.explicit = false)
     (hpd : peerOf s sender = some pd) :
     handleGraft p s sender g =
       (setPeer (setTopicMesh s ⟨g.topicId⟩ (sender :: meshOf s ⟨g.topicId⟩)) sender
         { pd with score := Score.graft pd.score s.now ⟨g.topicId⟩ }, []) := by
-  simp [handleGraft, hsub, hm, hb, hd, hpd]
+  simp [handleGraft, hsub, hm, hb, hd, he, hpd]
 
 private theorem handleGraft_add_none (p : Params) (s : State) (sender : Peer)
     (g : Rpc.ControlGraft) (hsub : memB (⟨g.topicId⟩ : TopicId) s.topics = true)
     (hm : memB sender (meshOf s ⟨g.topicId⟩) = false)
     (hb : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = false)
     (hd : ¬ p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length)
+    (he : memB sender s.explicit = false)
     (hpd : peerOf s sender = none) :
     handleGraft p s sender g = (s, []) := by
-  simp [handleGraft, hsub, hm, hb, hd, hpd]
+  simp [handleGraft, hsub, hm, hb, hd, he, hpd]
 
 private theorem meshOf_addPeer (s : State) (sender : Peer) (pd : PeerData) (t topic : TopicId)
     (h : topic ≠ t) :
@@ -1290,11 +1317,15 @@ private theorem handleGraft_mesh_other (p : Params) (s : State) (sender : Peer)
           cases h' : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now <;> simp_all
         by_cases hd : p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length
         · rw [handleGraft_overfull p s sender g hsub hm' hb' hd]
-        · cases hpd : peerOf s sender with
-          | none => rw [handleGraft_add_none p s sender g hsub hm' hb' hd hpd]
-          | some pd =>
-              rw [handleGraft_add p s sender g pd hsub hm' hb' hd hpd]
-              exact meshOf_addPeer s sender _ ⟨g.topicId⟩ topic h
+        · by_cases he : memB sender s.explicit = true
+          · rw [handleGraft_explicit p s sender g hsub hm' hb' hd he]
+          · have he' : memB sender s.explicit = false := by
+              cases h' : memB sender s.explicit <;> simp_all
+            cases hpd : peerOf s sender with
+            | none => rw [handleGraft_add_none p s sender g hsub hm' hb' hd he' hpd]
+            | some pd =>
+                rw [handleGraft_add p s sender g pd hsub hm' hb' hd he' hpd]
+                exact meshOf_addPeer s sender _ ⟨g.topicId⟩ topic h
   · have hsub' : memB (⟨g.topicId⟩ : TopicId) s.topics = false := by
       cases h' : memB (⟨g.topicId⟩ : TopicId) s.topics <;> simp_all
     rw [handleGraft_unknown p s sender g hsub']
@@ -1473,7 +1504,10 @@ private theorem handleGraft_topics (p : Params) (s : State) (sender : Peer)
       · simp [handleGraft, hsub, hm, hb]
       · by_cases hd : p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length
         · simp [handleGraft, hsub, hm, hb, hd]
-        · cases hpd : peerOf s sender <;> simp [handleGraft, hsub, hm, hb, hd, hpd, setPeer, setTopicMesh]
+        · by_cases he : memB sender s.explicit = true
+          · simp [handleGraft, hsub, hm, hb, hd, he]
+          · cases hpd : peerOf s sender <;>
+              simp [handleGraft, hsub, hm, hb, hd, he, hpd, setPeer, setTopicMesh]
   · simp [handleGraft, hsub]
 
 private theorem pruneState_topics (p : Params) (s : State) (sender : Peer)
@@ -1890,13 +1924,18 @@ private theorem handleGraft_not_deliver (p : Params) (s : State) (sender : Peer)
         by_cases hd : p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length
         · rw [handleGraft_overfull p s sender g hsub hm' hb' hd]
           simp
-        · cases hpd : peerOf s sender with
-          | none =>
-              rw [handleGraft_add_none p s sender g hsub hm' hb' hd hpd]
-              simp
-          | some pd =>
-              rw [handleGraft_add p s sender g pd hsub hm' hb' hd hpd]
-              simp
+        · by_cases he : memB sender s.explicit = true
+          · rw [handleGraft_explicit p s sender g hsub hm' hb' hd he]
+            simp
+          · have he' : memB sender s.explicit = false := by
+              cases h' : memB sender s.explicit <;> simp_all
+            cases hpd : peerOf s sender with
+            | none =>
+                rw [handleGraft_add_none p s sender g hsub hm' hb' hd he' hpd]
+                simp
+            | some pd =>
+                rw [handleGraft_add p s sender g pd hsub hm' hb' hd he' hpd]
+                simp
   · have hsub' : memB (⟨g.topicId⟩ : TopicId) s.topics = false := by
       cases h' : memB (⟨g.topicId⟩ : TopicId) s.topics <;> simp_all
     rw [handleGraft_unknown p s sender g hsub']
@@ -2175,7 +2214,8 @@ private theorem planTopic_added_backoff (p : Params) (s : State) (now : Millis)
   simp only [planTopic] at h
   have hc : q ∈ order.filter (fun q =>
       !memB q (meshOf s topic) && !(Cache.Backoff.active s.backoff q topic now) &&
-        (peerOf s q).isSome && decide (0 ≤ scoreOf p s q)) := List.mem_of_mem_take h
+        (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit) :=
+    List.mem_of_mem_take h
   cases hb : Cache.Backoff.active s.backoff q topic now with
   | false => rfl
   | true =>
