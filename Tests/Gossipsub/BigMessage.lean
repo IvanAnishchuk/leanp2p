@@ -48,7 +48,7 @@ def run (r : Runner) : IO Unit := do
     { peers := [(pa, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }),
         (pb, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] })]
       mesh := [(ta, [pa, pb])], fanout := []
-      mcache := Cache.MessageCache.empty params.window
+      mcache := Cache.MessageIndex.empty params.window
       seen := Cache.SeenIndex.empty params.seen
       backoff := [], iwant := [], topics := [ta], now := 0, lastHeartbeat := 0 }
   match step params s (.rpc pa bytes) with

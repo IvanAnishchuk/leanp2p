@@ -283,6 +283,70 @@ theorem shift_preserves_windowInvariant (c : MessageCache) :
   intro _ e he
   exact shift_age_lt (c := c) he
 
+/-! ## The message index: the production message cache
+
+`MessageCache` is the model, with the theorems above. Its `get` walks
+every cached message, and the router calls it once per id of every
+IHAVE and IWANT. `MessageIndex` is the structure the router runs: a
+`HashMap` from id to the newest message and the heartbeat it was put
+in, and one list of `(id, topic)` per history window, newest window
+first. `shift` drops the oldest window, and erases an id of it only
+when no later `put` renewed it.
+
+The two agree on `get` and `gossipIds` after every sequence of `put`
+and `shift`; the property test in `Tests/Gossipsub/Cache.lean` pins
+it. -/
+
+/-- The production message cache. -/
+structure MessageIndex where
+  /-- The window counts, shared with the model. -/
+  params : WindowParams
+  /-- Each cached id: its newest message and the heartbeat of that put. -/
+  byId : Std.HashMap MessageId (Message × Nat) := {}
+  /-- One list of `(id, topic)` per window, newest window first, each
+  newest first. At most `historyLength` windows. -/
+  windows : List (List (MessageId × TopicId)) := [[]]
+  /-- The heartbeats so far. -/
+  tick : Nat := 0
+
+namespace MessageIndex
+
+/-- An empty index. -/
+def empty (p : WindowParams) : MessageIndex := { params := p }
+
+/-- Add a message to the current window: `MessageCache.put`. -/
+def put (c : MessageIndex) (id : MessageId) (m : Message) : MessageIndex :=
+  { c with byId := c.byId.insert id (m, c.tick)
+           windows := match c.windows with
+             | w :: ws => ((id, m.topic) :: w) :: ws
+             | [] => [[(id, m.topic)]] }
+
+/-- The newest message of the id: `MessageCache.get`. -/
+def get (c : MessageIndex) (id : MessageId) : Option Message :=
+  (c.byId.get? id).map (·.1)
+
+/-- Shift one heartbeat: `MessageCache.shift`. The window that reaches
+`historyLength` leaves, with each of its ids whose newest put was in
+it. -/
+def shift (c : MessageIndex) : MessageIndex :=
+  let tick := c.tick + 1
+  let windows := [] :: c.windows
+  let kept := windows.take c.params.historyLength
+  let gone := (windows.drop c.params.historyLength).flatten
+  -- A put at heartbeat `t` has age `tick - t`; it leaves at age
+  -- `historyLength`.
+  let byId := gone.foldl (fun m (id, _) =>
+    match m.get? id with
+    | some (_, t) => if c.params.historyLength ≤ tick - t then m.erase id else m
+    | none => m) c.byId
+  { c with tick, windows := kept, byId }
+
+/-- The ids gossip lists for a topic: `MessageCache.gossipIds`. -/
+def gossipIds (c : MessageIndex) (topic : TopicId) : List MessageId :=
+  ((c.windows.take c.params.historyGossip).flatten.filter (·.2 == topic)).map (·.1)
+
+end MessageIndex
+
 /-! ## Seen cache
 
 The seen cache holds the message ids observed recently. An id is seen

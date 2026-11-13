@@ -180,7 +180,7 @@ structure State where
   /-- The fanout of each topic. -/
   fanout : List (TopicId × Fanout)
   /-- The message cache. -/
-  mcache : Cache.MessageCache
+  mcache : Cache.MessageIndex
   /-- The seen cache. -/
   seen : Cache.SeenIndex
   /-- The backoff table. -/
@@ -560,7 +560,7 @@ def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
     order.filter (fun q => decide (p.thresholds.gossipThreshold ≤ scoreOf p s q))
   let topics := s.mesh.map Prod.fst ++ s.fanout.map Prod.fst
   topics.flatMap fun t =>
-    let ids := Cache.MessageCache.gossipIds s.mcache t
+    let ids := Cache.MessageIndex.gossipIds s.mcache t
     if ids = [] then []
     else
       let targets :=
@@ -578,7 +578,7 @@ def freshState (p : Params) (s : State) (now : Millis) : State :=
     lastHeartbeat := now,
     backoff := Cache.Backoff.clear s.backoff now,
     seen := Cache.SeenIndex.prune s.seen now,
-    mcache := Cache.MessageCache.shift s.mcache }
+    mcache := Cache.MessageIndex.shift s.mcache }
 
 /-- The per-topic plans of the heartbeat. -/
 def heartbeatPlans (p : Params) (s : State) (now : Millis) (order : List Peer) :
@@ -786,7 +786,7 @@ promised, and record the promise. -/
 def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) :
     State × List Action :=
   let wanted := i.messageIds.filter (fun id =>
-    !(s.seen.contains id s.now) && (Cache.MessageCache.get s.mcache id).isNone &&
+    !(s.seen.contains id s.now) && (Cache.MessageIndex.get s.mcache id).isNone &&
       !(promised s.iwant sender id))
   let s1 : State :=
     { s with
@@ -799,7 +799,7 @@ the same id. -/
 def handleIwant (p : Params) (s : State) (sender : Peer) (w : Rpc.ControlIWant) :
     State × List Action :=
   let answers := w.messageIds.filterMap (fun id =>
-    match Cache.MessageCache.get s.mcache id with
+    match Cache.MessageIndex.get s.mcache id with
     | some m => if p.msgId m = id then some m else none
     | none => none)
   (s, answers.map (fun m => Action.sendRpc sender (publishRpc m)))

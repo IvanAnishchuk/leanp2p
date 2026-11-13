@@ -91,7 +91,7 @@ private def emptyState : State :=
   { peers := []
     mesh := []
     fanout := []
-    mcache := Cache.MessageCache.empty baseParams.window
+    mcache := Cache.MessageIndex.empty baseParams.window
     seen := Cache.SeenIndex.empty baseParams.seen
     backoff := []
     iwant := []
@@ -329,7 +329,7 @@ def run (r : Runner) : IO Unit := do
   -- Gossip stays away from a peer below the gossip threshold.
   r.check "core.gossip.threshold"
     (match step gossipParams
-        { known with mcache := (Cache.MessageCache.empty baseParams.window).put ⟨[1]⟩ (msgOf ta [1]) }
+        { known with mcache := (Cache.MessageIndex.empty baseParams.window).put ⟨[1]⟩ (msgOf ta [1]) }
         (.tick 1000 [pa, pb, pc, pd]) with
      | .ok (_, acts) => ihaveCount acts = 0
      | _ => false)
@@ -341,7 +341,7 @@ def run (r : Runner) : IO Unit := do
     (match step baseParams
         { known with
           mesh := [(ta, [pa, pb])]
-          mcache := (Cache.MessageCache.empty baseParams.window).put ⟨[1]⟩ (msgOf ta [1]) }
+          mcache := (Cache.MessageIndex.empty baseParams.window).put ⟨[1]⟩ (msgOf ta [1]) }
         (.tick 1000 [pa, pb, pc, pd]) with
      | .ok (_, acts) => sendsTo pa acts = 0 && sendsTo pb acts = 0 &&
          sendsTo pc acts = 1 && sendsTo pd acts = 1 && ihaveCount acts = 2
@@ -401,7 +401,7 @@ def run (r : Runner) : IO Unit := do
   -- A cached id answers an IWANT with one publish.
   r.check "core.iwant.cached-answer"
     (match step baseParams
-        { known with mcache := (Cache.MessageCache.empty baseParams.window).put ⟨[7]⟩ (msgOf ta [7]) }
+        { known with mcache := (Cache.MessageIndex.empty baseParams.window).put ⟨[7]⟩ (msgOf ta [7]) }
         (.rpc pa (Pb.encodeMessage (iwantRpc [⟨[7]⟩]))) with
      | .ok (_, acts) => publishCount acts = 1
      | _ => false)
@@ -416,13 +416,13 @@ def run (r : Runner) : IO Unit := do
     (match step vParams meshed inbound with
      | .ok (s', acts) => validations acts = [(msgOf ta [1], ⟨[1]⟩, pa)] &&
          delivers (msgOf ta [1]) acts = 0 && publishCount acts = 0 &&
-         (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isNone && s'.pending.length = 1
+         (Cache.MessageIndex.get s'.mcache ⟨[1]⟩).isNone && s'.pending.length = 1
      | _ => false)
   r.check "core.validate.accept-forwards"
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
         [inbound, .validated ⟨[1]⟩ pa .accept] with
      | .ok (s', acts) => sendsTo pa acts = 0 && sendsTo pb acts = 1 && sendsTo pc acts = 1 &&
-         (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isSome && s'.pending.isEmpty
+         (Cache.MessageIndex.get s'.mcache ⟨[1]⟩).isSome && s'.pending.isEmpty
      | _ => false)
   r.check "core.validate.reject-scores"
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
@@ -434,7 +434,7 @@ def run (r : Runner) : IO Unit := do
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
         [inbound, .validated ⟨[1]⟩ pa .ignore] with
      | .ok (s', acts) => publishCount acts = 0 && invalidCount s' pa ta = 0 &&
-         s'.pending.isEmpty && (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isNone
+         s'.pending.isEmpty && (Cache.MessageIndex.get s'.mcache ⟨[1]⟩).isNone
      | _ => false)
   -- A held message expires after the cache history: `historyLength`
   -- heartbeats. The test window is `defaults`' 5 heartbeats of 1000 ms.

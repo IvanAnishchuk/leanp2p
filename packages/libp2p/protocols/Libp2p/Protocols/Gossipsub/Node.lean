@@ -685,7 +685,7 @@ private def initialState (p : Core.Params) (now : Millis) : Core.State :=
   { peers := []
     mesh := []
     fanout := []
-    mcache := Cache.MessageCache.empty p.window
+    mcache := Cache.MessageIndex.empty p.window
     seen := Cache.SeenIndex.empty p.seen
     backoff := []
     iwant := []
@@ -797,7 +797,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           mesh := s.mesh.map fun (t, ps) => (t, ps.length)
           topics := s.topics.length
           seen := s.seen.index.size
-          cached := s.mcache.entries.length
+          cached := s.mcache.byId.size
           pending := s.pending.length
           dontSend := s.dontSend.length
           dropped := ← drops.get

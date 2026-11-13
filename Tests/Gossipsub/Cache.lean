@@ -89,9 +89,40 @@ private def seenIndexPin (rounds ops : Nat) : Bool := Id.run do
         if model.contains (mid k) now != index.contains (mid k) now then return false
   return true
 
+/-- The property pin of `MessageIndex` to the model `MessageCache`:
+random runs of puts (ids 0 to 14, two topics, a payload that marks the
+put) and shifts, with the spec windows of five and three. After each
+operation every id must agree on `get`, and each topic on `gossipIds`. -/
+private def messageIndexPin (rounds ops : Nat) : Bool := Id.run do
+  let topics : List TopicId := [⟨"a"⟩, ⟨"b"⟩]
+  let mut seed := 11
+  for _ in [0:rounds] do
+    let mut model := MessageCache.empty window5
+    let mut index := MessageIndex.empty window5
+    for step in [0:ops] do
+      seed := lcg seed
+      if (seed / 17) % 3 == 0 then
+        model := model.shift
+        index := index.shift
+      else
+        seed := lcg seed
+        let id := mid ((seed / 19) % 15)
+        let topic : TopicId := if (seed / 23) % 2 == 0 then ⟨"a"⟩ else ⟨"b"⟩
+        let m : Message := { «from» := none, data := some [step], seqno := none, topic,
+                             signature := none, key := none }
+        model := model.put id m
+        index := index.put id m
+      for k in [0:15] do
+        if model.get (mid k) != index.get (mid k) then return false
+      for t in topics do
+        if model.gossipIds t != index.gossipIds t then return false
+  return true
+
 /-- Run the checks of this module. -/
 def run (r : Runner) : IO Unit := do
   r.section "gossipsub Cache" "vendor/specs/pubsub"
+  r.check "MessageIndex agrees with MessageCache on get and gossipIds over random runs"
+    (messageIndexPin 200 200)
   r.check "SeenIndex agrees with SeenCache on contains over random add and prune runs"
     (seenIndexPin 200 200)
 
