@@ -196,21 +196,4 @@ def idVerify (pubkey : ByteArray) (sig challengeData ephPubkey idB : ByteArray) 
       let xy := Crypto.secp256k1Recover digest r s recId
       xy.size == 64 && ofNatList (Libp2p.Identity.Enr.compress xy) == pubkey
 
-/-! ## Messages (discv5-wire.md, "Protocol Messages") -/
-
-/-- PING: `[request-id, enr-seq]`, type 0x01. -/
-def encodePing (requestId : List Nat) (enrSeq : Nat) : ByteArray :=
-  ofNatList (0x01 :: Libp2p.Identity.Rlp.encode
-    (.list [.bytes requestId, .bytes (Libp2p.Identity.Rlp.ofScalar enrSeq)]))
-
-/-- A decoded message: its type and its RLP items. -/
-def decodeMessage (pt : ByteArray) : Except Error (UInt8 × List Libp2p.Identity.Rlp.Item) := do
-  if pt.size = 0 then throw .size
-  match Libp2p.Identity.Rlp.decode? (toNatList (pt.extract 1 pt.size)) with
-  | .ok (v, []) =>
-    match v.item with
-    | .list items => return (pt.get! 0, items)
-    | _ => throw .rlp
-  | _ => throw .rlp
-
 end Libp2p.Discv5

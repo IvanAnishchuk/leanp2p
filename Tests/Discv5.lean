@@ -46,10 +46,11 @@ private def challengeData (enrSeq : String) := hex
   ("000000000000000000000000000000006469736376350001010102030405060708090a0b0c" ++
    "00180102030405060708090a0b0c0d0e0f10" ++ enrSeq)
 
-/-- The decoded PING of a packet: `(type, request-id, enr-seq)`. -/
+/-- The decoded PING of a packet, through the node's own decoder:
+`(type, request-id, enr-seq)`. -/
 private def pingOf (pt : ByteArray) : Option (UInt8 × List Nat × Nat) :=
-  match decodeMessage pt with
-  | .ok (t, [.bytes rid, .bytes seq]) => some (t, rid, Libp2p.Identity.Rlp.beNat seq)
+  match Message.decode? pt with
+  | some (.ping rid seq) => some (1, rid, seq)
   | _ => none
 
 /-! ## Two cores, in memory -/
@@ -705,6 +706,8 @@ def run (r : Runner) : IO Unit := do
     | .ok pt =>
       r.check "discv5: the ping packet holds PING, request 1, enr-seq 2"
         (pingOf pt == some (1, [0, 0, 0, 1], 2))
+      r.check "discv5: the node's encoder writes the vector's PING plaintext"
+        ((Message.ping [0, 0, 0, 1] 2).encode.toList == pt.toList)
       r.check "discv5: masking the same header and message rebuilds the packet"
         ((mask destId u.iv u.header u.message).toOption == some pingPacket)
       r.check "discv5: sealing the PING again rebuilds the message"
