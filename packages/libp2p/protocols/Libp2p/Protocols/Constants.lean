@@ -34,6 +34,10 @@ def meshsubId : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.1.0"⟩
 it. -/
 def meshsubV12Id : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.2.0"⟩
 
+/-- The gossipsub v1.3 protocol id, `/meshsub/1.3.0` (`gossipsub-v1.3.md`,
+"Protocol ID"): v1.2 plus the Extensions control message. -/
+def meshsubV13Id : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.3.0"⟩
+
 /-- The gossipsub v1.0 protocol id, `/meshsub/1.0.0`. A v1.1 router speaks v1.0 to a peer that
 offers only this id. -/
 def meshsubV10Id : Libp2p.Core.ProtocolId := ⟨"/meshsub/1.0.0"⟩

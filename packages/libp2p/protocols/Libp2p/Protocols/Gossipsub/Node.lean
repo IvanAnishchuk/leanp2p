@@ -171,6 +171,12 @@ structure Config where
   /-- The heartbeats between opportunistic grafting rounds; rust's
   `opportunistic_graft_ticks` is 60. -/
   opportunisticGraftTicks : Nat := 60
+  /-- Called for each partial message a peer sends on a topic where
+  `params.partialTopics` can send them, mesh peer or not
+  (`partial-messages.md`, "Application-Library Interface"). It runs on
+  the loop task, so it must not park. The application answers through
+  `Node.sendPartial`, and scores the parts through `Node.judgePartial`. -/
+  onPartial : Peer → Rpc.PartialMessage → BaseIO Unit := fun _ _ => pure ()
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
 Lighthouse's `lighthouse_network` metrics are off in the shadow node
@@ -195,6 +201,8 @@ structure Stats where
   dropped : Nat
   /-- The peers known to speak `/meshsub/1.2.0`. -/
   v12Peers : Nat
+  /-- The peers known to speak `/meshsub/1.3.0`. -/
+  v13Peers : Nat
 
 /-- A running node. Every field is a seam over the loop task, which is the
 only owner of the router state. -/
@@ -238,6 +246,20 @@ structure Node where
   (`Config.payloadId`); `none` off that path, or once it expired with
   the message cache. -/
   payload : MessageId → BaseIO (Option ByteArray)
+  /-- Send a partial message to a peer. The router sends the whole
+  message to a peer that requested partial messages on the topic, the
+  metadata alone to a peer that only supports them, and nothing to any
+  other peer. `false` under the same conditions as `publish`. -/
+  sendPartial : Peer → Rpc.PartialMessage → BaseIO Bool
+  /-- Score the parts a peer sent on a topic: `true` for novel valid
+  data (a first delivery), `false` for bad data (an invalid delivery).
+  `false` under the same conditions as `publish`. -/
+  judgePartial : Peer → TopicId → Bool → BaseIO Bool
+  /-- The peers to offer partial messages on a topic: the mesh, or the
+  fanout off a subscribed topic, that can take partial messages, each
+  with its request flag. `none` when the node stopped or its queue is
+  full. -/
+  partialPeers : TopicId → Conc.Async (Option (List (Peer × Bool)))
   /-- Close the event queue and join the loop task. The loop serves the
   queued events first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
@@ -258,9 +280,10 @@ def hasIhave (r : Rpc.RPC) : Bool :=
 
 /-- One subscription record: `true` subscribes, and `false` unsubscribes.
 `Core.helloRpc` holds only positive records, so the loop builds this record
-beside the code that sends it. -/
-def subOptRpc (t : TopicId) (on : Bool) : Rpc.RPC :=
-  { subscriptions := [{ subscribe := on, topicid := t.name }], publish := [], control := none }
+beside the code that sends it. A subscribe carries our partial-messages
+choice for the topic (`Core.subOpts`). -/
+def subOptRpc (p : Core.Params) (t : TopicId) (on : Bool) : Rpc.RPC :=
+  { subscriptions := [Core.subOpts p t on], publish := [], control := none }
 
 /-- The one input queue carries core events and alarm wakes. -/
 inductive Input where
@@ -281,6 +304,10 @@ structure Outbound where
   queue : Conc.Chan ByteArray
   /-- Stop resets this stream to wake a parked write. -/
   stream : Conc.OnceRef (Option Streams.Stream)
+  /-- No frame entered the queue yet. The first one carries our
+  Extensions message, since each writer opens its own stream
+  (`gossipsub-v1.3.md`: "the first message on the stream"). -/
+  fresh : Conc.OnceRef Bool
 
 /-- Close a queue and reset its stream to wake its writer. -/
 private def endOutbound (ob : Outbound) : Conc.Async Unit := do
@@ -301,9 +328,10 @@ private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     (outbound.update (fun table => table.filter (fun e => e.2.id != ob.id)) : BaseIO Unit)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
-    -- v1.2 first: a peer answers `na` to an id it lacks, and the
-    -- negotiation falls back to v1.1.
-    match ← host.newStream peer [Constants.meshsubV12Id, Constants.meshsubId] with
+    -- The newest first: a peer answers `na` to an id it lacks, and the
+    -- negotiation falls back to v1.2, then v1.1.
+    match ← host.newStream peer [Constants.meshsubV13Id, Constants.meshsubV12Id,
+        Constants.meshsubId] with
     | .ok (id, stream) =>
       (onVersion peer id : BaseIO Unit)
       (ob.stream.set (some stream) : BaseIO Unit)
@@ -474,9 +502,11 @@ private structure Env where
 A full queue drops its frame. Each peer has one writer and one stream. -/
 private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Bool := do
   if ← env.closing.get then return true
-  -- IDONTWANT goes to a v1.2 peer only (`gossipsub-v1.2.md`); for any
-  -- other peer, and before the version is known, the control drops it.
-  let v12 := ((← env.versions.get).lookup peer) == some Constants.meshsubV12Id
+  -- IDONTWANT goes to a v1.2 or v1.3 peer only (`gossipsub-v1.2.md`);
+  -- for any other peer, and before the version is known, the control
+  -- drops it.
+  let version := (← env.versions.get).lookup peer
+  let v12 := version == some Constants.meshsubV12Id || version == some Constants.meshsubV13Id
   let rpc := match rpc0.control with
     | some c => if v12 || c.idontwant.isEmpty then rpc0
       else { rpc0 with control := some { c with idontwant := [] } }
@@ -489,6 +519,26 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
       !(match rpc0.control with | some c => c.idontwant.isEmpty | none => true) then
     -- Only an IDONTWANT, and the peer cannot take it.
     return true
+  let table ← env.outbound.get
+  let ob ← match table.find? (fun e => e.1 == peer) with
+    | some (_, ob) => pure ob
+    | none => do
+      let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
+      let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none,
+                             fresh := ← Conc.OnceRef.new true }
+      env.outbound.update (fun table => (peer, ob) :: table)
+      let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
+        env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
+      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record peer ob)
+      pure ob
+  -- The first frame of a stream carries the Extensions message. A v1.1
+  -- or v1.2 peer skips field 6 as an unknown field.
+  let first ← ob.fresh.updateGet fun f => (f, false)
+  let rpc := match first, Core.ownExtensions env.config.params with
+    | true, some ext =>
+      let c := rpc.control.getD { ihave := [], iwant := [], graft := [], prune := [] }
+      { rpc with control := some { c with extensions := some ext } }
+    | _, _ => rpc
   (env.config.onSend peer rpc : BaseIO Unit)
   -- On the payload path the published messages carry handles, and the
   -- frame takes the stored payloads back (`Payload.joinOutbound`).
@@ -500,18 +550,11 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
         some (Bytes.ofNatList (Streams.Framing.encodeLength .uvarint body.size) ++ body)
         else none)
     else pure ((Rpc.encodeFrame? rpc env.config.maxRpcSize).map Bytes.ofNatList)
-  let some frame := frame? | return false
-  let table ← env.outbound.get
-  let ob ← match table.find? (fun e => e.1 == peer) with
-    | some (_, ob) => pure ob
-    | none => do
-      let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
-      let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none }
-      env.outbound.update (fun table => (peer, ob) :: table)
-      let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
-        env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
-      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record peer ob)
-      pure ob
+  let some frame := frame? | do
+    -- The frame is dropped; the next one takes the Extensions message.
+    -- The loop is the only task that touches `fresh`.
+    if first then ob.fresh.update fun _ => true
+    return false
   if ← env.closing.get then
     ob.queue.close
     return true
@@ -577,6 +620,7 @@ private def perform (env : Env) (gossipAt : Option Millis) (index : Nat)
     match action with
     | .deliver m => (deliver env.subs m : BaseIO Unit)
     | .validate m id source => env.config.onValidate m id source
+    | .partialIn source pm => env.config.onPartial source pm
     | .sendRpc to rpc =>
       match gossipAt with
       | some now =>
@@ -598,16 +642,16 @@ private def announce (env : Env) (st : LoopState) (event : Core.Event) :
     BaseIO LoopState := do
   match event with
   | .subscribe t =>
-    let rpc := subOptRpc t true
+    let rpc := subOptRpc st.params t true
     for (peer, _) in st.router.peers do
       enqueue env peer rpc
   | .unsubscribe t =>
-    let rpc := subOptRpc t false
+    let rpc := subOptRpc st.params t false
     for (peer, _) in st.router.peers do
       enqueue env peer rpc
   | .peerJoined peer _ =>
     if !st.router.topics.isEmpty then
-      enqueue env peer (Core.helloRpc st.router.topics)
+      enqueue env peer (Core.helloRpc st.router.topics (some st.params))
   | _ => pure ()
   return st
 
@@ -662,7 +706,8 @@ private def reconcile (env : Env) (st : LoopState) : BaseIO LoopState := do
   let some livePeers := env.host.peers | return st
   let live ← livePeers
   let unsup ← env.unsupported.get
-  let known := st.router.peers.map (·.1)  let mut st := st
+  let known := st.router.peers.map (·.1)
+  let mut st := st
   for q in known do
     if !live.contains q || unsup.contains q then
       st ← stepAndAct env st (.peerLeft q)
@@ -795,7 +840,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
         payloads.update fun m =>
           ps.foldl (fun m (id, d) => if m.contains id then m else m.insert id (d, t)) m
         return some small
-  -- Both versions are served; the handler's id tells the peer's choice.
+  -- Every version is served; the handler's id tells the peer's choice.
+  host.setHandler (handler events config.maxRpcSize Constants.meshsubV13Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubId record split)
   let tasks ← Conc.TaskSet.new
@@ -899,13 +945,28 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           pending := s.pending.length
           dontSend := s.dontSend.length
           dropped := ← drops.get
-          v12Peers := ((← versions.get).filter (·.2 == Constants.meshsubV12Id)).length }
+          v12Peers := ((← versions.get).filter (·.2 == Constants.meshsubV12Id)).length
+          v13Peers := ((← versions.get).filter (·.2 == Constants.meshsubV13Id)).length }
       if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv
     setTopicParams := fun topic tp => do
       if ← closing.get then return false
       events.trySend (.setTopicParams topic tp)
+    sendPartial := fun peer pm => post (.sendPartial peer pm)
+    judgePartial := fun peer topic valid => post (.partialJudged peer topic valid)
+    partialPeers := fun topic => do
+      if ← (closing.get : BaseIO Bool) then return none
+      let reply : Conc.Chan (List (Peer × Bool)) ← Conc.Chan.new 1
+      let k : Core.Params → Core.State → BaseIO Unit := fun _ s => do
+        let targets := if Core.memB topic s.topics then Core.meshOf s topic else Core.fanoutOf s topic
+        let pairs := targets.filterMap fun q =>
+          let o := Core.peerPartial s q topic
+          if o.sends then some (q, o.requests) else none
+        discard <| reply.trySend pairs
+      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      -- Park: the loop answers, or `stop` closes the queue after serving it.
+      reply.recv
     dropped := drops.get
     stop := do
       let first ← (closing.updateGet (fun was => (!was, true)) : BaseIO Bool)

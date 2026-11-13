@@ -53,7 +53,7 @@ private partial def receiveWhere {α : Type} (c : Chan α) (wanted : α → Bool
   | some value => if wanted value then pure (some value) else receiveWhere c wanted
   | none => pure none
 
-private def marker : Rpc.RPC := subOptRpc ⟨"node-suite-barrier"⟩ false
+private def marker : Rpc.RPC := subOptRpc Core.defaults ⟨"node-suite-barrier"⟩ false
 
 /-- A clock with a signal for the absolute time of each armed deadline. -/
 private structure ClockProbe where
@@ -499,13 +499,13 @@ private def postJoinSubscriptionChecks (r : Tests.Runner) : Async Unit := do
   let stream ← openStream source pa
   let first ← receive seen
   r.check "node.post-join-subscription.receives-topic"
-    (first.map (fun s => s.rpc) == some (subOptRpc topic true))
+    (first.map (fun s => s.rpc) == some (subOptRpc Core.defaults topic true))
   let markerTopic : TopicId := ⟨"post-join-marker"⟩
   discard (f.node.subscribe markerTopic (fun _ => pure ()) : BaseIO Bool)
   r.check "node.post-join-subscription.marker-barrier" (← barrier f)
   let second ← receive seen
   r.check "node.post-join-subscription.exactly-one"
-    (second.map (fun s => s.rpc) == some (subOptRpc markerTopic true) &&
+    (second.map (fun s => s.rpc) == some (subOptRpc Core.defaults markerTopic true) &&
       (← (seen.tryRecv : BaseIO (Option Seen))).isNone)
   stream.close
   discard (f.node.peerLeft pb : BaseIO Bool)
@@ -532,7 +532,7 @@ private def surfaceChecks (r : Tests.Runner) : Async Unit := do
   let record ← receive seen
   let graft ← receive seen
   r.check "node.surface.announcement-precedes-graft"
-    (record.any (fun s => s.rpc == subOptRpc topic true) &&
+    (record.any (fun s => s.rpc == subOptRpc Core.defaults topic true) &&
       graft.any (fun s => s.rpc.control.any (fun c => !c.graft.isEmpty)))
   discard (f.node.subscribe topic (fun _ => discard <| tags.trySend 2) : BaseIO Bool)
   discard (f.node.subscribe ⟨"other"⟩ (fun _ => discard <| tags.trySend 9) : BaseIO Bool)
@@ -546,7 +546,7 @@ private def surfaceChecks (r : Tests.Runner) : Async Unit := do
   discard (seen.drain : BaseIO (List Seen))
   discard (f.node.unsubscribe topic : BaseIO Bool)
   r.check "node.surface.unsubscribe-barrier" (← barrier f)
-  let off ← receiveWhere seen (fun s => s.rpc == subOptRpc topic false)
+  let off ← receiveWhere seen (fun s => s.rpc == subOptRpc Core.defaults topic false)
   r.check "node.surface.negative-subscription-record" off.isSome
   discard <| stream.write (frame (Core.publishRpc (message [21])) ++ frame marker)
   r.check "node.surface.post-unsubscribe-barrier" ((← receive f.barriers).isSome)

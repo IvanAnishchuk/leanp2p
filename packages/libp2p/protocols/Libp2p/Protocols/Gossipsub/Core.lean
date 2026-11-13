@@ -7,7 +7,8 @@ import Libp2p.Protocols.Gossipsub.Sign
 /-!
 # Gossipsub router core
 
-The pure state machine of the gossipsub v1.1 router: the state, the
+The pure state machine of the gossipsub router, v1.1 with the v1.2
+IDONTWANT and the v1.3 partial-messages extension: the state, the
 external events, the outgoing actions, the one error constructor, and
 the total `step`. Time and the peer order enter as event data, so the
 core reads no clock and makes no random choice. `run` drives a list of
@@ -27,43 +28,31 @@ so a later echo of the same id is not forwarded again.
 The heartbeat emits gossip after it settles the mesh and before it
 shifts the message cache. The recipients are peers of the supplied order
 at or above the gossip threshold that are in neither the mesh nor the
-fanout of the topic, up to `dLazy` per topic. `gossipFactor` is stored
-and never read, so the emission count is not adaptive.
+fanout of the topic. Their count is adaptive: at least `dLazy`, and
+`gossipFactor` percent of the candidates when that is more.
 
-Several fields of the spec are stored and never read, and several
-behaviors are absent:
+Gaps that remain:
 
 - `PubsubProto` is stored and no path reads it, so floodsub peers are
   not a separate forward set.
 - `ControlPrune.peers` decodes and `handlePrune` ignores it, so peer
   exchange is absent. `acceptPXThreshold` is never read.
-- `opportunisticGraftThreshold` is never read.
-- `fanoutTtl` is never read, so a fanout entry does not expire.
-- `handleIhave` records a promise and nothing calls
-  `PromiseTable.broken`, so an expired promise changes no score.
-- No event writes `appScore`, `ipColocation`, or `behaviourPenalty`, so
-  P5, P6, and P7 have no producer. `PeerData` carries no address.
-- `meshMessageDeliveriesWindow` is never read. A mesh peer counts
-  toward P3 for every accepted message.
-- `leave` deletes the peer record, so a score does not survive a
-  disconnect.
-- `planTopic` drops the oldest mesh entries. `dScore` is never read and
-  there is no outbound flag, so the `D_out` quota is absent.
-- `validationOk` uses `strictNoSign`. There is no per-topic policy and
-  no Ignore outcome. `defaults.msgId` is the payload, because that
-  policy leaves `from` and `seqno` absent and the spec's default id
-  would be empty for every accepted message.
-- IHAVE and IWANT caps and flood publishing are absent.
-  `publishThreshold` is stored and never read.
+- `validationOk` uses `strictNoSign`, with no per-topic policy.
+  `defaults.msgId` is the payload, because that policy leaves `from`
+  and `seqno` absent and the spec's default id would be empty for every
+  accepted message.
 - A graft for a topic the router does not subscribe to is ignored. The
   v1.0 spec answers with a prune, and the v1.1 spam measures say to
   ignore it. This step follows v1.1.
-- `unsubscribe` writes `pruneBackoff`. The spec's shorter unsubscribe
-  backoff is absent, and `subscribe` does not consult the backoff.
+- The partial-messages choices are fixed parameters
+  (`Params.partialTopics`), so a node never changes its `SubOpts` flags
+  on a topic it already announced.
 
 The spec sections are `vendor/specs/pubsub/gossipsub/gossipsub-v1.0.md`
-(the router, the message cache, the mesh, the fanout, the heartbeat) and
-`gossipsub-v1.1.md` (the score gates, the backoff, the spam measures).
+(the router, the message cache, the mesh, the fanout, the heartbeat),
+`gossipsub-v1.1.md` (the score gates, the backoff, the spam measures),
+`gossipsub-v1.2.md` (IDONTWANT), and `gossipsub-v1.3.md` with
+`partial-messages.md` (the extensions).
 The root `docs/ARCHITECTURE.md` section 3.3 fixes the shape: one total
 `step` that returns `Except ProtocolError (State × List Action)`, with
 time as an input.
@@ -85,6 +74,19 @@ inductive PubsubProto where
   | floodsub
   deriving DecidableEq, BEq, Repr
 
+/-- A partial-messages choice for one topic (`partial-messages.md`,
+"Changes to `SubOpts`"): `requests` asks for partial messages, and
+`supports` can send them. A request implies support. -/
+structure PartialOpts where
+  /-- Partial messages are wanted on the topic. -/
+  requests : Bool := false
+  /-- Partial messages can be sent on the topic. -/
+  supports : Bool := false
+  deriving DecidableEq, BEq, Repr
+
+/-- The choice can send partial messages: a request implies support. -/
+def PartialOpts.sends (o : PartialOpts) : Bool := o.requests || o.supports
+
 /-- The per-peer record: the score state, the pubsub protocol, and the
 topics the peer announced. `Peer` keeps its one meaning, the peer id of
 `Types.lean`. -/
@@ -100,6 +102,13 @@ structure PeerData where
   outbound : Bool := false
   /-- The peer's IP address bytes, for P₆'s colocation count. -/
   ip : Option (List Nat) := none
+  /-- The partial-messages choice the peer announced, per topic. -/
+  partialSubs : List (TopicId × PartialOpts) := []
+  /-- An RPC from the peer arrived: an Extensions message after this
+  breaks the first-message rule (`gossipsub-v1.3.md`). -/
+  rpcSeen : Bool := false
+  /-- The peer's Extensions message, from its first RPC. -/
+  extensions : Option Rpc.ControlExtensions := none
 
 /-- The mesh degree parameters: `d`, `dLow`, `dHigh`, `dScore`, `dLazy`. -/
 structure MeshParams where
@@ -190,6 +199,10 @@ structure Params where
   `opportunisticGraftThreshold` grafts up to this many peers that score
   above the median. rust grafts 2 every 60 heartbeats. -/
   opportunisticGraftPeers : Nat := 2
+  /-- Our partial-messages choice per topic (gossipsub v1.3,
+  `partial-messages.md`). A topic not listed takes full messages only.
+  Any entry that can send makes the node announce the extension. -/
+  partialTopics : List (TopicId × PartialOpts) := []
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -285,6 +298,15 @@ inductive Event where
   | peerInfo (peer : Peer) (outbound : Bool) (ip : Option (List Nat))
   /-- The application's score of a peer: P₅ (`gossipsub-v1.1.md`, "P₅"). -/
   | appScore (peer : Peer) (score : Int)
+  /-- The application sends a partial message to a peer
+  (`partial-messages.md`, "Application-Library Interface"). The core
+  drops the data for a peer that did not request it, and drops the whole
+  message for a peer that cannot send partial messages. -/
+  | sendPartial (peer : Peer) (msg : Rpc.PartialMessage)
+  /-- The application judged the parts a peer sent on a topic: novel
+  valid data counts as a first delivery, bad data as an invalid one
+  (Fulu `partial-columns/p2p-interface.md`, the scoring hooks). -/
+  | partialJudged (peer : Peer) (topic : TopicId) (valid : Bool)
   deriving Repr
 
 /-- The outgoing actions. -/
@@ -296,6 +318,9 @@ inductive Action where
   /-- Hand a held message to the application for its answer, with its
   id and its propagation source (`Params.validateMessages`). -/
   | validate (msg : Message) (id : MessageId) (source : Peer)
+  /-- Hand a partial message from a peer to the application, mesh peer
+  or not (`partial-messages.md`, "Application-Library Interface"). -/
+  | partialIn (source : Peer) (msg : Rpc.PartialMessage)
   deriving DecidableEq, BEq, Repr
 
 /-- The one error constructor: an RPC that does not decode. -/
@@ -422,6 +447,7 @@ def delivers : List Action → List Message
   | .deliver m :: as => m :: delivers as
   | .sendRpc _ _ :: as => delivers as
   | .validate _ _ _ :: as => delivers as
+  | .partialIn _ _ :: as => delivers as
 
 /-! ## Outgoing RPC constructors -/
 
@@ -429,9 +455,58 @@ def delivers : List Action → List Message
 def controlRpc (c : Rpc.ControlMessage) : Rpc.RPC :=
   { subscriptions := [], publish := [], control := some c }
 
-/-- The hello RPC: one subscription record per topic. -/
-def helloRpc (topics : List TopicId) : Rpc.RPC :=
-  { subscriptions := topics.map (fun t => ({ subscribe := true, topicid := t.name } : Rpc.SubOpts)),
+/-! ## Partial messages (gossipsub v1.3)
+
+The extension's state is per peer and per topic: the choice each peer
+announced in its `SubOpts`. The core reads it in four places. A forward
+of a full message skips a peer that takes partial messages on its topic.
+Gossip skips such a peer too ("Partial Message Gossip"). An outbound
+partial message loses its data for a peer that did not request it. An
+inbound partial message goes to the application. -/
+
+/-- Our choice for topic `t`. -/
+def partialOpts (p : Params) (t : TopicId) : PartialOpts :=
+  ((p.partialTopics.find? (fun e => decide (e.1 = t))).map (·.2)).getD {}
+
+/-- The choice peer `q` announced for `t`. -/
+def peerPartial (s : State) (q : Peer) (t : TopicId) : PartialOpts :=
+  ((peerOf s q).bind fun pd => (pd.partialSubs.find? (fun e => decide (e.1 = t))).map (·.2)).getD {}
+
+/-- `q` takes partial messages on `t` in place of full ones: it
+requested them, and we can send them (`partial-messages.md`, "Behavior
+table"). -/
+def wantsPartial (p : Params) (s : State) (q : Peer) (t : TopicId) : Bool :=
+  (partialOpts p t).sends && (peerPartial s q t).requests
+
+/-- Drop each send of a full message to a peer that takes partial
+messages on its topic. Other actions pass. -/
+def dropForPartial (p : Params) (s : State) (acts : List Action) : List Action :=
+  acts.filter fun a => match a with
+    | .sendRpc q r => !(r.publish.any fun m => wantsPartial p s q m.topic)
+    | _ => true
+
+theorem mem_dropForPartial {p : Params} {s : State} {acts : List Action} {a : Action}
+    (h : a ∈ dropForPartial p s acts) : a ∈ acts :=
+  (List.mem_filter.1 h).1
+
+/-- The Extensions message the node sends first on each stream: present
+when some topic can send partial messages (`gossipsub-v1.3.md`). -/
+def ownExtensions (p : Params) : Option Rpc.ControlExtensions :=
+  if p.partialTopics.any (·.2.sends) then some { partialMessages := true } else none
+
+/-- One subscription record with our choice for the topic. An
+unsubscribe carries no flags: the receiver ignores them there. -/
+def subOpts (p : Params) (t : TopicId) (on : Bool) : Rpc.SubOpts :=
+  let o : PartialOpts := if on then partialOpts p t else {}
+  { subscribe := on, topicid := t.name, requestsPartial := o.requests,
+    supportsSendingPartial := o.sends }
+
+/-- The hello RPC: one subscription record per topic, with our choice
+for each. -/
+def helloRpc (topics : List TopicId) (p : Option Params := none) : Rpc.RPC :=
+  { subscriptions := topics.map (fun t => match p with
+      | some p => subOpts p t true
+      | none => ({ subscribe := true, topicid := t.name } : Rpc.SubOpts)),
     publish := [], control := none }
 
 /-- A graft of the topic. -/
@@ -653,8 +728,10 @@ def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
       -- Adaptive gossip (`gossipsub-v1.1.md`, lines 165 to 184): at
       -- least `dLazy` peers, and `gossipFactor` percent of the
       -- candidates when that is more.
+      -- A peer that takes partial messages gets no IHAVE on the topic
+      -- (`partial-messages.md`, "Partial Message Gossip").
       let cands := eligible.filter (fun q =>
-          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)))
+          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !wantsPartial p s q t)
       let targets := cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
       targets.map fun q => Action.sendRpc q (ihaveRpc t ids)
 
@@ -754,10 +831,23 @@ def applySubOpts (subs : List TopicId) (o : Rpc.SubOpts) : List TopicId :=
   if o.subscribe then (if memB t subs then subs else t :: subs)
   else subs.filter (fun u => decide (u ≠ t))
 
-/-- Update the announced topics of the sender. -/
+/-- One subscription option against the partial-messages choices. A
+subscribe records the flags; an unsubscribe drops them, and its own
+flags are ignored (`partial-messages.md`, "Changes to `SubOpts`"). -/
+def applyPartialOpts (ps : List (TopicId × PartialOpts)) (o : Rpc.SubOpts) :
+    List (TopicId × PartialOpts) :=
+  let t : TopicId := ⟨o.topicid⟩
+  let rest := ps.filter (fun e => decide (e.1 ≠ t))
+  if o.subscribe && (o.requestsPartial || o.supportsSendingPartial) then
+    (t, { requests := o.requestsPartial,
+          supports := o.requestsPartial || o.supportsSendingPartial }) :: rest
+  else rest
+
+/-- Update the announced topics of the sender, and its choices. -/
 def handleSubs (s : State) (sender : Peer) (subs : List Rpc.SubOpts) : State :=
   match peerOf s sender with
-  | some pd => setPeer s sender { pd with subs := subs.foldl applySubOpts pd.subs }
+  | some pd => setPeer s sender { pd with subs := subs.foldl applySubOpts pd.subs,
+                                          partialSubs := subs.foldl applyPartialOpts pd.partialSubs }
   | none => s
 
 /-- Note `sender` in the delivery record of each message. A first
@@ -802,7 +892,7 @@ def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
       let sc' := Score.firstDelivery p.score sc m.topic
       if memB sender (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')) s2
   (recordDeliveries p true sender s3 valid, r.accepted.map (fun m => Action.deliver m) ++
-    forwardPubs s sender r.accepted)
+    dropForPartial p s (forwardPubs s sender r.accepted))
 
 /-- An IDONTWANT of the ids. -/
 def idontwantRpc (ids : List MessageId) : Rpc.RPC :=
@@ -895,7 +985,7 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
         else st) s3
       -- The forward skips the IDONTWANT peers; the seen cache stops a
       -- second forward, so the pairs of this id go.
-      (forgetDontWant s4 id, dropDontWant p s (forwardPubs s src [m]))
+      (forgetDontWant s4 id, dropDontWant p s (dropForPartial p s (forwardPubs s src [m])))
     | .reject =>
       -- Every sender of an invalid message takes P₄, as go's
       -- `markInvalidMessageDelivery` does for each peer of the record.
@@ -1102,14 +1192,64 @@ def handleControl (p : Params) (s : State) (sender : Peer) :
   | none => (s, [])
   | some c => (controlPrunes p s sender c, controlActions p s sender c)
 
-/-- Handle a decoded RPC: subscriptions, published messages, control. -/
+/-- Note the sender's Extensions message. It belongs in the first RPC,
+once; a later one costs a P₇ penalty (`gossipsub-v1.3.md`, "Peer Scoring
+on Protocol Violations"). -/
+def noteExtensions (s : State) (sender : Peer) (rpc : Rpc.RPC) : State :=
+  match peerOf s sender with
+  | none => s
+  | some pd =>
+    let ext := rpc.control.bind (·.extensions)
+    let extensions := if pd.rpcSeen then pd.extensions else ext
+    let s1 := setPeer s sender { pd with rpcSeen := true, extensions }
+    if pd.rpcSeen && ext.isSome then updateScoreOf s1 sender Score.behaviourPenalty else s1
+
+/-- The topic a partial message names. -/
+def partialTopic (pm : Rpc.PartialMessage) : TopicId :=
+  ⟨(pm.topicId.bind fun b => Bytes.toString? (Bytes.ofNatList b)).getD ""⟩
+
+/-- An inbound partial message goes to the application, mesh peer or
+not. A topic where we cannot send partial messages drops it. Data on a
+topic where we did not request partial messages costs a P₇ penalty
+(`partial-messages.md`, "Changes to `SubOpts`"). Our choices are fixed
+parameters, so the spec's allowance for a peer that has not yet seen our
+latest `SubOpts` never applies. -/
+def handlePartialIn (p : Params) (s : State) (sender : Peer) :
+    Option Rpc.PartialMessage → State × List Action
+  | none => (s, [])
+  | some pm =>
+    let o := partialOpts p (partialTopic pm)
+    if pm.partialMessage.isSome && !o.requests then
+      (updateScoreOf s sender Score.behaviourPenalty, [])
+    else if o.sends then (s, [Action.partialIn sender pm])
+    else (s, [])
+
+/-- The application sends a partial message to `q`. A peer that
+requested partial messages on the topic gets it whole. A peer that only
+supports them gets the metadata without the data. Any other peer gets
+nothing; so does any topic where we cannot send them. -/
+def sendPartial (p : Params) (s : State) (q : Peer) (pm : Rpc.PartialMessage) : List Action :=
+  let t := partialTopic pm
+  let theirs := peerPartial s q t
+  let rpc (m : Rpc.PartialMessage) : Rpc.RPC :=
+    { subscriptions := [], publish := [], control := none, partialRpc := some m }
+  if !(partialOpts p t).sends then []
+  else if theirs.requests then [Action.sendRpc q (rpc pm)]
+  else if theirs.supports && pm.partsMetadata.isSome then
+    [Action.sendRpc q (rpc { pm with partialMessage := none })]
+  else []
+
+/-- Handle a decoded RPC: subscriptions, published messages, control,
+the Extensions message, and a partial message. -/
 def handleRpc (p : Params) (s : State) (sender : Peer) (rpc : Rpc.RPC) :
     State × List Action :=
   let s1 := handleSubs s sender rpc.subscriptions
   let (s2, a2) := if p.validateMessages then holdPubs p s1 sender rpc.publish
     else handlePubs p s1 sender rpc.publish
   let (s3, a3) := handleControl p s2 sender rpc.control
-  (noteDontWant p s3 sender rpc.control, a2 ++ a3)
+  let s4 := noteExtensions (noteDontWant p s3 sender rpc.control) sender rpc
+  let (s5, a5) := handlePartialIn p s4 sender rpc.partialRpc
+  (s5, a2 ++ a3 ++ a5)
 
 /-- The RPC branch gates: a graylisted peer is ignored, an unknown peer
 is ignored, and a decode failure is the one error. -/
@@ -1162,7 +1302,8 @@ def publishLocal (p : Params) (s : State) (m : Message) : State × List Action :
         mcache := s.mcache.put (p.msgId m) m
         seen := s.seen.add (p.msgId m) s.now }
     let s2 := if memB m.topic s1.topics then s1 else extendFanout p s1 m.topic
-    (s2, (publishTargets p s2 m.topic).map (fun q => Action.sendRpc q (publishRpc m)))
+    (s2, dropForPartial p s2
+      ((publishTargets p s2 m.topic).map (fun q => Action.sendRpc q (publishRpc m))))
   else (s, [])
 
 /-- The application subscribes: add the topic, move the fanout peers
@@ -1216,6 +1357,10 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
       | none => (s, []))
   | .appScore peer score =>
     .ok (updateScoreOf s peer (fun sc => { sc with appScore := score }), [])
+  | .sendPartial peer msg => .ok (s, sendPartial p s peer msg)
+  | .partialJudged peer topic valid =>
+    .ok (updateScoreOf s peer (fun sc =>
+      if valid then Score.firstDelivery p.score sc topic else Score.invalidDelivery p.score sc topic), [])
 
 /-- The transcript driver: the events in order. The first error stops
 the run. -/
@@ -2280,7 +2425,10 @@ private theorem publishLocal_not_deliver (p : Params) (s : State) (msg : Message
     (m : Message) : Action.deliver m ∉ (publishLocal p s msg).2 := by
   unfold publishLocal
   by_cases h : validationOk p msg
-  · simp [h, List.mem_map]
+  · intro hm
+    simp only [h, ↓reduceIte] at hm
+    have hm' := mem_dropForPartial hm
+    simp [List.mem_map] at hm'
   · simp [h]
 
 private theorem subscribe_not_deliver (p : Params) (s : State) (topic : TopicId)
@@ -2355,9 +2503,26 @@ private theorem handleValidated_not_deliver (p : Params) (s : State) (id : Messa
   split at h
   · simp at h
   · cases outcome with
-    | accept => exact forwardPubs_not_deliver s _ _ m (mem_dropDontWant h)
+    | accept => exact forwardPubs_not_deliver s _ _ m (mem_dropForPartial (mem_dropDontWant h))
     | reject => simp at h
     | ignore => simp at h
+
+private theorem handlePartialIn_not_deliver (p : Params) (s : State) (sender : Peer)
+    (o : Option Rpc.PartialMessage) (m : Message) :
+    Action.deliver m ∉ (handlePartialIn p s sender o).2 := by
+  cases o with
+  | none => simp [handlePartialIn]
+  | some pm =>
+    simp only [handlePartialIn]
+    (repeat' split) <;> simp
+
+private theorem sendPartial_not_deliver (p : Params) (s : State) (q : Peer)
+    (pm : Rpc.PartialMessage) (m : Message) : Action.deliver m ∉ sendPartial p s q pm := by
+  unfold sendPartial
+  by_cases h1 : (partialOpts p (partialTopic pm)).sends <;>
+    by_cases h2 : (peerPartial s q (partialTopic pm)).requests <;>
+    by_cases h3 : (peerPartial s q (partialTopic pm)).supports && pm.partsMetadata.isSome <;>
+    simp_all
 
 /-- A message reaches the application only when the pre-state seen cache
 does not hold its id. Under `Params.validateMessages` no step delivers
@@ -2429,6 +2594,14 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
       simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
       obtain ⟨-, rfl⟩ := hstep
       simp at hdel
+  | sendPartial peer msg =>
+      simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
+      obtain ⟨-, rfl⟩ := hstep
+      exact absurd hdel (sendPartial_not_deliver p s peer msg m)
+  | partialJudged peer topic valid =>
+      simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
+      obtain ⟨-, rfl⟩ := hstep
+      simp at hdel
   | rpc sender bytes =>
       simp only [step, rpcStep] at hstep
       split at hstep
@@ -2455,7 +2628,7 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
             have hacts : acts = (handleRpc p s sender rpc).2 := by rw [h1]
             rw [hacts] at hdel
             simp only [handleRpc, List.mem_append] at hdel
-            rcases hdel with hdel | hdel
+            rcases hdel with (hdel | hdel) | hdel
             · split at hdel
               · exact absurd hdel (holdPubs_not_deliver p _ sender rpc.publish m)
               simp only [handlePubs, List.mem_append] at hdel
@@ -2472,7 +2645,7 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
                   (handleSubs s sender rpc.subscriptions).seen
                   (List.filter (fun m => validationOk p m) rpc.publish) m hm'
                 rwa [hseen, hnow] at hgate
-              · exact absurd hdl
+              · exact absurd (mem_dropForPartial hdl)
                   (forwardPubs_not_deliver (handleSubs s sender rpc.subscriptions) sender
                     ((accept (handleSubs s sender rpc.subscriptions).seen
                         (handleSubs s sender rpc.subscriptions).now p.msgId []
@@ -2486,6 +2659,7 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
                   rw [hctl] at hdel
                   simp only [handleControl] at hdel
                   exact absurd hdel (controlActions_not_deliver p _ sender c m)
+            · exact absurd hdel (handlePartialIn_not_deliver p _ sender rpc.partialRpc m)
 
 /-! ## The backoff theorem -/
 

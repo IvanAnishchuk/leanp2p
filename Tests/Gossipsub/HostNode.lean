@@ -86,10 +86,10 @@ def run (r : Runner) : IO Unit := Async.run do
       r.check "hosts: stats count one peer, no topic, no drop"
         (s.peers == 1 && s.topics == 0 && s.pending == 0 && s.dropped == 0)
     | none => r.check "hosts: stats answer" false
-    -- Both nodes serve /meshsub/1.2.0, so the pair negotiates it. The
+    -- Both nodes serve /meshsub/1.3.0, so the pair negotiates it. The
     -- writer records the version when its open returns, on its own task.
-    r.check "hosts: the pair negotiates meshsub 1.2.0"
-      (← waitStats p.clock server (·.v12Peers == 1) 3)
+    r.check "hosts: the pair negotiates meshsub 1.3.0"
+      (← waitStats p.clock server (·.v13Peers == 1) 3)
     r.check "hosts: a meshsub peer stays across heartbeats"
       ((← waitPeers p.clock server (!·.contains clientPeer) 5) == false)
     discard (p.client.closePeer p.serverPeer : BaseIO Bool)
@@ -151,7 +151,7 @@ def run (r : Runner) : IO Unit := Async.run do
     discard (server.subscribe topic (fun _ => pure ()) : BaseIO Bool)
     discard <| waitPeers p.clock client (·.contains p.serverPeer) 4
     -- The server's subscription reaches the client on the server's stream.
-    discard <| waitStats p.clock server (·.v12Peers == 1) 4
+    discard <| waitStats p.clock server (·.v13Peers == 1) 4
     let mut counted := false
     for _ in [0:4] do
       discard (client.publish topic ⟨Array.replicate 200 7⟩ : BaseIO Bool)
@@ -195,5 +195,69 @@ def run (r : Runner) : IO Unit := Async.run do
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (explicit)" (← p.close).isNone
+
+/-- Spike P13 over two hosts: both nodes request partial messages on one
+topic. Each stream opens with the Extensions message, the subscriptions
+carry the flags, and a partial message crosses to the other node's
+application. -/
+def runPartial (r : Runner) : IO Unit := Async.run do
+  r.section "gossipsub partial messages on hosts" "(spike P13: gossipsub-v1.3.md, partial-messages.md)"
+  let p ← hostPair
+  let topic : TopicId := ⟨"columns"⟩
+  let params : Core.Params :=
+    { Core.defaults with partialTopics := [(topic, { requests := true, supports := true })] }
+  -- The server logs whether the client's first RPC carried extensions,
+  -- and every partial message it hands to the application.
+  let firsts : Chan Bool ← Chan.new 4
+  let seenFrom ← OnceRef.new ([] : List Peer)
+  let onRpc (q : Peer) (bytes : List Nat) : BaseIO Unit := do
+    let first ← seenFrom.updateGet fun l => (!l.contains q, if l.contains q then l else q :: l)
+    if first then
+      let ext := match Pb.decodeMessage? (α := Rpc.RPC) bytes with
+        | .ok (rpc, _) => (rpc.control.bind (·.extensions)).isSome
+        | .error _ => false
+      discard (firsts.trySend ext)
+  let partials : Chan (Peer × Rpc.PartialMessage) ← Chan.new 4
+  let server ← (Node.start (HostSeam.ofHost p.server)
+    { clock := p.clock.clock, params, onRpc,
+      onPartial := fun q pm => discard (partials.trySend (q, pm)) } : BaseIO Node.Node)
+  let client ← (Node.start (HostSeam.ofHost p.client) { clock := p.clock.clock, params } :
+    BaseIO Node.Node)
+  discard (server.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+  discard (client.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+  -- The client grafts the server at a heartbeat.
+  r.check "partial: the mesh forms"
+    (← waitStats p.clock client (fun s => s.mesh.any (·.2 == 1)) 6)
+  r.check "partial: the client's first RPC carries the Extensions message"
+    ((← (firsts.tryRecv : BaseIO _)) == some true)
+  -- The client's router learned the server's request from its SubOpts.
+  let mut offered : List (Peer × Bool) := []
+  for i in [0:40] do
+    if let some ps ← client.partialPeers topic then
+      if !ps.isEmpty then
+        offered := ps
+        break
+    nap
+    if i % 10 == 9 then p.clock.advance 1000
+  r.check "partial: the client offers partial messages to the requesting server"
+    (offered == [(p.serverPeer, true)])
+  let pm : Rpc.PartialMessage :=
+    { topicId := some (Bytes.toNatList (Bytes.ofString topic.name)), groupId := some [0, 1, 2],
+      partialMessage := some [7, 7, 7], partsMetadata := some [0xff] }
+  r.check "partial: the send is accepted" (← (client.sendPartial p.serverPeer pm : BaseIO Bool))
+  let mut got : Option (Peer × Rpc.PartialMessage) := none
+  for i in [0:40] do
+    if let some x ← (partials.tryRecv : BaseIO _) then
+      got := some x
+      break
+    nap
+    if i % 10 == 9 then p.clock.advance 1000
+  r.check "partial: the server's application gets the partial message from the client"
+    (got == some (p.client.localPeer, pm))
+  r.check "partial: the application's judgment is accepted"
+    (← (server.judgePartial p.client.localPeer topic true : BaseIO Bool))
+  client.stop
+  server.stop
+  r.check "partial: the pair closes with no fault" (← p.close).isNone
 
 end Tests.Gossipsub.HostNode
