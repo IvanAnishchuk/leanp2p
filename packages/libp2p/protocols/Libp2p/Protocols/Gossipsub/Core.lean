@@ -168,6 +168,14 @@ structure Params where
   212 to 214: "the score is retained for some period of time when a peer
   disconnects"). rust's default is 1 h; Lighthouse sets 100 epochs. -/
   retainScore : Millis := 3600000
+  /-- "A shorter backoff period can be used in case of an unsubscribe
+  event" (`gossipsub-v1.1.md`, lines 108 to 110). go and rust use 10 s. -/
+  unsubscribeBackoff : Millis := 10000
+  /-- Flood publishing (`gossipsub-v1.1.md`, lines 145 to 163): our own
+  messages go to every subscribed peer at or above `publishThreshold`.
+  go and rust turn it on by default; Lighthouse turns it off
+  (`config.rs:519`), so the default here is off. -/
+  floodPublish : Bool := false
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -532,9 +540,18 @@ construction. -/
 def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
     (topic : TopicId) : TopicPlan :=
   let ps := meshOf s topic
-  let excess := if ps.length > p.mesh.dHigh then ps.length - p.mesh.d else 0
-  let over := ps.take excess
-  let kept0 := ps.drop excess
+  -- An overfull mesh keeps its `dScore` best-scoring peers, then fills to
+  -- `d` from the rest (`gossipsub-v1.1.md`, lines 247 to 258), and prunes
+  -- the others. Ties and the fill favour the back of the mesh list, as
+  -- the old rule did, and the kept peers keep their mesh order.
+  let best := (ps.reverse.mergeSort (fun a b => decide (scoreOf p s b ≤ scoreOf p s a))).take
+    p.mesh.dScore
+  let rest := ps.filter (fun q => !memB q best)
+  let fill := rest.drop (rest.length - (p.mesh.d - best.length))
+  let kept0 := if ps.length > p.mesh.dHigh then
+      ps.filter (fun q => memB q best || memB q fill)
+    else ps
+  let over := ps.filter (fun q => !memB q kept0)
   let need := if kept0.length < p.mesh.dLow then p.mesh.d - kept0.length else 0
   let cands := order.filter (fun q =>
     !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
@@ -587,9 +604,12 @@ def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
     let ids := Cache.MessageIndex.gossipIds s.mcache t
     if ids = [] then []
     else
-      let targets :=
-        (eligible.filter (fun q =>
-          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)))).take p.mesh.dLazy
+      -- Adaptive gossip (`gossipsub-v1.1.md`, lines 165 to 184): at
+      -- least `dLazy` peers, and `gossipFactor` percent of the
+      -- candidates when that is more.
+      let cands := eligible.filter (fun q =>
+          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)))
+      let targets := cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
       targets.map fun q => Action.sendRpc q (ihaveRpc t ids)
 
 /-- The state at the start of the heartbeat: the decayed scores, the new
@@ -1046,8 +1066,12 @@ def extendFanout (p : Params) (s : State) (topic : TopicId) : State :=
 
 /-- The forward targets of a publish: the mesh when we subscribe to the
 topic, the fanout otherwise. -/
-def publishTargets (_p : Params) (s : State) (topic : TopicId) : List Peer :=
-  if memB topic s.topics then meshOf s topic else fanoutOf s topic
+def publishTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
+  if p.floodPublish then
+    -- Every peer that announced the topic, at or above the publish threshold.
+    (s.peers.filter (fun e => memB topic e.2.subs &&
+      decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1))).map Prod.fst
+  else if memB topic s.topics then meshOf s topic else fanoutOf s topic
 
 /-- The application publishes a message: validate, cache, record the id
 as seen, extend the fanout when we do not subscribe, and forward to the
@@ -1090,9 +1114,10 @@ def unsubscribe (p : Params) (s : State) (topic : TopicId) : State × List Actio
   let s3 : State :=
     { s2 with fanout := s2.fanout.filter (fun e => decide (e.1 ≠ topic)) }
   let s4 := ps.foldl
-    (fun st q => { st with backoff := Cache.Backoff.add st.backoff q topic p.pruneBackoff s.now })
+    (fun st q =>
+      { st with backoff := Cache.Backoff.add st.backoff q topic p.unsubscribeBackoff s.now })
     s3
-  (s4, ps.map (fun q => Action.sendRpc q (pruneRpc topic p.pruneBackoff)))
+  (s4, ps.map (fun q => Action.sendRpc q (pruneRpc topic p.unsubscribeBackoff)))
 
 /-! ## The transition and the driver -/
 

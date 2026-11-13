@@ -566,6 +566,49 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', _) => invalidCount s' pa ta = 1
      | _ => false)
 
+  -- `dScore`: an overfull mesh keeps its best-scoring peer. `pa` scores
+  -- above the others through P₂ first deliveries, and the old rule would
+  -- have pruned it from the front.
+  let firstTopic : Score.TopicParams :=
+    { scoreTopic with firstMessageDeliveriesWeight := 1000, firstMessageDeliveriesCap := 10 }
+  let firstTopics : TopicId → Option Score.TopicParams := fun t =>
+    if t = ta then some firstTopic else none
+  let firstParams : Params :=
+    { cfgParams with score := { cfgParams.score with topics := firstTopics } }
+  r.check "core.dscore.best-kept"
+    (match Libp2p.Protocols.Gossipsub.Core.run firstParams
+        { known with mesh := [(ta, [pa, pb, pc, pd])], lastHeartbeat := 0, now := 0 }
+        [.rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [42]])), .tick 1000 []] with
+     | .ok (s', _) => memB pa (meshOf s' ta) && (meshOf s' ta).length = 2
+     | _ => false)
+  -- Adaptive gossip: with `gossipFactor` 100 every candidate gets an
+  -- IHAVE, past `dLazy` 1.
+  let lazyOne : MeshParams := { baseParams.mesh with dLazy := 1 }
+  let wideGossip : Params := { baseParams with gossipFactor := 100, mesh := lazyOne }
+  let gossipCache := (Cache.MessageIndex.empty baseParams.window).put ⟨[9]⟩ (msgOf ta [9])
+  let gossipState : State :=
+    { known with mesh := [(ta, [pa])], lastHeartbeat := 0, now := 0, mcache := gossipCache }
+  r.check "core.gossip.adaptive"
+    (match Libp2p.Protocols.Gossipsub.Core.run wideGossip gossipState
+        [.tick 1000 [pb, pc, pd]] with
+     | .ok (_, acts) => ihaveCount acts = 3
+     | _ => false)
+  -- An unsubscribe prunes with the shorter backoff, 10 s.
+  r.check "core.unsubscribe.short-backoff"
+    (match step baseParams { known with mesh := [(ta, [pa])] } (.unsubscribe ta) with
+     | .ok (_, acts) => acts.any fun a => match a with
+         | .sendRpc _ r => match r.control with
+           | some c => c.prune.any (·.backoff == some 10)
+           | none => false
+         | _ => false
+     | _ => false)
+  -- Flood publishing reaches every subscribed peer, not the mesh alone.
+  r.check "core.publish.flood"
+    (match step { baseParams with floodPublish := true } { known with mesh := [(ta, [pa])] }
+        (.publish (msgOf ta [5])) with
+     | .ok (_, acts) => publishCount acts = 4
+     | _ => false)
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }
