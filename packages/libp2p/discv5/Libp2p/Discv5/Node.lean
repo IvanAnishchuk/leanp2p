@@ -62,6 +62,9 @@ structure Node where
   private checked : OnceRef (Std.HashMap Nat Nat)
   /-- The pause between two liveness checks. -/
   revalidateMs : Nat
+  /-- The unsolicited packets seen this second: the second, the total,
+  and the count per source IP. -/
+  private limiter : OnceRef (Nat × Nat × Std.HashMap (List Nat) Nat)
   /-- The UDP port the node listens on. -/
   port : Nat
 
@@ -89,13 +92,46 @@ private def feed (n : Node) (mk : ByteArray → Event) : Async Unit := do
     BaseIO (List Action))
   n.perform acts
 
-/-- The reader: each datagram goes to the core. `partial`, as the IO read
-loops are; `stop` ends it by closing the socket. -/
+/-- The unsolicited packets a second may bring, in total and from one IP:
+Lighthouse's `filter_rate_limiter` (`total_n_every(10)`,
+`ip_n_every(9)`). Client policy; the spec sets none. -/
+def unsolicitedTotal : Nat := 10
+def unsolicitedPerIp : Nat := 9
+
+/-- One unsolicited packet from `ip` in second `sec`, against the counts
+`(second, total, per IP)`: admitted while the second's limits hold. A
+new second starts the counts again. -/
+def limitStep (sec : Nat) (ip : List Nat) (st : Nat × Nat × Std.HashMap (List Nat) Nat) :
+    Bool × (Nat × Nat × Std.HashMap (List Nat) Nat) :=
+  let (at_, total, perIp) := st
+  let (total, perIp) := if at_ == sec then (total, perIp) else (0, {})
+  let mine := (perIp.get? ip).getD 0
+  if total ≥ unsolicitedTotal || mine ≥ unsolicitedPerIp then (false, (sec, total, perIp))
+  else (true, (sec, total + 1, perIp.insert ip (mine + 1)))
+
+/-- A loopback address, exempt from the rate limit so a local network
+works. -/
+private def isLoopback (ip : List Nat) : Bool :=
+  ip.head? == some 127 || ip == List.replicate 15 0 ++ [1]
+
+/-- Admit a packet from `src`. A packet from an endpoint that holds a
+session passes. Any other is unsolicited: it may draw a WHOAREYOU, so
+it counts against the limits of the current second. -/
+private def admit (n : Node) (src : Endpoint) : IO Bool := do
+  if isLoopback src.ip then return true
+  let s ← (n.core.get : BaseIO State)
+  if s.sessions.fold (fun found _ ses => found || ses.endpoint == src) false then return true
+  let sec := (← IO.monoMsNow) / 1000
+  n.limiter.updateGet (limitStep sec src.ip)
+
+/-- The reader: each admitted datagram goes to the core. `partial`, as
+the IO read loops are; `stop` ends it by closing the socket. -/
 private partial def reader (n : Node) : Async Unit := do
   match ← Streams.Udp.recv n.socket with
   | none => return
   | some (bytes, ip, port) =>
-    n.feed (Event.packet { ip, port } bytes)
+    if ← (n.admit { ip, port } : IO Bool) then
+      n.feed (Event.packet { ip, port } bytes)
     n.reader
 
 /-- Stop: close the socket, which wakes the reader, and the stop
@@ -284,6 +320,7 @@ def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pa
     core := ← OnceRef.new (Core.init key record), socket
     waiters := ← OnceRef.new [], nextId := ← OnceRef.new 1, tasks := ← TaskSet.new
     stopping := ← Chan.new 1, checked := ← OnceRef.new {}, revalidateMs
+    limiter := ← OnceRef.new (0, 0, {})
     port := socket.port }
   n.tasks.spawn n.reader
   n.tasks.spawn n.revalidator

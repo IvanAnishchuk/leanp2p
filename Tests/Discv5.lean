@@ -410,6 +410,55 @@ private def socketChecks (r : Runner) : IO Unit := Conc.Async.run do
   r.check "udp: close wakes a receive on a socket bound to 0.0.0.0"
     (← closeWakes [0, 0, 0, 0])
 
+/-! ## Eclipse limits -/
+
+/-- A signed record for key number `i` at `ip`, port 30303. Keys are the
+scalars `i + 1`, all valid. -/
+private def recordAt (i : Nat) (ip : List Nat) : Option Libp2p.Identity.Enr := do
+  let k ← Crypto.Key32.ofByteArray? (ByteArray.mk ((List.range 32).map fun j =>
+    if j = 31 then ((i + 1) % 256).toUInt8 else if j = 30 then ((i + 1) / 256).toUInt8 else 0).toArray)
+  (Libp2p.Identity.Enr.sign k 1
+    [⟨.ip, .bytes ip⟩, ⟨.udp, .bytes (Libp2p.Identity.Rlp.ofScalar 30303)⟩]).toOption
+
+private def policyChecks (r : Runner) : IO Unit := do
+  let localId := hex "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9"
+  let fill (ip : Nat → List Nat) (incoming : Bool) (n : Nat) : Table :=
+    (List.range n).foldl (fun t i => match recordAt i (ip i) with
+      | some e => t.insert { id := e.nodeId, record := e, incoming }
+      | none => t) (Table.empty localId)
+  -- 40 nodes of one global /24.
+  let net := fill (fun i => [1, 2, 3, i % 250 + 1]) false 40
+  let perBucket := net.buckets.toList.map (·.length)
+  r.check "a /24 holds at most 2 places in a bucket" (perBucket.all (· ≤ subnetBucketLimit))
+  r.check "a /24 holds at most 10 places in the table" (net.size ≤ subnetTableLimit && 0 < net.size)
+  -- 40 loopback nodes: the limits do not apply.
+  let lo := fill (fun i => [127, 0, 0, i % 250 + 1]) false 40
+  r.check "loopback addresses are not subnet-limited" (lo.size > subnetTableLimit)
+  -- Incoming nodes of distinct /24s take at most half a bucket.
+  let inc := fill (fun i => [1, i % 250 + 1, 3, 4]) true 80
+  r.check "incoming nodes take at most half of each bucket"
+    (inc.buckets.toList.all fun b => (b.filter (·.incoming)).length ≤ incomingLimit)
+  -- The rate limiter: 9 a second from one IP, 10 in total; a new second
+  -- starts again.
+  let ipA := [1, 1, 1, 1]
+  let ipB := [2, 2, 2, 2]
+  let run (steps : List (Nat × List Nat)) : List Bool := Id.run do
+    let mut st : Nat × Nat × Std.HashMap (List Nat) Nat := (0, 0, {})
+    let mut out : List Bool := []
+    for (sec, ip) in steps do
+      let (ok, st') := Node.limitStep sec ip st
+      st := st'
+      out := out ++ [ok]
+    return out
+  let fromA := run ((List.range 10).map fun _ => (5, ipA))
+  r.check "the tenth unsolicited packet of a second from one IP is dropped"
+    ((fromA.take 9).all id && fromA.getLast? == some false)
+  let mixed := run ((List.range 9).map (fun _ => (5, ipA)) ++ [(5, ipB), (5, ipB)])
+  r.check "the eleventh unsolicited packet of a second is dropped"
+    (mixed.getLast? == some false && mixed[9]? == some true)
+  r.check "a new second admits again"
+    ((run ((List.range 9).map (fun _ => (5, ipA)) ++ [(6, ipA)])).getLast? == some true)
+
 /-! ## IPv6 over UDP -/
 
 /-- Two nodes bound to `::1` find each other through `ip6`/`udp6`. -/
@@ -481,6 +530,7 @@ def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
   memoryChecks r
   gethChecks r
+  policyChecks r
   udpChecks r
   socketChecks r
   ipv6Checks r

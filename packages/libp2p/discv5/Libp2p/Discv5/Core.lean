@@ -396,7 +396,7 @@ private def onHandshake (s : State) (src : Endpoint) (u : Unmasked) (rand : Byte
       { readKey := keys.initiator, writeKey := keys.recipient, endpoint := src }
     let s := { s with
       challenges := s.challenges.erase (idNat srcId)
-      table := s.table.insert { id := srcId, record } }
+      table := s.table.insert { id := srcId, record, incoming := true } }
     return onMessage s srcId src m rand
   result.getD (s, [])
 

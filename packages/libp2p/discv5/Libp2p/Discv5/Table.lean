@@ -13,6 +13,11 @@ the protocol core's state.
 A bucket lists its entries most recently seen first. An insert into a
 full bucket goes to the replacement cache; a `remove` (a node that
 failed its liveness check) promotes the most recent replacement.
+
+Two client policies guard against eclipse attacks, with Lighthouse's
+numbers: a /24 of global IPv4 addresses holds at most 2 places in a
+bucket and 10 in the table, and nodes that contacted us take at most
+half a bucket.
 -/
 
 set_option autoImplicit false
@@ -42,6 +47,34 @@ structure Entry where
   id : ByteArray
   record : Enr
   live : Bool := false
+  /-- The node contacted us first (it came in through our challenge). -/
+  incoming : Bool := false
+
+/-- The nodes of one /24 a bucket takes, and the whole table takes: the
+eclipse limits of the sigp discv5 crate Lighthouse runs (`ip_limit`) and
+of geth. They are client policy; the spec sets none. -/
+def subnetBucketLimit : Nat := 2
+def subnetTableLimit : Nat := 10
+
+/-- The incoming nodes a bucket takes: half the bucket, as Lighthouse
+sets `incoming_bucket_limit(8)`, so peers that contact us cannot fill
+it. -/
+def incomingLimit : Nat := 8
+
+/-- An IPv4 address outside the loopback, private, link-local, shared,
+and unspecified ranges. The subnet limits apply only to these, as geth
+exempts LAN addresses, so a local network still works. -/
+def isGlobal4 : List Nat → Bool
+  | [a, b, _, _] =>
+    !(a == 0 || a == 10 || a == 127 || (a == 169 && b == 254) || (a == 172 && 16 ≤ b && b ≤ 31) ||
+      (a == 192 && b == 168) || (a == 100 && 64 ≤ b && b ≤ 127))
+  | _ => false
+
+/-- The /24 of a record's global IPv4 address. -/
+def subnet24? (e : Enr) : Option (List Nat) :=
+  match (e.ip?).toOption.join with
+  | some ip => if isGlobal4 ip then some (ip.take 3) else none
+  | none => none
 
 /-- The table. -/
 structure Table where
@@ -71,13 +104,22 @@ def insert (t : Table) (e : Entry) : Table :=
     if let some prev := b.find? (·.id == e.id) then
       -- The newer record wins; a node once live stays live.
       let rec_ := if e.record.seq ≥ prev.record.seq then e.record else prev.record
-      let e : Entry := { e with record := rec_, live := e.live || prev.live }
+      let e : Entry := { e with record := rec_, live := e.live || prev.live, incoming := prev.incoming }
       { t with buckets := t.buckets.set! i (e :: b.filter (·.id != e.id)) }
-    else if b.length < bucketSize then
-      { t with buckets := t.buckets.set! i (e :: b) }
     else
-      let r := (e :: t.replacements[i]!.filter (·.id != e.id)).take replacementSize
-      { t with replacements := t.replacements.set! i r }
+      -- A new node: past a subnet limit it is refused outright.
+      let sameNet (x : Entry) : Bool := subnet24? x.record == subnet24? e.record
+      let overNet := match subnet24? e.record with
+        | some _ => (b.filter sameNet).length ≥ subnetBucketLimit ||
+            ((t.buckets.toList.flatten).filter sameNet).length ≥ subnetTableLimit
+        | none => false
+      let overIncoming := e.incoming && (b.filter (·.incoming)).length ≥ incomingLimit
+      if overNet then t
+      else if b.length < bucketSize && !overIncoming then
+        { t with buckets := t.buckets.set! i (e :: b) }
+      else
+        let r := (e :: t.replacements[i]!.filter (·.id != e.id)).take replacementSize
+        { t with replacements := t.replacements.set! i r }
 
 /-- Remove a node, as after a failed liveness check, and promote the most
 recent replacement of its bucket. -/
