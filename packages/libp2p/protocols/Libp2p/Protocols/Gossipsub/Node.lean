@@ -173,6 +173,16 @@ structure Node where
   reject drops it and scores the source, ignore drops it. `false` under
   the same conditions as `publish`. -/
   report : MessageId → Peer → Core.Validation → BaseIO Bool
+  /-- The score of every known peer, in `scoreScale` units, as the loop
+  sees it now. Lighthouse's peer manager reads these every decay
+  interval (`peerdb.rs`, `update_gossipsub_scores`). `none` when the
+  node stopped or its queue is full. -/
+  scores : Conc.Async (Option (List (Peer × Score)))
+  /-- Replace the score parameters of one topic, as Lighthouse does by
+  validator count and slot (`service/mod.rs`,
+  `update_gossipsub_parameters`). `false` under the same conditions as
+  `publish`. -/
+  setTopicParams : TopicId → Option Score.TopicParams → BaseIO Bool
   /-- Close the event queue and join the loop task. The loop serves the
   queued events first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
@@ -201,6 +211,12 @@ def subOptRpc (t : TopicId) (on : Bool) : Rpc.RPC :=
 inductive Input where
   | event (e : Core.Event)
   | wake (now : Millis)
+  /-- Read the router: the loop calls `k` with its parameters and state.
+  `k` must not park. -/
+  | inspect (k : Core.Params → Core.State → BaseIO Unit)
+  /-- Replace the score parameters of one topic; `none` scores the topic
+  no more. -/
+  | setTopicParams (topic : TopicId) (tp : Option Score.TopicParams)
 
 /-- One peer's bounded writer queue and its currently open stream. -/
 structure Outbound where
@@ -419,6 +435,9 @@ private structure LoopState where
   ticks : Nat
   /-- The next run-wide delayed gossip index. -/
   gossipIndex : Nat
+  /-- The router parameters: `Config.params` at the start, with the
+  topic score parameters that `setTopicParams` replaced since. -/
+  params : Core.Params
 
 /-- Run the actions of one core step, in order, and answer the delayed
 sends. `gossipAt` is the time of the tick when a tick made the actions. The
@@ -491,7 +510,7 @@ private def stepAndAct (env : Env) (st : LoopState) (event : Core.Event) : BaseI
       removePeer env peer
       pure { st with pending := st.pending.filter (fun p => p.peer != peer) }
     | _ => pure st
-  match Core.step env.config.params st.router event with
+  match Core.step st.params st.router event with
   | .error (.decode _) => return st
   | .ok (router, actions) =>
     let actions := match event with
@@ -519,7 +538,7 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
   if st.nextTick ≤ now then
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
-    return { st with nextTick := now + env.config.params.heartbeatInterval, ticks := st.ticks + 1 }
+    return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
   return st
 
 /-- Run the core through one receive park. Each action returns its state.
@@ -534,6 +553,13 @@ private def loop (env : Env) (st0 : LoopState) : Conc.Async Unit := do
     | some (.wake now) => st ← (onWake env st now : BaseIO LoopState)
     | some (.event e) =>
       st ← (stepAndAct env st e : BaseIO LoopState)
+    | some (.inspect k) => (k st.params st.router : BaseIO Unit)
+    | some (.setTopicParams topic tp) =>
+      -- The parameters hold a function, so each replacement wraps the
+      -- one before it.
+      let old := st.params.score.topics
+      st := { st with params := { st.params with
+        score := { st.params.score with topics := fun t => if t = topic then tp else old t } } }
     (env.alarm.set (dueOf st) : BaseIO Unit)
   (env.alarm.close : BaseIO Unit)
   for (_, ob) in ← (env.outbound.get : BaseIO (List (Peer × Outbound))) do
@@ -583,7 +609,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       pending := []
       nextTick := now + config.params.heartbeatInterval
       ticks := 0
-      gossipIndex := 0 }
+      gossipIndex := 0
+      params := config.params }
   let post : Core.Event → BaseIO Bool := fun e => do
     if ← closing.get then return false
     events.trySend (.event e)
@@ -625,6 +652,18 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     peerJoined := fun peer proto => post (.peerJoined peer proto)
     peerLeft := fun peer => post (.peerLeft peer)
     report := fun id source outcome => post (.validated id source outcome)
+    scores := do
+      if ← (closing.get : BaseIO Bool) then return none
+      let reply : Conc.Chan (List (Peer × Score)) ← Conc.Chan.new 1
+      let k : Core.Params → Core.State → BaseIO Unit := fun p s =>
+        discard <| reply.trySend (s.peers.map fun (q, _) => (q, Core.scoreOf p s q))
+      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      -- Park: the loop answers, or `stop` closes the queue, and the loop
+      -- serves the queued inspect before it ends.
+      reply.recv
+    setTopicParams := fun topic tp => do
+      if ← closing.get then return false
+      events.trySend (.setTopicParams topic tp)
     dropped := drops.get
     stop := do
       let first ← (closing.updateGet (fun was => (!was, true)) : BaseIO Bool)

@@ -222,6 +222,36 @@ private def localChecks (r : Tests.Runner) : Async Unit := do
   r.check "node.local.no-stream" ((← (f.opens.get : BaseIO Nat)) == 0)
   finish sw [f]
 
+/-- The score readout and the runtime topic parameters (spike P9). A
+topic with no parameters keeps no counters (`Score.invalidDelivery`),
+so the parameters go in first. Then the control peer sends a message
+that fails `strictNoSign`, and its one invalid delivery costs a full
+unit. -/
+private def scoreChecks (r : Tests.Runner) : Async Unit := do
+  let sw ← (Switch.new : BaseIO Switch)
+  let f ← fixture sw pa
+  let bad : Message := { message [1] with «from» := some [9] }
+  r.check "node.score.barrier" (← barrier f)
+  match ← f.node.scores with
+  | some [(_, s)] => r.check "node.score.zero-at-join" (s == 0)
+  | other => r.check s!"node.score.one-peer ({other.map (·.length)})" false
+  let tp : Score.TopicParams :=
+    { topicWeight := 1, timeInMeshWeight := 0, timeInMeshQuantum := 1, timeInMeshCap := 0
+      firstMessageDeliveriesWeight := 0, firstMessageDeliveriesDecay := scoreScale
+      firstMessageDeliveriesCap := 0, meshMessageDeliveriesWeight := 0
+      meshMessageDeliveriesDecay := scoreScale, meshMessageDeliveriesThreshold := 0
+      meshMessageDeliveriesCap := 0, meshMessageDeliveriesActivation := 0
+      meshMessageDeliveriesWindow := 0, meshFailurePenaltyWeight := 0
+      meshFailurePenaltyDecay := scoreScale, invalidMessageDeliveriesWeight := -1000
+      invalidMessageDeliveriesDecay := scoreScale }
+  r.check "node.score.set-topic-params" (← (f.node.setTopicParams topic (some tp) : BaseIO Bool))
+  discard <| f.control.write (frame { subscriptions := [], publish := [bad], control := none })
+  r.check "node.score.barrier-after-invalid" (← barrier f)
+  match ← f.node.scores with
+  | some [(_, s)] => r.check s!"node.score.topic-params-apply ({s})" (s < 0)
+  | _ => r.check "node.score.topic-params-apply" false
+  finish sw [f]
+
 /-- The system-clock alarm ends when the node stops, without an advance of a
 test clock. A real heartbeat grafts its known peer. -/
 private def systemClockChecks (r : Tests.Runner) : Async Unit := do
@@ -738,6 +768,7 @@ def run (r : Tests.Runner) : IO Unit := do
     -- Inbound reset checks use a separate host task owner below.
     switchChecks r
     localChecks r
+    scoreChecks r
     systemClockChecks r
     inboundChecks r
     frameBoundaryChecks r
