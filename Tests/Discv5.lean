@@ -600,12 +600,52 @@ def serve : IO Unit := Conc.Async.run do
   let some kb := key32 nodeBKey | throw (IO.userError "discv5 serve: key")
   let port := ((← IO.getEnv "LEANP2P_DISCV5_PORT").bind (·.toNat?)).getD 0
   let ms := ((← IO.getEnv "LEANP2P_DISCV5_MS").bind (·.toNat?)).getD 60000
-  let n ← Node.start kb [127, 0, 0, 1] port
+  -- `echo` answers with the request; any other protocol gets an empty
+  -- TALKRESP, the default.
+  let echo (_ : ByteArray) (proto req : List Nat) : BaseIO (List Nat) :=
+    pure (if proto == [0x65, 0x63, 0x68, 0x6f] then req else [])
+  let n ← Node.start kb [127, 0, 0, 1] port (onTalk := echo)
   let e ← (n.localEnr : BaseIO _)
   IO.println s!"ENR {e.toText}"
   (← IO.getStdout).flush
   Conc.select #[← (Conc.Park.sleep ms () : BaseIO (Conc.Park Unit))]
   n.stop
+
+/-- Query an outside node (`scripts/discv5-rust-interop.sh`): the ENR in
+`LEANP2P_DISCV5_TARGET` gets a PING, a FINDNODE at distance 0, and a
+TALKREQ `echo` of `[1, 2, 3]`. One line per answer; exit code 0 when all
+three came back right. The geth driver also runs it
+(`scripts/discv5-geth-interop.sh`). -/
+def client : IO UInt32 := Conc.Async.run do
+  let some kb := key32 nodeBKey | throw (IO.userError "discv5 client: key")
+  let some text ← (IO.getEnv "LEANP2P_DISCV5_TARGET" : IO (Option String))
+    | throw (IO.userError "discv5 client: LEANP2P_DISCV5_TARGET")
+  let .ok target := Libp2p.Identity.Enr.ofText? text
+    | throw (IO.userError "discv5 client: the target ENR does not decode")
+  let n ← Node.start kb [127, 0, 0, 1] 0
+  (n.addEnr target : BaseIO Unit)
+  let mut ok := true
+  match ← n.ping target with
+  | some (.pong _ seq ip port) => IO.println s!"PONG seq {seq} ip {ip} port {port}"
+  | _ =>
+    IO.println "PING failed"
+    ok := false
+  let found ← n.findNode target [0]
+  let self := found.any (·.nodeId == target.nodeId)
+  IO.println s!"NODES {found.length} self {self}"
+  ok := ok && self
+  -- With `LEANP2P_DISCV5_ECHO=0` the target serves no `echo`, and the
+  -- answer must be the empty TALKRESP of an unknown protocol.
+  let echoes := (← IO.getEnv "LEANP2P_DISCV5_ECHO") != some "0"
+  match ← n.talk target [0x65, 0x63, 0x68, 0x6f] [1, 2, 3] with
+  | some resp =>
+    IO.println s!"TALKRESP {resp}"
+    ok := ok && resp == (if echoes then [1, 2, 3] else [])
+  | none =>
+    IO.println "TALKREQ failed"
+    ok := false
+  n.stop
+  return if ok then 0 else 1
 
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"

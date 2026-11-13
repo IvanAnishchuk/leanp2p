@@ -13,7 +13,10 @@
 # (DISCV5_GETH_SRC, default ../p2p/go-ethereum-discv5 beside the repo),
 # with the host Go toolchain, on two cores. The node under test is the
 # suite binary in `discv5serve` mode: it prints `ENR <text>` and serves
-# until DISCV5_SERVE_MS passes. PASS needs every scenario to pass.
+# until DISCV5_SERVE_MS passes. geth-to-lean passes when every scenario
+# passes. lean-to-geth then runs a geth node (`devp2p discv5 listen`)
+# and queries it from the suite binary in `discv5client` mode: PING,
+# FINDNODE at distance 0, and a TALKREQ that geth answers empty.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -59,11 +62,40 @@ done
 echo "node: $enr"
 
 # geth's suite, from both tester addresses.
+status=0
 if "$tool" discv5 test --listen1 127.0.0.1 --listen2 127.0.0.2 "$enr" >"$out/geth.out" 2>"$out/geth.err"; then
-  grep -E -- '^(-- |--- )?(PASS|FAIL|ok|not ok)' "$out/geth.out" || cat "$out/geth.out"
-  echo PASS
+  grep -E -- '^-- (OK|FAIL)|tests passed' "$out/geth.out"
+  echo "geth-to-lean: PASS"
 else
   cat "$out/geth.out"
-  echo FAIL
-  exit 1
+  echo "geth-to-lean: FAIL"
+  status=1
 fi
+cleanup
+node_pid=
+
+# lean-to-geth: a geth node (`devp2p discv5 listen`) at a fixed endpoint,
+# and the suite binary in `discv5client` mode. geth serves no `echo`, so
+# the TALKREQ must get the empty answer of an unknown protocol.
+geth_port=${DISCV5_GETH_PORT:-30411}
+"$tool" discv5 listen --addr "127.0.0.1:$geth_port" --extaddr "127.0.0.1:$geth_port" \
+  >"$out/geth-listen.out" 2>"$out/geth-listen.err" &
+node_pid=$!
+genr=
+for _ in $(seq 1 100); do
+  genr=$(grep -o -m1 'enr:[A-Za-z0-9_-]*' "$out/geth-listen.out" || true)
+  [[ -n "$genr" ]] && break
+  kill -0 "$node_pid" 2>/dev/null || { echo "lean-to-geth: the geth node exited" >&2; exit 1; }
+  sleep 0.1
+done
+[[ -n "$genr" ]] || { echo "lean-to-geth: no ENR from the geth node" >&2; exit 1; }
+if LEANP2P_SUITE=discv5client LEANP2P_DISCV5_TARGET="$genr" LEANP2P_DISCV5_ECHO=0 \
+    LEAN_NUM_THREADS=2 "$tests" >"$out/lean-query.out" 2>"$out/lean-query.err"; then
+  cat "$out/lean-query.out"
+  echo "lean-to-geth: PASS"
+else
+  cat "$out/lean-query.out" "$out/lean-query.err"
+  echo "lean-to-geth: FAIL"
+  status=1
+fi
+exit "$status"

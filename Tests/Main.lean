@@ -104,6 +104,8 @@ def main : IO UInt32 := do
   | some "yamux" => Tests.Yamux.run r; return ← r.summary
   -- One discv5 node for an outside tester; no checks run.
   | some "discv5serve" => Tests.Discv5.serve; return 0
+  -- One discv5 query against an outside node; the exit code is its answer.
+  | some "discv5client" => return ← Tests.Discv5.client
   | some "streams" => Tests.Streams.run r; return ← r.summary
   | _ => pure ()
   if (← IO.getEnv "LEANP2P_SUITE") == some "mux" then
