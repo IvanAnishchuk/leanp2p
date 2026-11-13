@@ -2,6 +2,7 @@ import Libp2p.Discv5.Packet
 import Libp2p.Discv5.Message
 import Libp2p.Discv5.Table
 import Libp2p.Discv5.Core
+import Libp2p.Discv5.Node
 
 /-!
 # discv5

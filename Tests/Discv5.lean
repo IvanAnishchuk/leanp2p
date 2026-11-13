@@ -125,9 +125,54 @@ private def memoryChecks (r : Runner) : IO Unit := do
     r.check "discv5 memory: A's table holds B after NODES" (a4.table.entries.any (·.id == eb.nodeId))
   | _, _ => r.check "discv5 memory: the records sign" false
 
+/-! ## Three nodes over UDP on the loopback -/
+
+/-- The `eth2` key: a pair a consensus client adds to its record. -/
+private def eth2Key : Libp2p.Identity.Enr.Key := .ofName [0x65, 0x74, 0x68, 0x32]
+
+private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
+  let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "discv5 udp: key A" false
+  let some kb := key32 nodeBKey | r.check "discv5 udp: key B" false
+  let some kc := key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
+    | r.check "discv5 udp: key C" false
+  let lo := [127, 0, 0, 1]
+  -- The consensus client's own pair: the predicate below looks for it.
+  let tagged : List Libp2p.Identity.Enr.Pair :=
+    [⟨eth2Key, .bytes [1, 2, 3, 4]⟩]
+  let a ← Node.start ka lo 0
+  let b ← Node.start kb lo 0
+  let c ← Node.start kc lo 0 tagged
+  let ea ← (a.localEnr : BaseIO _)
+  let eb ← (b.localEnr : BaseIO _)
+  let ec ← (c.localEnr : BaseIO _)
+  -- B knows C; A boots from B alone.
+  (b.addEnr ec : BaseIO Unit)
+  (a.addEnr eb : BaseIO Unit)
+  match ← a.ping eb with
+  | some (.pong _ _ ip port) =>
+    r.check "discv5 udp: A's PING to B gets a PONG naming A's endpoint" (ip == lo && port == a.port)
+  | _ => r.check "discv5 udp: A's PING to B gets a PONG" false
+  -- A FINDNODE at C's distance from B returns C's record.
+  let d := logDistance eb.nodeId ec.nodeId
+  let found ← a.findNode eb [d]
+  r.check "discv5 udp: FINDNODE through B returns C" (found.any (·.nodeId == ec.nodeId))
+  -- The client's interface: a lookup that keeps the records with the
+  -- `eth2` pair finds C, which A never booted from.
+  let peers ← a.findPeers (fun e => (e.get? eth2Key).isSome) 4
+  r.check "discv5 udp: findPeers finds C by its record's eth2 pair"
+    (peers.any (·.nodeId == ec.nodeId))
+  r.check "discv5 udp: B learned A from the handshake"
+    ((← (b.known : BaseIO (List Libp2p.Identity.Enr))).any (·.nodeId == ea.nodeId))
+  a.stop
+  b.stop
+  c.stop
+  r.check "discv5 udp: the nodes stop" true
+
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
   memoryChecks r
+  udpChecks r
   -- ECDH.
   match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
   | none => r.check "discv5: the ECDH key builds" false

@@ -7,6 +7,7 @@ import Streams.Framing
 import Streams.Stream
 import Streams.Sim
 import Streams.Tcp
+import Streams.Udp
 
 /-!
 # Streams
