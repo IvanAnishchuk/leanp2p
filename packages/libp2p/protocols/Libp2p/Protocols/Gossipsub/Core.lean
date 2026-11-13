@@ -136,6 +136,12 @@ structure Params where
   prims : Sign.Prims
   /-- The message id function. -/
   msgId : Sign.MsgIdFn
+  /-- Hold each accepted message until the application answers it
+  (`gossipsub-v1.1.md`, "Extended Validators"). When set, the core emits
+  `Action.validate` in place of the delivery and the forward, keeps the
+  message out of the message cache, and acts on `Event.validated`.
+  rust-libp2p calls this `validate_messages`, and Lighthouse sets it. -/
+  validateMessages : Bool := false
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -173,6 +179,20 @@ structure State where
   now : Millis
   /-- The time of the last heartbeat. -/
   lastHeartbeat : Millis
+  /-- The messages that wait for the application's answer, with their
+  ids and the peers that sent them (`Params.validateMessages`). -/
+  pending : List (MessageId × Peer × Message) := []
+
+/-- The application's answer on one held message
+(`gossipsub-v1.1.md`, "Extended Validators"). -/
+inductive Validation where
+  /-- Deliver and forward. -/
+  | accept
+  /-- Drop, and count an invalid delivery against the sender (P₄). -/
+  | reject
+  /-- Drop, with no penalty. -/
+  | ignore
+  deriving DecidableEq, BEq, Repr
 
 /-- The external events. -/
 inductive Event where
@@ -190,6 +210,8 @@ inductive Event where
   | unsubscribe (topic : TopicId)
   /-- The heartbeat fires at `now` with a peer order. -/
   | tick (now : Millis) (order : List Peer)
+  /-- The application answers the held message `id` from `source`. -/
+  | validated (id : MessageId) (source : Peer) (outcome : Validation)
   deriving Repr
 
 /-- The outgoing actions. -/
@@ -198,6 +220,9 @@ inductive Action where
   | sendRpc (to : Peer) (rpc : Rpc.RPC)
   /-- Deliver a message to the application. -/
   | deliver (msg : Message)
+  /-- Hand a held message to the application for its answer, with its
+  id and its propagation source (`Params.validateMessages`). -/
+  | validate (msg : Message) (id : MessageId) (source : Peer)
   deriving DecidableEq, BEq, Repr
 
 /-- The one error constructor: an RPC that does not decode. -/
@@ -323,6 +348,7 @@ def delivers : List Action → List Message
   | [] => []
   | .deliver m :: as => m :: delivers as
   | .sendRpc _ _ :: as => delivers as
+  | .validate _ _ _ :: as => delivers as
 
 /-! ## Outgoing RPC constructors -/
 
@@ -614,6 +640,49 @@ def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
   (s3, r.accepted.map (fun m => Action.deliver m) ++
     forwardPubs s sender r.accepted)
 
+/-- `handlePubs` under `Params.validateMessages`: accept as before, but
+hold each accepted message for the application's answer. The seen
+cache records the id at once, so a duplicate during the wait is
+dropped. The message cache, the delivery scores, and the forward wait
+for `Validation.accept` (`handleValidated`), so gossip and IWANT never
+serve a message the application has not accepted. -/
+def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
+    State × List Action :=
+  let valid := ms.filter (fun m => validationOk p m)
+  let invalid := ms.filter (fun m => !(validationOk p m))
+  let r := accept s.seen s.now p.msgId [] s.seen valid
+  let s1 : State :=
+    { s with
+      seen := r.cache,
+      pending := s.pending ++ r.accepted.map (fun m => (p.msgId m, sender, m)) }
+  let s2 := invalid.foldl (fun st m =>
+    updateScoreOf st sender (fun sc => Score.invalidDelivery p.score sc m.topic)) s1
+  (s2, r.accepted.map (fun m => Action.validate m (p.msgId m) sender))
+
+/-- The application's answer on a held message. An unknown id is a
+no-op: the answer came twice, or for a message never held. Accept
+caches the message, scores the delivery, and forwards it to the mesh
+peers other than the source. Reject counts an invalid delivery against
+the source. Ignore only drops it. -/
+def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
+    (outcome : Validation) : State × List Action :=
+  match s.pending.find? (fun e => decide (e.1 = id)) with
+  | none => (s, [])
+  | some (_, src, m) =>
+    let s1 : State := { s with pending := s.pending.filter (fun e => decide (e.1 ≠ id)) }
+    -- The score goes to the peer the core recorded at receipt. The
+    -- answer's source is the application's copy of the same value.
+    match outcome with
+    | .accept =>
+      let s2 : State := { s1 with mcache := s1.mcache.put id m }
+      let s3 := updateScoreOf s2 src (fun sc =>
+        let sc' := Score.firstDelivery p.score sc m.topic
+        if memB src (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')
+      (s3, forwardPubs s src [m])
+    | .reject =>
+      (updateScoreOf s1 src (fun sc => Score.invalidDelivery p.score sc m.topic), [])
+    | .ignore => (s1, [])
+
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
   ps.any (fun e => decide (e.peer = q ∧ e.id = id))
@@ -734,7 +803,8 @@ def handleControl (p : Params) (s : State) (sender : Peer) :
 def handleRpc (p : Params) (s : State) (sender : Peer) (rpc : Rpc.RPC) :
     State × List Action :=
   let s1 := handleSubs s sender rpc.subscriptions
-  let (s2, a2) := handlePubs p s1 sender rpc.publish
+  let (s2, a2) := if p.validateMessages then holdPubs p s1 sender rpc.publish
+    else handlePubs p s1 sender rpc.publish
   let (s3, a3) := handleControl p s2 sender rpc.control
   (s3, a2 ++ a3)
 
@@ -831,6 +901,7 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
   | .unsubscribe topic => .ok (unsubscribe p s topic)
   | .tick now order =>
       if heartbeatDue p s now then .ok (heartbeat p s now order) else .ok (s, [])
+  | .validated id source outcome => .ok (handleValidated p s id source outcome)
 
 /-- The transcript driver: the events in order. The first error stops
 the run. -/
@@ -1857,8 +1928,28 @@ private theorem heartbeatActions_not_deliver (p : Params) (s : State) (now : Mil
     · exact negativeActions_not_deliver p s now order m h
   · exact gossipActions_not_deliver p (gossipState p s now order) order m h
 
+private theorem holdPubs_not_deliver (p : Params) (s : State) (sender : Peer)
+    (ms : List Message) (m : Message) : Action.deliver m ∉ (holdPubs p s sender ms).2 := by
+  intro h
+  simp only [holdPubs, List.mem_map] at h
+  obtain ⟨_, -, hq⟩ := h
+  cases hq
+
+private theorem handleValidated_not_deliver (p : Params) (s : State) (id : MessageId)
+    (source : Peer) (outcome : Validation) (m : Message) :
+    Action.deliver m ∉ (handleValidated p s id source outcome).2 := by
+  intro h
+  unfold handleValidated at h
+  split at h
+  · simp at h
+  · cases outcome with
+    | accept => exact forwardPubs_not_deliver s _ _ m h
+    | reject => simp at h
+    | ignore => simp at h
+
 /-- A message reaches the application only when the pre-state seen cache
-does not hold its id. -/
+does not hold its id. Under `Params.validateMessages` no step delivers
+at all: the application gets `Action.validate` instead. -/
 theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
     (e : Event) (m : Message)
     (hstep : step p s e = .ok (s', acts)) (hdel : Action.deliver m ∈ acts) :
@@ -1909,6 +2000,12 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
           simpa using hs
         rw [hacts] at hdel
         simp at hdel
+  | validated id source outcome =>
+      have h1 : handleValidated p s id source outcome = (s', acts) := by
+        simpa only [step, Except.ok.injEq] using hstep
+      have hacts : acts = (handleValidated p s id source outcome).2 := by rw [h1]
+      rw [hacts] at hdel
+      exact absurd hdel (handleValidated_not_deliver p s id source outcome m)
   | rpc sender bytes =>
       simp only [step, rpcStep] at hstep
       split at hstep
@@ -1936,7 +2033,9 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
             rw [hacts] at hdel
             simp only [handleRpc, List.mem_append] at hdel
             rcases hdel with hdel | hdel
-            · simp only [handlePubs, List.mem_append] at hdel
+            · split at hdel
+              · exact absurd hdel (holdPubs_not_deliver p _ sender rpc.publish m)
+              simp only [handlePubs, List.mem_append] at hdel
               rcases hdel with hdl | hdl
               · simp only [List.mem_map] at hdl
                 obtain ⟨m', hm', heq⟩ := hdl

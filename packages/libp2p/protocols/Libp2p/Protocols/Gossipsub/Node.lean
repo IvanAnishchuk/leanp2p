@@ -140,6 +140,11 @@ structure Config where
   onRpc : Peer → List Nat → BaseIO Unit := fun _ _ => pure ()
   /-- Called for every outbound RPC before it enters the peer queue. -/
   onSend : Peer → Rpc.RPC → BaseIO Unit := fun _ _ => pure ()
+  /-- Called for each held message under `params.validateMessages`, with
+  its id and its propagation source. It runs on the loop task, so it
+  must not park: the application queues the work and answers later
+  through `Node.report`. -/
+  onValidate : Message → MessageId → Peer → BaseIO Unit := fun _ _ _ => pure ()
 
 /-- A running node. Every field is a seam over the loop task, which is the
 only owner of the router state. -/
@@ -159,6 +164,10 @@ structure Node where
   peerJoined : Peer → Core.PubsubProto → BaseIO Bool
   /-- Tell the loop that a peer left. -/
   peerLeft : Peer → BaseIO Bool
+  /-- Answer a held message (`Config.onValidate`): accept forwards it,
+  reject drops it and scores the source, ignore drops it. `false` under
+  the same conditions as `publish`. -/
+  report : MessageId → Peer → Core.Validation → BaseIO Bool
   /-- Close the event queue and join the loop task. The loop serves the
   queued events first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
@@ -416,6 +425,7 @@ private def perform (env : Env) (gossipAt : Option Millis) (index : Nat)
   for action in actions do
     match action with
     | .deliver m => (deliver env.subs m : BaseIO Unit)
+    | .validate m id source => env.config.onValidate m id source
     | .sendRpc to rpc =>
       match gossipAt with
       | some now =>
@@ -603,6 +613,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       post (.unsubscribe topic)
     peerJoined := fun peer proto => post (.peerJoined peer proto)
     peerLeft := fun peer => post (.peerLeft peer)
+    report := fun id source outcome => post (.validated id source outcome)
     dropped := drops.get
     stop := do
       let first ← (closing.updateGet (fun was => (!was, true)) : BaseIO Bool)

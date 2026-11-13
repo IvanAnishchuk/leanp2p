@@ -154,17 +154,23 @@ private def isOk : Except ProtocolError (State × List Action) → Bool
 private def delivers (m : Message) (l : List Action) : Nat :=
   (l.filter (fun a => match a with
     | .deliver m' => decide (m' = m)
-    | .sendRpc _ _ => false)).length
+    | _ => false)).length
 
 private def sendsTo (q : Peer) (l : List Action) : Nat :=
   (l.filter (fun a => match a with
     | .sendRpc q' _ => decide (q' = q)
-    | .deliver _ => false)).length
+    | _ => false)).length
 
 private def sends (l : List Action) (test : Rpc.RPC → Bool) : Nat :=
   (l.filter (fun a => match a with
     | .sendRpc _ r => test r
-    | .deliver _ => false)).length
+    | _ => false)).length
+
+/-- The held messages of an action list, with their ids and sources. -/
+private def validations (l : List Action) : List (Message × MessageId × Peer) :=
+  l.filterMap fun a => match a with
+    | .validate m id src => some (m, id, src)
+    | _ => none
 
 private def isPrune (t : TopicId) (r : Rpc.RPC) : Bool :=
   match r.control with
@@ -398,6 +404,43 @@ def run (r : Runner) : IO Unit := do
         { known with mcache := (Cache.MessageCache.empty baseParams.window).put ⟨[7]⟩ (msgOf ta [7]) }
         (.rpc pa (Pb.encodeMessage (iwantRpc [⟨[7]⟩]))) with
      | .ok (_, acts) => publishCount acts = 1
+     | _ => false)
+
+  -- Validation answered later (`gossipsub-v1.1.md`, "Extended
+  -- Validators"). The core holds the message: no delivery, no forward,
+  -- no cache entry, until the answer.
+  let vParams : Params := { cfgParams with validateMessages := true }
+  let meshed : State := { known with mesh := [(ta, [pa, pb, pc])] }
+  let inbound : Event := .rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))
+  r.check "core.validate.held"
+    (match step vParams meshed inbound with
+     | .ok (s', acts) => validations acts = [(msgOf ta [1], ⟨[1]⟩, pa)] &&
+         delivers (msgOf ta [1]) acts = 0 && publishCount acts = 0 &&
+         (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isNone && s'.pending.length = 1
+     | _ => false)
+  r.check "core.validate.accept-forwards"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, .validated ⟨[1]⟩ pa .accept] with
+     | .ok (s', acts) => sendsTo pa acts = 0 && sendsTo pb acts = 1 && sendsTo pc acts = 1 &&
+         (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isSome && s'.pending.isEmpty
+     | _ => false)
+  r.check "core.validate.reject-scores"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, .validated ⟨[1]⟩ pa .reject] with
+     | .ok (s', acts) => publishCount acts = 0 && invalidCount s' pa ta = 1 &&
+         s'.pending.isEmpty
+     | _ => false)
+  r.check "core.validate.ignore-drops"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, .validated ⟨[1]⟩ pa .ignore] with
+     | .ok (s', acts) => publishCount acts = 0 && invalidCount s' pa ta = 0 &&
+         s'.pending.isEmpty && (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isNone
+     | _ => false)
+  -- A duplicate during the wait is dropped by the seen cache.
+  r.check "core.validate.duplicate-dropped"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, .rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))] with
+     | .ok (s', acts) => (validations acts).length = 1 && s'.pending.length = 1
      | _ => false)
 
   -- The transcript driver runs two events in order and appends the
