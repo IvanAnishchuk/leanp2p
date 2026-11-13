@@ -644,6 +644,26 @@ def run (r : Runner) : IO Unit := do
      | .ok (_, acts) => publishCount acts = 4
      | _ => false)
 
+  -- P₅: the application's score reaches the peer's record.
+  r.check "core.p5.app-score"
+    (match step baseParams known (.appScore pa (-7)) with
+     | .ok (s', acts) => acts.isEmpty && ((peerOf s' pa).map (·.score.appScore)) == some (-7)
+     | _ => false)
+  -- The parameter constraints. `defaults` turns scoring off with zero
+  -- thresholds, so it breaks the threshold rules; a scored set passes.
+  r.check "core.params.defaults-break-thresholds"
+    (defaults.problems.contains "GossipThreshold must be < 0" &&
+      !defaults.problems.contains "D_out must be less than D_lo")
+  let scored : Params := { defaults with
+    thresholds := { gossipThreshold := -10, publishThreshold := -50, graylistThreshold := -80,
+                    acceptPXThreshold := 100, opportunisticGraftThreshold := 5 }
+    score := { defaults.score with global := { defaults.score.global with
+      ipColocationFactorWeight := -35, behaviourPenaltyWeight := -15,
+      behaviourPenaltyDecay := 986 } } }
+  r.check s!"core.params.scored-set-passes {scored.problems}" scored.problems.isEmpty
+  r.check "core.params.dout-over-half"
+    ({ scored with dOut := 4 }.problems.contains "D_out must be at most D/2")
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }

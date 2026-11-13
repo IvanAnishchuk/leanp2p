@@ -283,6 +283,8 @@ inductive Event where
   /-- What the host knows of a connected peer: whether we dialed it, and
   its IP address bytes. -/
   | peerInfo (peer : Peer) (outbound : Bool) (ip : Option (List Nat))
+  /-- The application's score of a peer: P₅ (`gossipsub-v1.1.md`, "P₅"). -/
+  | appScore (peer : Peer) (score : Int)
   deriving Repr
 
 /-- The outgoing actions. -/
@@ -1212,6 +1214,8 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
     .ok (match peerOf s peer with
       | some pd => (setPeer s peer { pd with outbound, ip }, [])
       | none => (s, []))
+  | .appScore peer score =>
+    .ok (updateScoreOf s peer (fun sc => { sc with appScore := score }), [])
 
 /-- The transcript driver: the events in order. The first error stops
 the run. -/
@@ -1267,6 +1271,34 @@ def defaults : Params where
   seen := { capacity := 65536, ttl := 120000, valid := by decide }
   prims := Sign.Prims.identity
   msgId := fun m => ⟨m.data.getD []⟩
+
+/-- The spec's parameter constraints a parameter set breaks, each named
+(`gossipsub-v1.1.md`, the parameter tables, lines 548 to 588, and the
+thresholds, lines 228 to 245). `Params.Valid` carries only `d ≤ dHigh`,
+the bound the mesh theorems consume; a node checks the rest here at
+start. `defaults` breaks the threshold rules on purpose: every threshold
+and weight is 0, which turns scoring off. -/
+def Params.problems (p : Params) : List String :=
+  let g := p.score.global
+  let t := p.thresholds
+  let checks : List (Bool × String) := [
+    (decide (p.mesh.dLow ≤ p.mesh.d ∧ p.mesh.d ≤ p.mesh.dHigh), "D_lo ≤ D ≤ D_hi"),
+    (decide (p.dOut < p.mesh.dLow), "D_out must be less than D_lo"),
+    (decide (p.dOut ≤ p.mesh.d / 2), "D_out must be at most D/2"),
+    (decide (p.mesh.dScore ≤ p.mesh.d), "D_score must be at most D"),
+    (decide (p.gossipFactor ≤ 100), "GossipFactor must be in [0, 1]"),
+    (decide (t.gossipThreshold < 0), "GossipThreshold must be < 0"),
+    (decide (t.publishThreshold ≤ t.gossipThreshold), "PublishThreshold must be <= GossipThreshold"),
+    (decide (t.graylistThreshold < t.publishThreshold), "GraylistThreshold must be < PublishThreshold"),
+    (decide (0 ≤ t.acceptPXThreshold), "AcceptPXThreshold must be >= 0"),
+    (decide (0 ≤ t.opportunisticGraftThreshold), "OpportunisticGraftThreshold must be >= 0"),
+    (decide (0 ≤ g.appSpecificWeight), "AppSpecificWeight must be positive"),
+    (decide (g.ipColocationFactorWeight ≤ 0), "IPColocationFactorWeight must be negative"),
+    (decide (1 ≤ g.ipColocationFactorThreshold), "IPColocationFactorThreshold must be at least 1"),
+    (decide (g.behaviourPenaltyWeight ≤ 0), "BehaviourPenaltyWeight must be negative"),
+    (decide (0 < g.behaviourPenaltyDecay ∧ g.behaviourPenaltyDecay < scoreScale),
+      "BehaviourPenaltyDecay must be between 0 and 1")]
+  (checks.filter (!·.1)).map (·.2)
 
 /-! ## Accessor lemmas -/
 
@@ -2393,6 +2425,10 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
         (simp only [Except.ok.injEq, Prod.mk.injEq] at hstep
          obtain ⟨-, rfl⟩ := hstep
          simp at hdel)
+  | appScore peer score =>
+      simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
+      obtain ⟨-, rfl⟩ := hstep
+      simp at hdel
   | rpc sender bytes =>
       simp only [step, rpcStep] at hstep
       split at hstep

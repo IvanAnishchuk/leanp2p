@@ -228,6 +228,9 @@ structure Node where
   `update_gossipsub_parameters`). `false` under the same conditions as
   `publish`. -/
   setTopicParams : TopicId → Option Score.TopicParams → BaseIO Bool
+  /-- Set a peer's application score, P₅. `false` under the same
+  conditions as `publish`. -/
+  setAppScore : Peer → Int → BaseIO Bool
   /-- A snapshot of the router (`Stats`). `none` when the node stopped
   or its queue is full. -/
   stats : Conc.Async (Option Stats)
@@ -873,6 +876,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     peerJoined := fun peer proto => post (.peerJoined peer proto)
     peerLeft := fun peer => post (.peerLeft peer)
     report := fun id source outcome => post (.validated id source outcome)
+    setAppScore := fun peer score => post (.appScore peer score)
     scores := do
       if ← (closing.get : BaseIO Bool) then return none
       let reply : Conc.Chan (List (Peer × Score)) ← Conc.Chan.new 1
