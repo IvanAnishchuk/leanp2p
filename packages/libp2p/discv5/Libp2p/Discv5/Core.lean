@@ -17,7 +17,8 @@ the randomness, and hands each event the random bytes it may need, so
 the core makes no choice of its own and a test replays it.
 
 PONG's `recipient-ip` and `recipient-port` are votes for the node's
-external endpoint, one per voter. When `voteQuorum` voters name an
+external endpoint, one per voter, each good for `voteTtl` on the
+shell's clock (`Event.clock`). When `voteQuorum` voters name an
 endpoint the record does not hold, the core re-signs the record with
 that endpoint and the next `seq`.
 
@@ -28,8 +29,8 @@ count: the core keeps each request by id until its answer ends or the
 shell posts `forget`, and keeps only the NODES records at the distances
 asked.
 
-Spike scope: no retries, no session eviction (the spec's LRU cache), no
-vote expiry, and no per-IP limits.
+A TALKREQ goes up to the application as a `talk` action; the
+application's TALKRESP comes back as `Event.respond`.
 -/
 
 set_option autoImplicit false
@@ -74,6 +75,13 @@ structure Challenge where
   /-- The core's tick when it was sent, for the bound. -/
   at_ : Nat := 0
 
+/-- One PONG's view of our external endpoint: who said it, what it said,
+and when, on the shell's clock. -/
+structure Vote where
+  voter : Nat
+  endpoint : Endpoint
+  at_ : Nat
+
 /-- A request awaiting its answer, by request id. Only an answer from
 the node we asked, for a request we sent, counts: an unsolicited NODES
 or PONG changes nothing (geth `v5test`, `UnsolicitedNodes`). -/
@@ -98,7 +106,9 @@ structure State where
   /-- The `recipient-ip`/`port` each PONG reported, newest first, one
   per voter by node id: the votes for our external endpoint
   (discv5-theory.md, "Maintaining The Local Node Record"). -/
-  votes : List (Nat × Endpoint) := []
+  votes : List Vote := []
+  /-- The shell's clock in milliseconds, from its last `clock` event. -/
+  now : Nat := 0
 
 /-- The events. Each carries at least `randLen` random bytes. -/
 inductive Event where
@@ -109,6 +119,13 @@ inductive Event where
   /-- The shell gave up on a request: drop its state. Time stays out of
   the core, so the shell's deadline ends a request this way. -/
   | forget (requestId : List Nat)
+  /-- Send the answer `m` to the node `dest` in its session: the
+  application's TALKRESP to a `talk` action. With no session, nothing
+  goes out. -/
+  | respond (dest : ByteArray) (m : Message) (rand : ByteArray)
+  /-- The shell's clock moved to `now` (milliseconds): votes older than
+  `voteTtl` stop counting. -/
+  | clock (now : Nat)
 
 /-- The random bytes an event needs: IV, nonce, id-nonce, ephemeral key,
 and a second IV and nonce for the handshake packet. -/
@@ -120,6 +137,10 @@ inductive Action where
   | send (dst : Endpoint) (bytes : ByteArray)
   /-- A response arrived from the node `src`. -/
   | response (src : ByteArray) (m : Message)
+  /-- A TALKREQ arrived from the node `src`: the application answers it
+  with `Event.respond` and a TALKRESP of the same request id
+  (discv5-wire.md, "TALKREQ Request"). -/
+  | talk (src : ByteArray) (requestId : List Nat) (protocol : List Nat) (request : List Nat)
 
 namespace Core
 
@@ -213,13 +234,22 @@ private def nodesAnswers (s : State) (rid : List Nat) (ds : List Nat) : List Mes
 def maxVotes : Nat := 32
 
 /-- The voters that must agree before the record changes its endpoint.
-The spec leaves the number open; the spike's pick. -/
-def voteQuorum : Nat := 3
+The spec leaves the number open; the sigp discv5 crate's
+`enr_peer_update_min`, which Lighthouse also sets to 10. -/
+def voteQuorum : Nat := 10
+
+/-- How long a vote counts, in milliseconds: the sigp crate's
+`vote_duration`, 120 s. -/
+def voteTtl : Nat := 120000
+
+/-- The votes still in time at `now`. -/
+def liveVotes (votes : List Vote) (now : Nat) : List Vote :=
+  votes.filter fun v => now ≤ v.at_ + voteTtl
 
 /-- The endpoint most voters name, and how many name it. -/
-def topVote (votes : List (Nat × Endpoint)) : Option (Endpoint × Nat) :=
-  let eps := (votes.map (·.2)).eraseDups
-  let counted := eps.map fun ep => (ep, (votes.filter (·.2 == ep)).length)
+def topVote (votes : List Vote) : Option (Endpoint × Nat) :=
+  let eps := (votes.map (·.endpoint)).eraseDups
+  let counted := eps.map fun ep => (ep, (votes.filter (·.endpoint == ep)).length)
   counted.foldl (fun best c => match best with
     | some b => if b.2 < c.2 then some c else best
     | none => some c) none
@@ -231,11 +261,11 @@ private def recordEndpoint (r : Enr) (v6 : Bool) : Option Endpoint := do
   let port ← (r.port? (if v6 then .udp6 else .udp)).toOption.join
   return { ip, port }
 
-/-- Re-sign the record when `voteQuorum` voters name an endpoint it does
-not hold. The other pairs stay; `seq` grows by one. A record that does
-not sign stays as it was. -/
+/-- Re-sign the record when `voteQuorum` voters, in time, name an
+endpoint it does not hold. The other pairs stay; `seq` grows by one. A
+record that does not sign stays as it was. -/
 def refreshRecord (s : State) : State :=
-  match topVote s.votes with
+  match topVote (liveVotes s.votes s.now) with
   | none => s
   | some (ep, n) =>
     let v6 := ep.ip.length == 16
@@ -266,30 +296,36 @@ def finish (s : State) (rid : List Nat) : State :=
     pending := s.pending.erase rid
     sent := s.sent.filter fun _ v => v.message.requestId != rid }
 
+/-- Send answers to `srcId` in its session, each under the next count of
+the session's nonce. With no session, nothing goes out. -/
+private def replyTo (s : State) (srcId : ByteArray) (ms : List Message) (rand : ByteArray) :
+    State × List Action :=
+  match s.sessions.get? (idNat srcId) with
+  | none => (s, [])
+  | some ses =>
+    let packets := (List.range ms.length).zip ms |>.filterMap fun (i, r) =>
+      let nonce := counterNonce (ses.count + i) (slice rand 16 8)
+      messagePacket s.localId srcId ses.writeKey (slice rand 0 16) nonce r
+    let s := putSession s srcId { ses with count := ses.count + ms.length }
+    (s, packets.map (Action.send ses.endpoint))
+
 /-- Handle a decrypted message from `srcId` at `src`. -/
 private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Message)
     (rand : ByteArray) : State × List Action :=
-  let reply (s : State) (ms : List Message) : State × List Action :=
-    match s.sessions.get? (idNat srcId) with
-    | none => (s, [])
-    | some ses =>
-      let packets := (List.range ms.length).zip ms |>.filterMap fun (i, r) =>
-        -- Each answer takes the next count of the session.
-        let nonce := counterNonce (ses.count + i) (slice rand 16 8)
-        messagePacket s.localId srcId ses.writeKey (slice rand 0 16) nonce r
-      let s := putSession s srcId { ses with count := ses.count + ms.length }
-      (s, packets.map (Action.send ses.endpoint))
+  let reply (s : State) (ms : List Message) : State × List Action := replyTo s srcId ms rand
   match m with
   | .ping rid _ => reply s [.pong rid s.localEnr.seq src.ip src.port]
   | .findNode rid ds => reply s (nodesAnswers s rid ds)
-  | .talkReq rid _ _ => reply s [.talkResp rid []]
+  -- The application answers a TALKREQ (`Event.respond`); the shell
+  -- answers an unknown protocol with an empty TALKRESP.
+  | .talkReq rid proto req => (s, [.talk srcId rid proto req])
   | .pong rid _ ip port =>
     if !solicited s srcId rid then (s, []) else
     -- The node answered our PING: it is live, so FINDNODE may relay it.
     let s := { finish s rid with table := s.table.markLive srcId }
     let voter := idNat srcId
-    let vote : Endpoint := { ip, port }
-    let votes := ((voter, vote) :: s.votes.filter (·.1 != voter)).take maxVotes
+    let vote : Vote := { voter, endpoint := { ip, port }, at_ := s.now }
+    let votes := (vote :: (liveVotes s.votes s.now).filter (·.voter != voter)).take maxVotes
     (refreshRecord { s with votes }, [.response srcId m])
   | .nodes rid total rs =>
     match s.pending.get? rid with
@@ -432,6 +468,8 @@ private def stepAt (s : State) : Event → State × List Action
       | .whoareyou => onWhoareyou s u rand
       | .handshake => onHandshake s src u rand
   | .forget rid => (finish s rid, [])
+  | .respond dest m rand => replyTo s dest [m] rand
+  | .clock now => ({ s with now, votes := liveVotes s.votes now }, [])
 
 /-- One step of the core. Each step advances the tick that orders the
 LRU bounds. -/

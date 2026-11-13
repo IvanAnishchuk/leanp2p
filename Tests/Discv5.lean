@@ -76,6 +76,18 @@ private def settle (a b : State) (epA epB : Endpoint) (acts : List (Bool × Acti
       queue := rest
       match act with
       | .response _ m => got := got ++ [(fromA, m)]
+      -- The shell's default for a TALKREQ: an empty TALKRESP, from the
+      -- core that took the request.
+      | .talk src rid _ _ =>
+        k := k + 1
+        if fromA then
+          let (a', out) := Core.step a (.respond src (.talkResp rid []) (randFor k))
+          a := a'
+          queue := queue ++ out.map (true, ·)
+        else
+          let (b', out) := Core.step b (.respond src (.talkResp rid []) (randFor k))
+          b := b'
+          queue := queue ++ out.map (false, ·)
       | .send _ bytes =>
         k := k + 1
         if fromA then
@@ -87,6 +99,26 @@ private def settle (a b : State) (epA epB : Endpoint) (acts : List (Bool × Acti
           a := a'
           queue := queue ++ out.map (true, ·)
   return (a, b, got)
+
+/-- The datagrams an action list sends. -/
+private def sendsOf (acts : List Action) : List (Endpoint × ByteArray) :=
+  acts.filterMap fun a => match a with
+    | .send d b => some (d, b)
+    | _ => none
+
+/-- The packet kind of a datagram sent to the node `localId`. -/
+private def flagFor (localId : ByteArray) (b : ByteArray) : Option Flag :=
+  (unmask localId b).toOption.map (·.header.flag)
+
+/-- The header nonce of a datagram sent to the node `localId`. -/
+private def nonceFor (localId : ByteArray) (b : ByteArray) : Option (List UInt8) :=
+  (unmask localId b).toOption.map (·.header.nonce.toList)
+
+/-- The one datagram of an action list. -/
+private def onlySend (acts : List Action) : Option ByteArray :=
+  match sendsOf acts with
+  | [(_, b)] => some b
+  | _ => none
 
 private def memoryChecks (r : Runner) : IO Unit := do
   let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
@@ -112,7 +144,7 @@ private def memoryChecks (r : Runner) : IO Unit := do
       ((a2.sessions.get? (idNat eb.nodeId)).isSome && (b2.sessions.get? (idNat ea.nodeId)).isSome)
     r.check "discv5 memory: B learned A's record from the handshake"
       (b2.table.entries.any (·.id == ea.nodeId))
-    r.check "discv5 memory: A recorded B's view of its endpoint" (a2.votes.any (·.2 == epA))
+    r.check "discv5 memory: A recorded B's view of its endpoint" (a2.votes.any (·.endpoint == epA))
     -- A second request goes straight through the session: one packet
     -- each way.
     let (a3, out) := Core.step a2 (.request eb epB (.findNode [2] [0]) (randFor 100))
@@ -126,7 +158,7 @@ private def memoryChecks (r : Runner) : IO Unit := do
     -- Endpoint votes: below the quorum the record stays; at the quorum
     -- it names the voted endpoint under the next seq.
     let outside : Endpoint := { ip := [203, 0, 113, 7], port := 30303 }
-    let vote (k : Nat) : Nat × Endpoint := (k, outside)
+    let vote (k : Nat) : Vote := { voter := k, endpoint := outside, at_ := 0 }
     let few := Core.refreshRecord { a0 with votes := (List.range (Core.voteQuorum - 1)).map vote }
     r.check "discv5 votes: fewer than the quorum leave the record" (few.localEnr.seq == 1)
     let many := Core.refreshRecord { a0 with votes := (List.range Core.voteQuorum).map vote }
@@ -136,6 +168,35 @@ private def memoryChecks (r : Runner) : IO Unit := do
     r.check "discv5 votes: the node id stays" (many.localEnr.nodeId == ea.nodeId)
     let again := Core.refreshRecord many
     r.check "discv5 votes: a record that holds the endpoint stays" (again.localEnr.seq == 2)
+    -- Votes expire after `voteTtl`: a quorum cast at time 0 counts at
+    -- `voteTtl` and not one millisecond later.
+    let quorum := (List.range Core.voteQuorum).map vote
+    r.check "discv5 votes: a quorum still in time counts"
+      ((Core.refreshRecord { a0 with votes := quorum, now := Core.voteTtl }).localEnr.seq == 2)
+    r.check "discv5 votes: an expired quorum does not count"
+      ((Core.refreshRecord { a0 with votes := quorum, now := Core.voteTtl + 1 }).localEnr.seq == 1)
+    let (cleared, _) := Core.step { a0 with votes := quorum } (.clock (Core.voteTtl + 1))
+    r.check "discv5 votes: the clock drops expired votes" cleared.votes.isEmpty
+    -- TALKREQ goes up to the application; its answer comes back through
+    -- `Event.respond` and leaves in the session.
+    let (a5, out) := Core.step a4 (.request eb epB (.talkReq [12] [0x65] [1, 2]) (randFor 120))
+    match onlySend out with
+    | some p =>
+      let (b5, bOut) := Core.step b2 (.packet epA p (randFor 121))
+      r.check "TALKREQ goes up to the application, and nothing answers by itself"
+        (bOut.any (fun a => match a with
+          | .talk src [12] [0x65] [1, 2] => src.toList == ea.nodeId.toList
+          | _ => false) && (sendsOf bOut).isEmpty)
+      let (_, rOut) := Core.step b5 (.respond ea.nodeId (.talkResp [12] [7, 7]) (randFor 122))
+      match onlySend rOut with
+      | some q =>
+        let (_, aOut) := Core.step a5 (.packet epB q (randFor 123))
+        r.check "the application's TALKRESP reaches the asker"
+          (aOut.any fun a => match a with
+            | .response _ (.talkResp [12] [7, 7]) => true
+            | _ => false)
+      | none => r.check "the TALKRESP is one packet" false
+    | none => r.check "TALKREQ: A sends one packet" false
   | _, _ => r.check "discv5 memory: the records sign" false
 
 /-! ## geth's conformance scenarios
@@ -143,26 +204,6 @@ private def memoryChecks (r : Runner) : IO Unit := do
 The behaviours geth's discv5 test suite checks against a node
 (`cmd/devp2p/internal/v5test/discv5tests.go`, go-ethereum `0d06140`),
 played here with our own core as the tester. -/
-
-/-- The datagrams an action list sends. -/
-private def sendsOf (acts : List Action) : List (Endpoint × ByteArray) :=
-  acts.filterMap fun a => match a with
-    | .send d b => some (d, b)
-    | _ => none
-
-/-- The packet kind of a datagram sent to the node `localId`. -/
-private def flagFor (localId : ByteArray) (b : ByteArray) : Option Flag :=
-  (unmask localId b).toOption.map (·.header.flag)
-
-/-- The header nonce of a datagram sent to the node `localId`. -/
-private def nonceFor (localId : ByteArray) (b : ByteArray) : Option (List UInt8) :=
-  (unmask localId b).toOption.map (·.header.nonce.toList)
-
-/-- The one datagram of an action list. -/
-private def onlySend (acts : List Action) : Option ByteArray :=
-  match sendsOf acts with
-  | [(_, b)] => some b
-  | _ => none
 
 private def gethChecks (r : Runner) : IO Unit := do
   let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
@@ -459,6 +500,30 @@ private def policyChecks (r : Runner) : IO Unit := do
   r.check "a new second admits again"
     ((run ((List.range 9).map (fun _ => (5, ipA)) ++ [(6, ipA)])).getLast? == some true)
 
+/-! ## TALKREQ over UDP -/
+
+/-- The bytes of the protocol name `echo`. -/
+private def echoProto : List Nat := [0x65, 0x63, 0x68, 0x6f]
+
+/-- A node whose handler serves `echo` answers it with the request, and
+any other protocol with an empty TALKRESP. -/
+private def talkChecks (r : Runner) : IO Unit := Conc.Async.run do
+  let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "talk: key A" false
+  let some kb := key32 nodeBKey | r.check "talk: key B" false
+  let lo := [127, 0, 0, 1]
+  let echo (_ : ByteArray) (proto req : List Nat) : BaseIO (List Nat) :=
+    pure (if proto == echoProto then req else [])
+  let a ← Node.start ka lo 0
+  let b ← Node.start kb lo 0 (onTalk := echo)
+  let eb ← (b.localEnr : BaseIO _)
+  r.check "talk: the handler answers its protocol"
+    ((← a.talk eb echoProto [1, 2, 3]) == some [1, 2, 3])
+  r.check "talk: an unknown protocol gets an empty TALKRESP"
+    ((← a.talk eb [0x78] [1]) == some [])
+  a.stop
+  b.stop
+
 /-! ## IPv6 over UDP -/
 
 /-- Two nodes bound to `::1` find each other through `ip6`/`udp6`. -/
@@ -549,6 +614,7 @@ def run (r : Runner) : IO Unit := do
   policyChecks r
   udpChecks r
   socketChecks r
+  talkChecks r
   ipv6Checks r
   livenessChecks r
   -- ECDH.

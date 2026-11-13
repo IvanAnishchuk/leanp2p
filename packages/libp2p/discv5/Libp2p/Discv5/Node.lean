@@ -62,6 +62,11 @@ structure Node where
   private checked : OnceRef (Std.HashMap Nat Nat)
   /-- The pause between two liveness checks. -/
   revalidateMs : Nat
+  /-- The application's TALKREQ handler: the sender's node id, the
+  protocol, and the request; it answers the response bytes. An unknown
+  protocol answers `[]`, an empty TALKRESP, as discv5-wire.md requires.
+  It runs on the reader task, so it must not park. -/
+  private onTalk : ByteArray → List Nat → List Nat → BaseIO (List Nat)
   /-- The unsolicited packets seen this second: the second, the total,
   and the count per source IP. -/
   private limiter : OnceRef (Nat × Nat × Std.HashMap (List Nat) Nat)
@@ -78,6 +83,8 @@ private def perform (n : Node) (acts : List Action) : Async Unit := do
     | .response _ m =>
       for (rid, ch) in ← (n.waiters.get : BaseIO _) do
         if rid == m.requestId then discard (ch.trySend m : BaseIO Bool)
+    -- `feed` answers a TALKREQ after the step's other actions.
+    | .talk .. => pure ()
 
 /-- `n` random bytes; a DRBG failure is an IO error. -/
 private def random (n : Nat) : IO ByteArray := do
@@ -86,11 +93,21 @@ private def random (n : Nat) : IO ByteArray := do
   | .error _ => throw (IO.userError "discv5: no random bytes")
 
 /-- Run one event through the core and perform its actions. -/
-private def feed (n : Node) (mk : ByteArray → Event) : Async Unit := do
+private def stepAndPerform (n : Node) (mk : ByteArray → Event) : Async (List Action) := do
   let rand ← (random randLen : IO ByteArray)
   let acts ← (n.core.updateGet fun s => let (s', a) := Core.step s (mk rand); (a, s') :
     BaseIO (List Action))
   n.perform acts
+  return acts
+
+/-- Run one event through the core and perform its actions, then answer
+each TALKREQ it handed up: `onTalk` gives the response bytes, and the
+core sends the TALKRESP in the session. -/
+private def feed (n : Node) (mk : ByteArray → Event) : Async Unit := do
+  for a in ← n.stepAndPerform mk do
+    if let .talk src rid proto req := a then
+      let resp ← (n.onTalk src proto req : BaseIO (List Nat))
+      discard <| n.stepAndPerform fun rand => .respond src (.talkResp rid resp) rand
 
 /-- The unsolicited packets a second may bring, in total and from one IP:
 Lighthouse's `filter_rate_limiter` (`total_n_every(10)`,
@@ -167,7 +184,7 @@ def known (n : Node) : BaseIO (List Enr) := do
 
 /-- The external endpoints the PONGs reported, newest first. -/
 def votes (n : Node) : BaseIO (List Endpoint) := do
-  return (← n.core.get).votes.map (·.2)
+  return (← n.core.get).votes.map (·.endpoint)
 
 /-- Send `m` (its request id is set here) to `e`, and collect responses
 until `done` holds or `timeoutMs` passes. -/
@@ -216,6 +233,16 @@ private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat
 def ping (n : Node) (e : Enr) (timeoutMs : Nat := 2000) : Async (Option Message) := do
   let seq := (← (n.core.get : BaseIO State)).localEnr.seq
   return (← n.ask e (fun rid => .ping rid seq) timeoutMs (!·.isEmpty)).head?
+
+/-- TALKREQ: a node's answer for `protocol`, if one came within
+`timeoutMs`. An empty answer means the node does not serve the protocol
+(discv5-wire.md, "TALKRESP Response"). -/
+def talk (n : Node) (e : Enr) (protocol request : List Nat) (timeoutMs : Nat := 2000) :
+    Async (Option (List Nat)) := do
+  let got ← n.ask e (fun rid => .talkReq rid protocol request) timeoutMs (!·.isEmpty)
+  return got.head?.bind fun m => match m with
+    | .talkResp _ resp => some resp
+    | _ => none
 
 /-- FINDNODE: the records a node returns for `distances`, from every
 NODES packet up to their `total`. -/
@@ -312,6 +339,9 @@ the table. Park: the timer wakes it, and so does `stop`, which closes
 private partial def revalidator (n : Node) (round : Nat := 0) : Async Unit := do
   let timer ← (Park.sleep n.revalidateMs false : BaseIO (Park Bool))
   if ← select #[Park.recv n.stopping (fun _ => true), timer] then return
+  -- The core's clock, for the vote expiry.
+  let now ← (IO.monoMsNow : IO Nat)
+  n.feed fun _ => .clock now
   n.revalidateOnce
   if (round + 1) % refreshEvery == 0 then
     discard <| n.lookup (← (random 32 : IO ByteArray))
@@ -322,7 +352,9 @@ pick). Its record is signed after the bind, so `udp` names the real
 port; `extra` adds the client's pairs, such as `eth2` and `tcp`.
 `revalidateMs` paces the liveness checks of the table. -/
 def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pair := [])
-    (seq : Nat := 1) (revalidateMs : Nat := 1000) : Async Node := do
+    (seq : Nat := 1) (revalidateMs : Nat := 1000)
+    (onTalk : ByteArray → List Nat → List Nat → BaseIO (List Nat) := fun _ _ _ => pure []) :
+    Async Node := do
   let socket ← (Streams.Udp.bind ip port : IO Streams.Udp.Socket)
   -- An IPv6 bind names itself in `ip6` and `udp6`.
   let (ipKey, portKey) : Enr.Key × Enr.Key := if ip.length == 16 then (.ip6, .udp6) else (.ip, .udp)
@@ -336,8 +368,10 @@ def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pa
     core := ← OnceRef.new (Core.init key record), socket
     waiters := ← OnceRef.new [], nextId := ← OnceRef.new 1, tasks := ← TaskSet.new
     stopping := ← Chan.new 1, checked := ← OnceRef.new {}, revalidateMs
-    limiter := ← OnceRef.new (0, 0, {})
+    limiter := ← OnceRef.new (0, 0, {}), onTalk
     port := socket.port }
+  let now ← (IO.monoMsNow : IO Nat)
+  n.feed fun _ => .clock now
   n.tasks.spawn n.reader
   n.tasks.spawn n.revalidator
   return n
