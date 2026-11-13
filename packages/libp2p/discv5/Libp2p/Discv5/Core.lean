@@ -16,9 +16,13 @@ table. The shell (`Libp2p.Discv5.Node`) owns the socket, the clock, and
 the randomness, and hands each event the random bytes it may need, so
 the core makes no choice of its own and a test replays it.
 
+PONG's `recipient-ip` and `recipient-port` are votes for the node's
+external endpoint, one per voter. When `voteQuorum` voters name an
+endpoint the record does not hold, the core re-signs the record with
+that endpoint and the next `seq`.
+
 Spike scope: no request timeouts or retries (the shell's), no session
-eviction (the spec's LRU cache), no endpoint votes beyond recording
-PONG's `recipient-ip`, and no per-IP limits.
+eviction (the spec's LRU cache), no vote expiry, and no per-IP limits.
 -/
 
 set_option autoImplicit false
@@ -61,10 +65,10 @@ structure State where
   sent : Std.HashMap (List UInt8) Sent := {}
   challenges : Std.HashMap Nat Challenge := {}
   table : Table
-  /-- The `recipient-ip`/`port` each PONG reported, newest first: the
-  votes for our external endpoint (discv5-theory.md, "Maintaining The
-  Local Node Record"). -/
-  votes : List Endpoint := []
+  /-- The `recipient-ip`/`port` each PONG reported, newest first, one
+  per voter by node id: the votes for our external endpoint
+  (discv5-theory.md, "Maintaining The Local Node Record"). -/
+  votes : List (Nat × Endpoint) := []
 
 /-- The events. Each carries at least `randLen` random bytes. -/
 inductive Event where
@@ -133,6 +137,46 @@ private def nodesAnswers (s : State) (rid : List Nat) (ds : List Nat) : List Mes
   let groups := if groups.isEmpty then [[]] else groups
   groups.map fun g => .nodes rid groups.length g
 
+/-- The voters the core remembers. -/
+def maxVotes : Nat := 32
+
+/-- The voters that must agree before the record changes its endpoint.
+The spec leaves the number open; the spike's pick. -/
+def voteQuorum : Nat := 3
+
+/-- The endpoint most voters name, and how many name it. -/
+def topVote (votes : List (Nat × Endpoint)) : Option (Endpoint × Nat) :=
+  let eps := (votes.map (·.2)).eraseDups
+  let counted := eps.map fun ep => (ep, (votes.filter (·.2 == ep)).length)
+  counted.foldl (fun best c => match best with
+    | some b => if b.2 < c.2 then some c else best
+    | none => some c) none
+
+/-- The endpoint the record names: `ip`/`udp` for an IPv4 vote, and
+`ip6`/`udp6` for an IPv6 one. -/
+private def recordEndpoint (r : Enr) (v6 : Bool) : Option Endpoint := do
+  let ip ← (if v6 then r.ip6? else r.ip?).toOption.join
+  let port ← (r.port? (if v6 then .udp6 else .udp)).toOption.join
+  return { ip, port }
+
+/-- Re-sign the record when `voteQuorum` voters name an endpoint it does
+not hold. The other pairs stay; `seq` grows by one. A record that does
+not sign stays as it was. -/
+def refreshRecord (s : State) : State :=
+  match topVote s.votes with
+  | none => s
+  | some (ep, n) =>
+    let v6 := ep.ip.length == 16
+    if n < voteQuorum || recordEndpoint s.localEnr v6 == some ep then s
+    else
+      let (ipKey, portKey) : Enr.Key × Enr.Key := if v6 then (.ip6, .udp6) else (.ip, .udp)
+      let pairs : List Enr.Pair :=
+        [⟨ipKey, .bytes ep.ip⟩, ⟨portKey, .bytes (Rlp.ofScalar ep.port)⟩] ++
+          s.localEnr.pairs.filter fun p => p.key != ipKey && p.key != portKey
+      match Enr.sign s.key (s.localEnr.seq + 1) pairs with
+      | .ok r => { s with localEnr := r }
+      | .error _ => s
+
 /-- Handle a decrypted message from `srcId` at `src`. -/
 private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Message)
     (rand : ByteArray) : State × List Action :=
@@ -150,7 +194,9 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
   | .findNode rid ds => reply s (nodesAnswers s rid ds)
   | .talkReq rid _ _ => reply s [.talkResp rid []]
   | .pong _ _ ip port =>
-    ({ s with votes := ({ ip, port } :: s.votes).take 32 }, [.response srcId m])
+    let voter := idNat srcId
+    let votes := ((voter, { ip, port }) :: s.votes.filter (·.1 != voter)).take maxVotes
+    (refreshRecord { s with votes }, [.response srcId m])
   | .nodes _ _ rs =>
     let t := rs.foldl (fun t e => t.insert { id := e.nodeId, record := e }) s.table
     ({ s with table := t }, [.response srcId m])

@@ -122,7 +122,7 @@ def known (n : Node) : BaseIO (List Enr) := do
 
 /-- The external endpoints the PONGs reported, newest first. -/
 def votes (n : Node) : BaseIO (List Endpoint) := do
-  return (← n.core.get).votes
+  return (← n.core.get).votes.map (·.2)
 
 /-- Send `m` (its request id is set here) to `e`, and collect responses
 until `done` holds or `timeoutMs` passes. -/

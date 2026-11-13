@@ -112,7 +112,7 @@ private def memoryChecks (r : Runner) : IO Unit := do
       ((a2.sessions.get? (idNat eb.nodeId)).isSome && (b2.sessions.get? (idNat ea.nodeId)).isSome)
     r.check "discv5 memory: B learned A's record from the handshake"
       (b2.table.entries.any (·.id == ea.nodeId))
-    r.check "discv5 memory: A recorded B's view of its endpoint" (a2.votes.contains epA)
+    r.check "discv5 memory: A recorded B's view of its endpoint" (a2.votes.any (·.2 == epA))
     -- A second request goes straight through the session: one packet
     -- each way.
     let (a3, out) := Core.step a2 (.request eb epB (.findNode [2] [0]) (randFor 100))
@@ -123,6 +123,19 @@ private def memoryChecks (r : Runner) : IO Unit := do
         | .nodes [2] 1 [e] => e.nodeId == eb.nodeId
         | _ => false)
     r.check "discv5 memory: A's table holds B after NODES" (a4.table.entries.any (·.id == eb.nodeId))
+    -- Endpoint votes: below the quorum the record stays; at the quorum
+    -- it names the voted endpoint under the next seq.
+    let outside : Endpoint := { ip := [203, 0, 113, 7], port := 30303 }
+    let vote (k : Nat) : Nat × Endpoint := (k, outside)
+    let few := Core.refreshRecord { a0 with votes := (List.range (Core.voteQuorum - 1)).map vote }
+    r.check "discv5 votes: fewer than the quorum leave the record" (few.localEnr.seq == 1)
+    let many := Core.refreshRecord { a0 with votes := (List.range Core.voteQuorum).map vote }
+    r.check "discv5 votes: the quorum re-signs the record under seq 2" (many.localEnr.seq == 2)
+    r.check "discv5 votes: the new record names the voted endpoint"
+      (endpointOf? many.localEnr == some outside)
+    r.check "discv5 votes: the node id stays" (many.localEnr.nodeId == ea.nodeId)
+    let again := Core.refreshRecord many
+    r.check "discv5 votes: a record that holds the endpoint stays" (again.localEnr.seq == 2)
   | _, _ => r.check "discv5 memory: the records sign" false
 
 /-! ## Three nodes over UDP on the loopback -/
