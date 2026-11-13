@@ -473,6 +473,10 @@ private structure LoopState where
   /-- The router parameters: `Config.params` at the start, with the
   topic score parameters that `setTopicParams` replaced since. -/
   params : Core.Params
+  /-- The replaced topic parameters, one entry per topic. `params` reads
+  this map over the config's own function, so a replacement never
+  wraps the one before it. -/
+  topicOverrides : Std.HashMap TopicId (Option Score.TopicParams) := {}
 
 /-- Run the actions of one core step, in order, and answer the delayed
 sends. `gossipAt` is the time of the tick when a tick made the actions. The
@@ -608,11 +612,14 @@ private def loop (env : Env) (st0 : LoopState) : Conc.Async Unit := do
       st ← (stepAndAct env st e : BaseIO LoopState)
     | some (.inspect k) => (k st.params st.router : BaseIO Unit)
     | some (.setTopicParams topic tp) =>
-      -- The parameters hold a function, so each replacement wraps the
-      -- one before it.
-      let old := st.params.score.topics
-      st := { st with params := { st.params with
-        score := { st.params.score with topics := fun t => if t = topic then tp else old t } } }
+      -- One map, read over the config's function: the closure depth
+      -- stays one however many replacements come.
+      let overrides := st.topicOverrides.insert topic tp
+      let base := env.config.params.score.topics
+      st := { st with
+        topicOverrides := overrides
+        params := { st.params with score := { st.params.score with
+          topics := fun t => (overrides.get? t).getD (base t) } } }
     (env.alarm.set (dueOf st) : BaseIO Unit)
   (env.alarm.close : BaseIO Unit)
   for (_, ob) in ← (env.outbound.get : BaseIO (List (Peer × Outbound))) do

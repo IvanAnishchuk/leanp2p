@@ -250,6 +250,12 @@ private def scoreChecks (r : Tests.Runner) : Async Unit := do
   match ← f.node.scores with
   | some [(_, s)] => r.check s!"node.score.topic-params-apply ({s})" (s < 0)
   | _ => r.check "node.score.topic-params-apply" false
+  -- A second replacement for the same topic takes the place of the
+  -- first: with no parameters the topic scores nothing again.
+  r.check "node.score.replace-again" (← (f.node.setTopicParams topic none : BaseIO Bool))
+  match ← f.node.scores with
+  | some [(_, s)] => r.check s!"node.score.replacement-replaces ({s})" (s == 0)
+  | _ => r.check "node.score.replacement-replaces" false
   finish sw [f]
 
 /-- The system-clock alarm ends when the node stops, without an advance of a
