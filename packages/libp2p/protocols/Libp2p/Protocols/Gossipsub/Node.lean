@@ -145,12 +145,17 @@ structure Config where
   must not park: the application queues the work and answers later
   through `Node.report`. -/
   onValidate : Message → MessageId → Peer → BaseIO Unit := fun _ _ _ => pure ()
+  /-- The cap on one encoded RPC, in and out. The default is go's 1 MiB
+  (`Constants.rpcCap`), which the interop gate runs at. A consensus node
+  sets `Constants.gossipMaxMessageSize` (phase0 "Maximum message
+  sizes"). -/
+  maxRpcSize : Nat := Constants.rpcCap
 
 /-- A running node. Every field is a seam over the loop task, which is the
 only owner of the router state. -/
 structure Node where
   /-- Publish the payload on the topic. `false` when the queue of the loop
-  is full or the node stopped. -/
+  is full, the node stopped, or the payload is over `maxDataSize`. -/
   publish : TopicId → ByteArray → BaseIO Bool
   /-- Register a delivery callback. The callback runs on the loop task, so
   it must not park. `false` under the same conditions as `publish`, and the
@@ -246,7 +251,7 @@ before emptyWithCapacity allocates the body. This is the pinned Lean name
 for the capacity constructor. Each copySlice writes only the next slice at
 cursor, without retaining an earlier body value. EOF between frames is clean.
 The repeat loop uses constant stack space for any number of chunks or frames. -/
-private def readFrames (events : Conc.Chan Input) (peer : Peer)
+private def readFrames (events : Conc.Chan Input) (cap : Nat) (peer : Peer)
     (stream : Streams.Stream) : Conc.Async (Except Libp2p.Core.Error Unit) := do
   let mut header := ByteArray.emptyWithCapacity Varint.maxBytes
   let mut body := ByteArray.empty
@@ -289,7 +294,7 @@ private def readFrames (events : Conc.Chan Input) (peer : Peer)
         | .error .truncated => pure ()
         | .error .malformed => return .error (.protocol "the RPC header is malformed")
         | .ok (size, _) =>
-          if Constants.rpcCap < size then
+          if cap < size then
             return .error (.protocol "the RPC exceeds the cap")
           -- The allocation runs only after the length passes the cap.
           body := ByteArray.emptyWithCapacity size
@@ -301,7 +306,8 @@ private def readFrames (events : Conc.Chan Input) (peer : Peer)
 /-- Serve every RPC of a peer's stream in arrival order. Frame errors reset
 both directions. A clean EOF closes our write direction. The host owns and
 joins this handler task. -/
-def handler (events : Conc.Chan Input) : Libp2p.Core.StreamHandler where
+def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap) :
+    Libp2p.Core.StreamHandler where
   id := Constants.meshsubId
   handle ctx stream := ExceptT.mk do
     let peer := ctx.remotePeer
@@ -309,7 +315,7 @@ def handler (events : Conc.Chan Input) : Libp2p.Core.StreamHandler where
     if let .error _ ← events.send (.event (.peerJoined peer .meshsub)) then
       stream.close
       return .ok ()
-    let answer ← readFrames events peer stream
+    let answer ← readFrames events cap peer stream
     match answer with
     | .ok () => stream.close
     | .error _ => stream.reset
@@ -369,7 +375,7 @@ A full queue drops its frame. Each peer has one writer and one stream. -/
 private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := do
   if ← env.closing.get then return ()
   (env.config.onSend peer rpc : BaseIO Unit)
-  let some frame := Rpc.encodeFrame? rpc | return ()
+  let some frame := Rpc.encodeFrame? rpc env.config.maxRpcSize | return ()
   let table ← env.outbound.get
   let ob ← match table.find? (fun e => e.1 == peer) with
     | some (_, ob) => pure ob
@@ -564,7 +570,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let now ← config.clock.nowMs
   let subs : Conc.OnceRef Subscriptions ← Conc.OnceRef.new { next := 0, entries := [] }
   let events : Conc.Chan Input ← Conc.Chan.new 64
-  host.setHandler (handler events)
+  host.setHandler (handler events config.maxRpcSize)
   let tasks ← Conc.TaskSet.new
   let alarm ← Conc.Alarm.new
   let outbound ← Conc.OnceRef.new ([] : List (Peer × Outbound))
@@ -596,7 +602,12 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   for peer in ← host.peers do
     discard <| post (.peerJoined peer .meshsub)
   return {
-    publish := fun topic payload => post (.publish (messageOf topic payload))
+    -- "MUST NOT emit" a message over the cap (phase0 "Maximum message
+    -- sizes"): an oversize payload is refused here.
+    publish := fun topic payload =>
+      if Core.sizeOk config.params (messageOf topic payload) then
+        post (.publish (messageOf topic payload))
+      else pure false
     subscribe := fun topic callback => do
       if ← closing.get then return false
       let id ← subs.updateGet fun s =>

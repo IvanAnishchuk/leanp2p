@@ -443,6 +443,22 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', acts) => (validations acts).length = 1 && s'.pending.length = 1
      | _ => false)
 
+  -- The data cap (phase0 "Maximum message sizes"): a message over it is
+  -- invalid, so it is dropped and the sender takes P₄.
+  let capParams : Params := { cfgParams with maxDataSize := some 2 }
+  r.check "core.size.over-cap-rejected"
+    (match step capParams meshed
+        (.rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [1, 2, 3]]))) with
+     | .ok (s', acts) => delivers (msgOf ta [1, 2, 3]) acts = 0 && publishCount acts = 0 &&
+         invalidCount s' pa ta = 1
+     | _ => false)
+  r.check "core.size.at-cap-accepted"
+    (match step capParams meshed
+        (.rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [1, 2]]))) with
+     | .ok (_, acts) => delivers (msgOf ta [1, 2]) acts = 1
+     | _ => false)
+  r.check "core.size.max-message-size" (Constants.gossipMaxMessageSize == 12234442)
+
   -- The transcript driver runs two events in order and appends the
   -- actions.
   r.check "core.run.transcript"

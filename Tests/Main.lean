@@ -7,6 +7,7 @@ import Tests.Gossipsub.Rpc
 import Tests.Gossipsub.Node
 import Tests.Gossipsub.Wire
 import Tests.Gossipsub.Interop
+import Tests.Gossipsub.BigMessage
 import Tests.Vectors
 import Tests.Concurrency
 import Tests.Protobuf
@@ -72,6 +73,9 @@ def main : IO UInt32 := do
     return ← r.summary
   if (← IO.getEnv "LEANP2P_SUITE") == some "host" then
     Tests.Host.run r
+    return ← r.summary
+  if (← IO.getEnv "LEANP2P_SUITE") == some "bigmsg" then
+    Tests.Gossipsub.BigMessage.run r
     return ← r.summary
   Tests.Vectors.run r
   Tests.Gossipsub.Core.run r

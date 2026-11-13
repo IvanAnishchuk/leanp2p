@@ -86,6 +86,14 @@ def maxPayloadSize : Nat := 10 * 2 ^ 20
 framed bytes a reader takes after the length prefix `n`. -/
 def maxCompressedLen (n : Nat) : Nat := 32 + n + n / 6
 
+/-- `max_message_size()`, phase0 "Maximum message sizes": the cap on an
+encoded gossipsub `RPCMsg`, `max(max_compressed_len(MAX_PAYLOAD_SIZE) +
+1024, 1 MiB)`. 12234442 bytes at the mainnet `MAX_PAYLOAD_SIZE`. A
+consensus node sets `Node.Config.maxRpcSize` to it. -/
+def gossipMaxMessageSize : Nat := max (maxCompressedLen maxPayloadSize + 1024) (2 ^ 20)
+
+example : gossipMaxMessageSize = 12234442 := by decide
+
 /-- The length prefix is a protobuf varint of at most 10 bytes, "SSZ-snappy
 encoding strategy". -/
 def lengthPrefixMaxBytes : Nat := 10

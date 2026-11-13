@@ -142,6 +142,12 @@ structure Params where
   message out of the message cache, and acts on `Event.validated`.
   rust-libp2p calls this `validate_messages`, and Lighthouse sets it. -/
   validateMessages : Bool := false
+  /-- The cap on one message's `data`, as it travels. `none` sets no cap.
+  A consensus node sets `max_compressed_len(MAX_PAYLOAD_SIZE)` (phase0
+  "Maximum message sizes": "Clients MUST reject ... messages whose size
+  exceed the following limits"). The uncompressed bound needs the
+  snappy header, which the client's decoder reads. -/
+  maxDataSize : Option Nat := none
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -411,8 +417,17 @@ theorem decodeRpc_of_decodeMessage (bytes : List Nat) (r : Rpc.RPC)
     decodeRpc bytes = .ok r := by
   simp [decodeRpc, h]
 
-/-- A `strictNoSign` validation as a `Bool`. -/
+/-- The message's `data` fits `Params.maxDataSize`. -/
+def sizeOk (p : Params) (m : Message) : Bool :=
+  match p.maxDataSize with
+  | none => true
+  | some cap => decide ((m.data.getD []).length ≤ cap)
+
+/-- A `strictNoSign` validation, and the size cap, as a `Bool`. A
+message over the cap counts as invalid, so the sender takes the P₄
+penalty, as for any message the router rejects. -/
 def validationOk (p : Params) (m : Message) : Bool :=
+  sizeOk p m &&
   match Sign.validate p.prims (fun x => Pb.encodeMessage x) .strictNoSign m with
   | .ok _ => true
   | .error _ => false

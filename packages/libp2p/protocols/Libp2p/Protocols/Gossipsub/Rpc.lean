@@ -868,10 +868,11 @@ as `Streams.Framing.Frame.decode?` does. A zero-length frame is a legal
 empty RPC; unlike `Identify`, this protocol has no empty-frame rule. -/
 
 /-- One length-delimited RPC frame under the cap. `none` when the
-payload is over the cap. -/
-def encodeFrame? (r : RPC) : Option (List Nat) :=
+payload is over the cap. A node passes its own cap
+(`Node.Config.maxRpcSize`). -/
+def encodeFrame? (r : RPC) (cap : Nat := Constants.rpcCap) : Option (List Nat) :=
   let payload := Pb.encodeMessage r
-  if payload.length ≤ Constants.rpcCap then
+  if payload.length ≤ cap then
     some (Streams.Framing.encodeLength .uvarint payload.length ++ payload)
   else none
 
