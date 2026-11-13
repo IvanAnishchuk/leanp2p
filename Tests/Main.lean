@@ -77,6 +77,9 @@ def main : IO UInt32 := do
   if (← IO.getEnv "LEANP2P_SUITE") == some "bigmsg" then
     Tests.Gossipsub.BigMessage.run r
     return ← r.summary
+  if (← IO.getEnv "LEANP2P_SUITE") == some "scale" then
+    Tests.Gossipsub.BigMessage.scale r
+    return ← r.summary
   Tests.Vectors.run r
   Tests.Gossipsub.Core.run r
   Tests.Gossipsub.Sign.run r
