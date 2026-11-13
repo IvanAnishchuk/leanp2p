@@ -159,18 +159,32 @@ def Enr.run (r : Runner) : IO Unit := do
     -- `/udp/<quic>/quic-v1`, QUIC first; a zero `tcp6` gives none.
     -- `quic-v1` is multicodec 0x01cd; 0x01cc is the draft `quic`.
     let quicV1 : List Nat := [0xcd, 0x03]
+    -- The consensus keys carry no IPv6 fallback (phase0 "ENR structure":
+    -- `quic` is the IPv4 port, `quic6` the IPv6 one), so `ip6` gets an
+    -- address only from `quic6` and `tcp6`; a zero `tcp6` gives none.
     let consensus : List Enr.Pair := [⟨.ip, .bytes [1, 2, 3, 4]⟩, ⟨.ip6, .bytes v6⟩,
-      ⟨Enr.quicKey, .bytes (Rlp.ofScalar 9002)⟩, ⟨.tcp, .bytes (Rlp.ofScalar 9000)⟩,
-      ⟨.tcp6, .bytes []⟩, ⟨.udp, .bytes (Rlp.ofScalar 9001)⟩]
+      ⟨Enr.quicKey, .bytes (Rlp.ofScalar 9002)⟩, ⟨Enr.quic6Key, .bytes (Rlp.ofScalar 9003)⟩,
+      ⟨.tcp, .bytes (Rlp.ofScalar 9000)⟩, ⟨.tcp6, .bytes []⟩, ⟨.udp, .bytes (Rlp.ofScalar 9001)⟩]
     match Enr.sign priv 1 consensus with
     | .error e => r.check s!"the consensus record signs ({repr e})" false
     | .ok crec =>
-      r.check "consensus: QUIC then TCP, no udp, no zero tcp6"
+      r.check "consensus: QUIC then TCP, no udp, no zero tcp6, no IPv6 fallback"
         (succeedsWith
           [[0x04, 1, 2, 3, 4, 0x91, 0x02] ++ port 9002 ++ quicV1,
-            (0x29 :: v6) ++ [0x91, 0x02] ++ port 9002 ++ quicV1,
+            (0x29 :: v6) ++ [0x91, 0x02] ++ port 9003 ++ quicV1,
             [0x04, 1, 2, 3, 4, 0x06] ++ port 9000]
           (crec.dialAddrs.map bytesOfAddrs))
+      -- The reverse: the node's own listen addresses give the same keys.
+      match [[0x04, 1, 2, 3, 4, 0x91, 0x02] ++ port 9002 ++ quicV1,
+          (0x29 :: v6) ++ [0x91, 0x02] ++ port 9003 ++ quicV1,
+          [0x04, 1, 2, 3, 4, 0x06] ++ port 9000].mapM maddr with
+      | none => r.check "the consensus listen addresses build" false
+      | some addrs =>
+        r.check "consensus: listen addresses map to ip, ip6, quic, quic6, tcp"
+          (succeedsWith [⟨.ip, .bytes [1, 2, 3, 4]⟩, ⟨.ip6, .bytes v6⟩,
+              ⟨Enr.quicKey, .bytes (Rlp.ofScalar 9002)⟩, ⟨Enr.quic6Key, .bytes (Rlp.ofScalar 9003)⟩,
+              ⟨.tcp, .bytes (Rlp.ofScalar 9000)⟩]
+            (Enr.consensusPairs addrs))
 
   -- One rejection per decode rule. Each mutation starts from the
   -- example's items: `[signature, seq, id, v4, ip, …, udp, 765f]`.

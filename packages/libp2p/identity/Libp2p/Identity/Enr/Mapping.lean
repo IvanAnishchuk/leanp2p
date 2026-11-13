@@ -90,13 +90,14 @@ def multiaddrs (r : Enr) : Except Error (List Multiaddr) := do
 /-! ## The consensus profile
 
 The consensus networking spec gives the ports their own meanings
-(phase0 `p2p-interface.md`, "ENR structure"): `tcp`/`tcp6` is the libp2p
-TCP port, `quic`/`quic6` the libp2p QUIC port, and `udp`/`udp6` the
-discv5 port. So the dial addresses read `tcp` and `quic`, and never
-`udp`. The IPv6 fallback to the general port follows EIP-778, as
-`multiaddrs` does; Lighthouse's `dialable_multiaddrs_tcp` reads `tcp6`
-only. A port of 0 is no listener, and gives no address, as in
-Lighthouse. -/
+(phase0 `p2p-interface.md`, "ENR structure"): "An IPv4 QUIC port
+(`quic` field) ... and/or the corresponding IPv6 port (`quic6` field)",
+and the same for `tcp`/`tcp6` (libp2p TCP) and `udp`/`udp6` (discv5).
+So the dial addresses read `tcp` and `quic`, never `udp`, and an IPv6
+address takes only `tcp6` and `quic6`: no fallback to the IPv4 port,
+which EIP-778's generic rule has and `multiaddrs` keeps. Lighthouse's
+`dialable_multiaddrs_tcp` reads it the same way. A port of 0 is no
+listener, and gives no address, as in Lighthouse. -/
 
 /-- The `quic` key of the consensus spec. -/
 def quicKey : Key := Key.ofName nameQuic
@@ -122,11 +123,11 @@ def dialAddrs (r : Enr) : Except Error (List Multiaddr) := do
   let live (p : Option Nat) : Option Nat := p.filter (· != 0)
   let quics := (match ip, live quic with
       | some a, some p => [(Protocol.ip4, a, p)] | _, _ => []) ++
-    (match ip6, live (quic6 <|> quic) with
+    (match ip6, live quic6 with
       | some a, some p => [(Protocol.ip6, a, p)] | _, _ => [])
   let tcps := (match ip, live tcp with
       | some a, some p => [(Protocol.ip4, a, p)] | _, _ => []) ++
-    (match ip6, live (tcp6 <|> tcp) with
+    (match ip6, live tcp6 with
       | some a, some p => [(Protocol.ip6, a, p)] | _, _ => [])
   let q ← quics.mapM fun (ipProto, a, p) => quicAddress ipProto a p
   let t ← tcps.mapM fun (ipProto, a, p) => address ipProto a .tcp p
@@ -193,6 +194,57 @@ def pairsOfMultiaddrs (addrs : List Multiaddr) : Except Error (List Pair) := do
     (v.map fun n => ⟨k, .bytes (ofScalar n)⟩).toList
   let pairs := bytesPair .ip e.ip ++ bytesPair .ip6 e.ip6 ++ portPair .tcp e.tcp ++
     portPair .tcp6 e.tcp6 ++ portPair .udp e.udp ++ portPair .udp6 e.udp6
+  return pairs.mergeSort fun p q => decide (p.key.name ≤ q.key.name)
+
+/-- The parts of a QUIC listen address, `/ip4|ip6/<a>/udp/<p>/quic-v1`:
+the address protocol and bytes, and the port. -/
+def quicParts? (m : Multiaddr) : Option (Protocol × List Nat × Nat) :=
+  match m.components with
+  | [ipF, udpF, quicF] =>
+    match udpF.value with
+    | [hi, lo] =>
+      if (ipF.proto = .ip4 || ipF.proto = .ip6) && udpF.proto = .udp && quicF.proto = .«quic-v1» then
+        some (ipF.proto, ipF.value, hi * 256 + lo)
+      else none
+    | _ => none
+  | _ => none
+
+/-- The record pairs of a consensus node's listen addresses (phase0
+`p2p-interface.md`, "ENR structure"): `ip`/`ip6`, then per family
+`tcp`/`tcp6` for the TCP listeners and `quic`/`quic6` for the QUIC ones.
+An IPv6 port always takes its own key, since the consensus keys carry
+no fallback. `udp` is discv5's, so the caller adds it. Any other address
+is an error, and so are two ports of one key. -/
+def consensusPairs (addrs : List Multiaddr) : Except Error (List Pair) := do
+  let mut ip : Option (List Nat) := none
+  let mut ip6 : Option (List Nat) := none
+  let mut tcp : Option Nat := none
+  let mut tcp6 : Option Nat := none
+  let mut quic : Option Nat := none
+  let mut quic6 : Option Nat := none
+  for m in addrs do
+    match quicParts? m, parts? m with
+    | some (ipProto, a, port), _ =>
+      if ipProto = .ip4 then
+        ip := ← merge .ip ip a
+        quic := ← merge quicKey quic port
+      else
+        ip6 := ← merge .ip6 ip6 a
+        quic6 := ← merge quic6Key quic6 port
+    | none, some (ipProto, a, .tcp, port) =>
+      if ipProto = .ip4 then
+        ip := ← merge .ip ip a
+        tcp := ← merge .tcp tcp port
+      else
+        ip6 := ← merge .ip6 ip6 a
+        tcp6 := ← merge .tcp6 tcp6 port
+    | _, _ => throw .multiaddr
+  let bytesPair (k : Key) (v : Option (List Nat)) : List Pair :=
+    (v.map fun b => ⟨k, .bytes b⟩).toList
+  let portPair (k : Key) (v : Option Nat) : List Pair :=
+    (v.map fun n => ⟨k, .bytes (ofScalar n)⟩).toList
+  let pairs := bytesPair .ip ip ++ bytesPair .ip6 ip6 ++ portPair quicKey quic ++
+    portPair quic6Key quic6 ++ portPair .tcp tcp ++ portPair .tcp6 tcp6
   return pairs.mergeSort fun p q => decide (p.key.name ≤ q.key.name)
 
 /-- The address pairs of a record: the pairs the reverse map rebuilds. -/
