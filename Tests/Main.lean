@@ -102,6 +102,8 @@ def main : IO UInt32 := do
   | some "leak9" => Tests.Leak.tcpParkedRead r; return ← r.summary
   | some "leak10" => Tests.Leak.tcpWriteAfterClose r; return ← r.summary
   | some "yamux" => Tests.Yamux.run r; return ← r.summary
+  -- One discv5 node for an outside tester; no checks run.
+  | some "discv5serve" => Tests.Discv5.serve; return 0
   | some "streams" => Tests.Streams.run r; return ← r.summary
   | _ => pure ()
   if (← IO.getEnv "LEANP2P_SUITE") == some "mux" then

@@ -527,6 +527,21 @@ private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
   x.stop
   y.stop
 
+/-- Serve one node for an outside tester (`scripts/discv5-geth-interop.sh`):
+bind `127.0.0.1` at `LEANP2P_DISCV5_PORT` (0 for any), print
+`ENR <text>` and flush, and serve for `LEANP2P_DISCV5_MS` milliseconds
+(60000 by default). The key is node B's of the wire vectors. -/
+def serve : IO Unit := Conc.Async.run do
+  let some kb := key32 nodeBKey | throw (IO.userError "discv5 serve: key")
+  let port := ((← IO.getEnv "LEANP2P_DISCV5_PORT").bind (·.toNat?)).getD 0
+  let ms := ((← IO.getEnv "LEANP2P_DISCV5_MS").bind (·.toNat?)).getD 60000
+  let n ← Node.start kb [127, 0, 0, 1] port
+  let e ← (n.localEnr : BaseIO _)
+  IO.println s!"ENR {e.toText}"
+  (← IO.getStdout).flush
+  Conc.select #[← (Conc.Park.sleep ms () : BaseIO (Conc.Park Unit))]
+  n.stop
+
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
   memoryChecks r
