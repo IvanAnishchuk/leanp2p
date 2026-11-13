@@ -28,6 +28,14 @@ ARCHITECTURE, contract 4):
    then the listeners. A secured listener's join also waits for the
    sessions it gave, which share its socket; stage 4 closed them.
 
+After the joins, `close` empties the handler table and the notifiee
+list. A closed host serves no stream and raises no event, so neither is
+read again. A handler or notifiee often holds its own host, as
+`Identify.pushHandler h` does, and the host holds it in turn. Reference
+counting frees no such cycle, so without this step the host, its
+sessions, and everything they reach would stay allocated until exit
+(#102).
+
 Every stage closes the parks of the tasks that a later stage joins, so
 every join returns (PRINCIPLES 3.1, 3.2). A path that registers after a
 stage took its list sees the flag of stage 1, and closes what it
@@ -110,6 +118,11 @@ def close (h : Host) (onStage : Stage → BaseIO Unit := fun _ => pure ()) : Asy
     listenerFault := listenerFault <|> (← capture l.join)
   for l in securedListeners do
     listenerFault := listenerFault <|> (← capture l.join)
+
+  -- Every task that reads the tables has been joined; break the cycles
+  -- through closures that hold the host (module doc).
+  (h.handlers.set {} : BaseIO Unit)
+  (h.notifiees.set [] : BaseIO Unit)
 
   if let some e := sessionFault <|> hostFault <|> listenerFault then throw e
 

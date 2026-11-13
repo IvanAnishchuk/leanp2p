@@ -11,6 +11,7 @@ import Tests.Gossipsub.BigMessage
 import Tests.Gossipsub.HostNode
 import Tests.Gossipsub.Payload
 import Tests.Gossipsub.Partial
+import Tests.Leak
 import Tests.Vectors
 import Tests.Concurrency
 import Tests.Protobuf
@@ -88,6 +89,21 @@ def main : IO UInt32 := do
     Tests.Gossipsub.Partial.run r
     Tests.Gossipsub.HostNode.runPartial r
     return ← r.summary
+  -- The #102 leak scenarios, one per run, for the LeakSanitizer build.
+  match (← IO.getEnv "LEANP2P_SUITE") with
+  | some "leak1" => Tests.Leak.clockOnly r; return ← r.summary
+  | some "leak2" => Tests.Leak.hostsOnly r; return ← r.summary
+  | some "leak3" => Tests.Leak.pairOnly r; return ← r.summary
+  | some "leak4" => Tests.Leak.pairStream r; return ← r.summary
+  | some "leak5" => Tests.Leak.pairSelfHandler r; return ← r.summary
+  | some "leak6" => Tests.Leak.tcpClosed r; return ← r.summary
+  | some "leak7" => Tests.Leak.tcpDeadline r; return ← r.summary
+  | some "leak8" => Tests.Leak.tcpReset r; return ← r.summary
+  | some "leak9" => Tests.Leak.tcpParkedRead r; return ← r.summary
+  | some "leak10" => Tests.Leak.tcpWriteAfterClose r; return ← r.summary
+  | some "yamux" => Tests.Yamux.run r; return ← r.summary
+  | some "streams" => Tests.Streams.run r; return ← r.summary
+  | _ => pure ()
   if (← IO.getEnv "LEANP2P_SUITE") == some "mux" then
     Tests.Mux.run r
     return ← r.summary
