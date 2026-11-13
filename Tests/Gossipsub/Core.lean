@@ -499,20 +499,55 @@ def run (r : Runner) : IO Unit := do
   let withFanout : State :=
     { known with fanout := [(tb, { peers := [pa], lastPublished := 0 })] }
   r.check "core.maintain.fanout-expires"
-    ((maintain cfgParams withFanout (cfgParams.fanoutTtl - 1)).fanout.length = 1 &&
-      (maintain cfgParams withFanout cfgParams.fanoutTtl).fanout.isEmpty)
+    ((maintain cfgParams withFanout (cfgParams.fanoutTtl - 1)).1.fanout.length = 1 &&
+      (maintain cfgParams withFanout cfgParams.fanoutTtl).1.fanout.isEmpty)
   -- A promise past its deadline is one P₇ penalty, and leaves the table.
   let promised : State := { known with iwant := Cache.PromiseTable.promise [] pa ⟨[7]⟩ 100 }
   let penalty (s : State) (q : Peer) : Nat := ((peerOf s q).map (·.score.behaviourPenalty)).getD 0
   r.check "core.maintain.broken-promise-penalised"
-    (penalty (maintain cfgParams promised 99) pa = 0 &&
-      penalty (maintain cfgParams promised 100) pa = 1 &&
-      (maintain cfgParams promised 100).iwant.isEmpty)
+    (penalty (maintain cfgParams promised 99).1 pa = 0 &&
+      penalty (maintain cfgParams promised 100).1 pa = 1 &&
+      (maintain cfgParams promised 100).1.iwant.isEmpty)
   -- A delivered id keeps its promise: no penalty.
   r.check "core.maintain.delivered-promise-kept"
     (match step cfgParams promised (.rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [7]]))) with
-     | .ok (s', _) => penalty (maintain cfgParams s' 100) pa = 0
+     | .ok (s', _) => penalty (maintain cfgParams s' 100).1 pa = 0
      | _ => false)
+  -- P₆: two peers on one IP address count 2 each, a third on its own 1.
+  let ipOf (s : State) (q : Peer) : Nat := ((peerOf s q).map (·.score.ipColocation)).getD 0
+  match Libp2p.Protocols.Gossipsub.Core.run baseParams known
+      [.peerInfo pa false (some [1, 2, 3, 4]), .peerInfo pb false (some [1, 2, 3, 4]),
+       .peerInfo pc true (some [5, 6, 7, 8])] with
+  | .ok (s', _) =>
+    let (m, _) := maintain baseParams s' 0
+    r.check "core.p6.colocation-counts" (ipOf m pa = 2 && ipOf m pb = 2 && ipOf m pc = 1)
+    -- D_out: a full mesh of inbound peers grafts the outbound `pc`, and no
+    -- inbound peer fills that quota.
+    let dOutParams : Params := { baseParams with dOut := 1 }
+    let inboundMesh : State := { s' with mesh := [(ta, [pa, pb])], lastHeartbeat := 0, now := 0 }
+    r.check "core.dout.outbound-grafted"
+      (match step dOutParams inboundMesh (.tick 1000 [pd, pc]) with
+       | .ok (s'', acts) => memB pc (meshOf s'' ta) && !memB pd (meshOf s'' ta) &&
+           graftCount ta acts = 1
+       | _ => false)
+  | .error _ => r.check "core.p6.setup" false
+  -- Opportunistic grafting: the mesh's median score is below the
+  -- threshold, so it grafts the one outside peer that scores above it.
+  -- P₂ first deliveries score `pc` above the mesh's zero median.
+  let ogTopic : Score.TopicParams :=
+    { scoreTopic with firstMessageDeliveriesWeight := 1000, firstMessageDeliveriesCap := 10 }
+  let ogTopics : TopicId → Option Score.TopicParams := fun t =>
+    if t = ta then some ogTopic else none
+  let ogThresholds : Thresholds := { cfgParams.thresholds with opportunisticGraftThreshold := 1 }
+  let og : Params :=
+    { cfgParams with score := { cfgParams.score with topics := ogTopics }, thresholds := ogThresholds }
+  match Libp2p.Protocols.Gossipsub.Core.run og { known with mesh := [(ta, [pa, pb])] }
+      [.rpc pc (Pb.encodeMessage (rpcOfPublish [msgOf ta [43]]))] with
+  | .ok (s', _) =>
+    let (m, acts) := maintain og s' 0 (opportunistic := true)
+    r.check "core.opportunistic.grafts-above-median"
+      (memB pc (meshOf m ta) && graftCount ta acts = 1)
+  | .error _ => r.check "core.opportunistic.setup" false
   -- The delivery record. A duplicate from mesh peer `pb` within the
   -- window counts toward P₃; the topic's window is 10 ms here.
   -- `scoreTopic` caps the P₃ counter at 0, so this topic lifts the cap.

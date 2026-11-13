@@ -168,6 +168,9 @@ structure Config where
   gets the message with its handle in `data`; `Node.payload` reads the
   bytes. -/
   payloadId : Option (String → ByteArray → MessageId) := none
+  /-- The heartbeats between opportunistic grafting rounds; rust's
+  `opportunistic_graft_ticks` is 60. -/
+  opportunisticGraftTicks : Nat := 60
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
 Lighthouse's `lighthouse_network` metrics are off in the shadow node
@@ -694,7 +697,10 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
         pure { st with nextExplicitCheck := now + env.config.explicitCheckMs }
       else pure st
     let st := { st with router := Core.expirePending st.params st.router now }
-    let st := { st with router := Core.maintain st.params st.router now }
+    let opportunistic := st.ticks > 0 && st.ticks % env.config.opportunisticGraftTicks == 0
+    let (router, grafts) := Core.maintain st.params st.router now opportunistic
+    let st := { st with router }
+    discard <| perform env none st.gossipIndex grafts
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
@@ -815,11 +821,16 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   -- `disconnected` of a replaced session is dropped (`Host.ConnEvent`).
   let current ← Conc.OnceRef.new ([] : List (Peer × Nat))
   host.addNotifiee fun
-    | .connected peer session _ _ => do
+    | .connected peer session role remoteAddr => do
       current.update fun t => (peer, session) :: t.filter (·.1 != peer)
       -- A new session may speak meshsub where the last did not.
       unsupported.update (·.filter (· != peer))
       discard <| post (.peerJoined peer .meshsub)
+      -- The direction feeds `D_out`, the IP address feeds P₆.
+      let ip := match remoteAddr.components with
+        | f :: _ => if f.proto == .ip4 || f.proto == .ip6 then some f.value else none
+        | [] => none
+      discard <| post (.peerInfo peer (role == .initiator) ip)
     | .disconnected peer session => do
       let mine ← current.updateGet fun t =>
         if t.any (· == (peer, session)) then (true, t.filter (·.1 != peer)) else (false, t)

@@ -95,6 +95,11 @@ structure PeerData where
   proto : PubsubProto
   /-- The announced topics. -/
   subs : List TopicId
+  /-- We dialed the peer: the `D_out` quota counts it
+  (`gossipsub-v1.1.md`, lines 186 to 203). -/
+  outbound : Bool := false
+  /-- The peer's IP address bytes, for P₆'s colocation count. -/
+  ip : Option (List Nat) := none
 
 /-- The mesh degree parameters: `d`, `dLow`, `dHigh`, `dScore`, `dLazy`. -/
 structure MeshParams where
@@ -176,6 +181,15 @@ structure Params where
   go and rust turn it on by default; Lighthouse turns it off
   (`config.rs:519`), so the default here is off. -/
   floodPublish : Bool := false
+  /-- `D_out`: the outbound peers a mesh keeps (`gossipsub-v1.1.md`,
+  lines 186 to 203); rust's `mesh_outbound_min` is 2. It must stay below
+  `D_lo` and at most `D/2`. -/
+  dOut : Nat := 2
+  /-- Opportunistic grafting (`gossipsub-v1.1.md`, lines 260 to 279): at
+  each of its heartbeats, a mesh whose median score is below
+  `opportunisticGraftThreshold` grafts up to this many peers that score
+  above the median. rust grafts 2 every 60 heartbeats. -/
+  opportunisticGraftPeers : Nat := 2
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -266,6 +280,9 @@ inductive Event where
   | tick (now : Millis) (order : List Peer)
   /-- The application answers the held message `id` from `source`. -/
   | validated (id : MessageId) (source : Peer) (outcome : Validation)
+  /-- What the host knows of a connected peer: whether we dialed it, and
+  its IP address bytes. -/
+  | peerInfo (peer : Peer) (outbound : Bool) (ip : Option (List Nat))
   deriving Repr
 
 /-- The outgoing actions. -/
@@ -532,11 +549,32 @@ structure TopicPlan where
 def announced (s : State) (topic : TopicId) : List Peer :=
   (s.peers.filter (fun e => memB topic e.2.subs)).map Prod.fst
 
-/-- One topic plan. An overfull mesh drops its oldest entries down to
-`d`, an underfull mesh takes candidates from the order up to `d`, and a
-candidate is outside the mesh, outside backoff, known, and at or above
-score 0. The kept list is cut at `dHigh`, so the mesh bound holds by
-construction. -/
+/-- The peers a heartbeat grafts: `need` candidates, then, when the mesh
+is still `outNeed` short of outbound peers, outbound candidates only up
+to that quota ("the router selects outbound peers from the candidates
+and grafts them", `gossipsub-v1.1.md`, lines 186 to 203). An inbound
+peer never fills the outbound quota. -/
+def pickAdded (cands : List Peer) (isOut : Peer → Bool) (need outNeed : Nat) : List Peer :=
+  let base := cands.take need
+  let extra := ((cands.filter isOut).filter (fun q => !memB q base)).take
+    (outNeed - (base.filter isOut).length)
+  base ++ extra
+
+/-- A picked peer is a candidate. -/
+theorem mem_pickAdded {cands : List Peer} {isOut : Peer → Bool} {need outNeed : Nat} {q : Peer}
+    (h : q ∈ pickAdded cands isOut need outNeed) : q ∈ cands := by
+  unfold pickAdded at h
+  rw [List.mem_append] at h
+  rcases h with h | h
+  · exact List.mem_of_mem_take h
+  · exact (List.mem_filter.1 (List.mem_filter.1 (List.mem_of_mem_take h)).1).1
+
+/-- One topic plan. An overfull mesh keeps its `dScore` best and its
+`D_out` outbound peers and fills to `d`; an underfull mesh, or one short
+of outbound peers, takes candidates from the order (`pickAdded`); and a
+candidate is outside the mesh, outside backoff, known, not explicit, and
+at or above score 0. The kept list is cut at `dHigh`, so the mesh bound
+holds by construction. -/
 def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
     (topic : TopicId) : TopicPlan :=
   let ps := meshOf s topic
@@ -546,8 +584,14 @@ def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
   -- the old rule did, and the kept peers keep their mesh order.
   let best := (ps.reverse.mergeSort (fun a b => decide (scoreOf p s b ≤ scoreOf p s a))).take
     p.mesh.dScore
+  let isOut (q : Peer) : Bool := ((peerOf s q).map (·.outbound)).getD false
   let rest := ps.filter (fun q => !memB q best)
-  let fill := rest.drop (rest.length - (p.mesh.d - best.length))
+  -- `D_out`: the fill takes outbound peers first, up to the quota
+  -- (`gossipsub-v1.1.md`, lines 186 to 203).
+  let outShort := p.dOut - (best.filter isOut).length
+  let fillOut := (rest.filter isOut).take outShort
+  let restIn := rest.filter (fun q => !memB q fillOut)
+  let fill := fillOut ++ restIn.drop (restIn.length - (p.mesh.d - best.length - fillOut.length))
   let kept0 := if ps.length > p.mesh.dHigh then
       ps.filter (fun q => memB q best || memB q fill)
     else ps
@@ -556,7 +600,7 @@ def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
   let cands := order.filter (fun q =>
     !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
       (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit)
-  let added := cands.take need
+  let added := pickAdded cands isOut need (p.dOut - (kept0.filter isOut).length)
   { topic := topic, kept := (kept0 ++ added).take p.mesh.dHigh, pruned := over, added := added }
 
 /-- The plan of every topic in the mesh. -/
@@ -870,6 +914,24 @@ def expirePending (p : Params) (s : State) (now : Millis) : State :=
   else { s with pending := s.pending.filter (fun e => !memB e.1 old),
                 pendingAt := s.pendingAt.filter (fun e => !memB e.1 old) }
 
+/-- Opportunistic grafting (`gossipsub-v1.1.md`, lines 260 to 279): a mesh
+whose median peer score is below `opportunisticGraftThreshold` grafts up
+to `opportunisticGraftPeers` peers that announced the topic, sit outside
+the mesh and its backoff, are not explicit, and score above the median.
+The answer is the state with the meshes grown and the grafts to send. -/
+def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List Action :=
+  s.mesh.foldl (fun (st, acts) (t, ps) =>
+    if ps.isEmpty then (st, acts) else
+    let scores := (ps.map (scoreOf p st)).mergeSort (fun a b => decide (a ≤ b))
+    let median := scores.getD (scores.length / 2) 0
+    if decide (p.thresholds.opportunisticGraftThreshold ≤ median) then (st, acts) else
+    let cands := ((announced st t).filter fun q =>
+      !memB q ps && !(Cache.Backoff.active st.backoff q t now) && !memB q st.explicit &&
+        decide (median < scoreOf p st q)).take p.opportunisticGraftPeers
+    let st := cands.foldl (fun st q =>
+      updateScoreOf (setTopicMesh st t (q :: meshOf st t)) q (fun sc => Score.graft sc now t)) st
+    (st, acts ++ cands.map (fun q => Action.sendRpc q (graftRpc t)))) (s, [])
+
 /-- Heartbeat upkeep that the spike runs outside `step` (the loop calls it
 before each tick), so the heartbeat theorems hold unchanged. Each part
 cites #95:
@@ -878,12 +940,25 @@ cites #95:
   publish for `fanoutTtl` loses its fanout;
 * broken IWANT promises (`gossipsub-v1.1.md`, spam measures): each
   promise past its deadline adds one P₇ behaviour penalty to its peer,
-  and leaves the table. -/
-def maintain (p : Params) (s : State) (now : Millis) : State :=
+  and leaves the table;
+* P₆ (`gossipsub-v1.1.md`, "P₆"): each peer's IP colocation count is the
+  number of known peers on its IP address;
+* opportunistic grafting, on the heartbeats the loop marks
+  (`opportunistic`): see `opportunisticGrafts`. -/
+def maintain (p : Params) (s : State) (now : Millis) (opportunistic : Bool := false) :
+    State × List Action :=
   let broken := Cache.PromiseTable.broken s.iwant now
-  let s1 := broken.foldl (fun st (q, n) =>
+  let s0 := broken.foldl (fun st (q, n) =>
     updateScoreOf st q (fun sc => (List.replicate n ()).foldl (fun sc _ => Score.behaviourPenalty sc) sc)) s
-  { s1 with
+  -- P₆: one count per IP address over the known peers.
+  let ips := s0.peers.filterMap (·.2.ip)
+  let s1 : State := { s0 with peers := s0.peers.map fun (q, pd) =>
+    (q, { pd with score := { pd.score with ipColocation :=
+      match pd.ip with
+      | some a => (ips.filter (· == a)).length
+      | none => 0 } }) }
+  let (s1, grafts) := if opportunistic then opportunisticGrafts p s1 now else (s1, [])
+  ({ s1 with
     iwant := s1.iwant.filter (fun e => decide (now < e.deadline))
     fanout := s1.fanout.filter (fun e => decide (now < e.2.lastPublished + p.fanoutTtl))
     -- A delivery record lives as long as the seen cache remembers its id.
@@ -893,7 +968,7 @@ def maintain (p : Params) (s : State) (now : Millis) : State :=
     -- A retransmission count lives as long as its message is cached.
     served := s1.served.filter (fun k _ => (Cache.MessageIndex.get s1.mcache k.2).isSome)
     -- A departed peer's record lives `retainScore`.
-    retained := s1.retained.filter (fun e => decide (now < e.2.2 + p.retainScore)) }
+    retained := s1.retained.filter (fun e => decide (now < e.2.2 + p.retainScore)) }, grafts)
 
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
@@ -1133,6 +1208,10 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
   | .tick now order =>
       if heartbeatDue p s now then .ok (heartbeat p s now order) else .ok (s, [])
   | .validated id source outcome => .ok (handleValidated p s id source outcome)
+  | .peerInfo peer outbound ip =>
+    .ok (match peerOf s peer with
+      | some pd => (setPeer s peer { pd with outbound, ip }, [])
+      | none => (s, []))
 
 /-- The transcript driver: the events in order. The first error stops
 the run. -/
@@ -2307,6 +2386,13 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
       have hacts : acts = (handleValidated p s id source outcome).2 := by rw [h1]
       rw [hacts] at hdel
       exact absurd hdel (handleValidated_not_deliver p s id source outcome m)
+  | peerInfo peer outbound ip =>
+      -- The step only records the peer's facts; it emits no action.
+      simp only [step] at hstep
+      split at hstep <;>
+        (simp only [Except.ok.injEq, Prod.mk.injEq] at hstep
+         obtain ⟨-, rfl⟩ := hstep
+         simp at hdel)
   | rpc sender bytes =>
       simp only [step, rpcStep] at hstep
       split at hstep
@@ -2392,10 +2478,11 @@ private theorem planTopic_added_backoff (p : Params) (s : State) (now : Millis)
     (h : q ∈ (planTopic p s now order topic).added) :
     Cache.Backoff.active s.backoff q topic now = false := by
   simp only [planTopic] at h
+  -- `added` is a pick of the candidates (`mem_pickAdded`).
   have hc : q ∈ order.filter (fun q =>
       !memB q (meshOf s topic) && !(Cache.Backoff.active s.backoff q topic now) &&
         (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit) :=
-    List.mem_of_mem_take h
+    mem_pickAdded h
   cases hb : Cache.Backoff.active s.backoff q topic now with
   | false => rfl
   | true =>
