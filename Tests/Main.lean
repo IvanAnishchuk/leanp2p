@@ -35,6 +35,7 @@ import Tests.Tls
 import Tests.Quic
 import Tests.Rlp
 import Tests.Enr
+import Tests.Discv5
 import Tests.Negotiate
 import Tests.Upgrade
 import Tests.Host
@@ -77,6 +78,9 @@ def main : IO UInt32 := do
   if (← IO.getEnv "LEANP2P_SUITE") == some "bigmsg" then
     Tests.Gossipsub.BigMessage.run r
     return ← r.summary
+  if (← IO.getEnv "LEANP2P_SUITE") == some "discv5" then
+    Tests.Discv5.run r
+    return ← r.summary
   if (← IO.getEnv "LEANP2P_SUITE") == some "scale" then
     Tests.Gossipsub.BigMessage.scale r
     return ← r.summary
@@ -115,6 +119,7 @@ def main : IO UInt32 := do
   Tests.QuicSuite.run r
   Tests.Rlp.run r
   Tests.Enr.run r
+  Tests.Discv5.run r
   Tests.Negotiate.run r
   Tests.Upgrade.run r
   Tests.Host.run r

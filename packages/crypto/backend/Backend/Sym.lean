@@ -154,4 +154,41 @@ def chachaOpen (key : Key32) (nonce : Nonce12) (ad ct : ByteArray) :
   else if ct.size < aeadTagLen then .error .authFailed
   else liftShim .authFailed (chachaOpenRaw key.bytes nonce.bytes ad ct)
 
+/-! ## AES-128
+
+discv5's two ciphers (devp2p `discv5-wire.md`, "Notation"): AES-128-CTR
+masks the packet header, and AES-128-GCM with a 12-byte nonce seals the
+message. -/
+
+@[extern "leanp2p_aes128_ctr"]
+private opaque aes128CtrRaw (key : @& ByteArray) (iv : @& ByteArray) (data : @& ByteArray) :
+    Option ByteArray
+
+@[extern "leanp2p_aes128gcm_seal"]
+private opaque aes128GcmSealRaw (key : @& ByteArray) (nonce : @& ByteArray) (ad : @& ByteArray)
+    (pt : @& ByteArray) : Option ByteArray
+
+@[extern "leanp2p_aes128gcm_open"]
+private opaque aes128GcmOpenRaw (key : @& ByteArray) (nonce : @& ByteArray) (ad : @& ByteArray)
+    (ct : @& ByteArray) : Option ByteArray
+
+/-- AES-128-CTR over `data`. It encrypts and decrypts alike. -/
+def aes128Ctr (key iv : Key16) (data : ByteArray) : Except CryptoError ByteArray :=
+  if data.size > aeadMaxLen then .error .invalidInput
+  else liftShim .fault (aes128CtrRaw key.bytes iv.bytes data)
+
+/-- AES-128-GCM seal: the ciphertext, then the 16-byte tag. -/
+def aes128GcmSeal (key : Key16) (nonce : Nonce12) (ad pt : ByteArray) :
+    Except CryptoError ByteArray :=
+  if pt.size > aeadMaxLen || ad.size > aeadMaxLen then .error .invalidInput
+  else liftShim .fault (aes128GcmSealRaw key.bytes nonce.bytes ad pt)
+
+/-- AES-128-GCM open. A message shorter than the tag, or a tag that
+does not verify, is `authFailed`. -/
+def aes128GcmOpen (key : Key16) (nonce : Nonce12) (ad ct : ByteArray) :
+    Except CryptoError ByteArray :=
+  if ct.size > aeadMaxLen || ad.size > aeadMaxLen then .error .invalidInput
+  else if ct.size < aeadTagLen then .error .authFailed
+  else liftShim .authFailed (aes128GcmOpenRaw key.bytes nonce.bytes ad ct)
+
 end Backend

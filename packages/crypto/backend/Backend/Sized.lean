@@ -37,6 +37,16 @@ structure Nonce12 where
   bytes : ByteArray
   sizeEq : bytes.size = 12
 
+/-- Exactly 16 bytes: an AES-128 key, or the AES-CTR IV of discv5's
+header masking. -/
+structure Key16 where
+  bytes : ByteArray
+  sizeEq : bytes.size = 16
+
+/-- The bytes as a `Key16`, or `none` when the size is not 16. -/
+def Key16.ofByteArray? (b : ByteArray) : Option Key16 :=
+  if h : b.size = 16 then some ⟨b, h⟩ else none
+
 /-- The bytes as a `Key32`, or `none` when the size is not 32. `none` has
 the one meaning "wrong size". -/
 def Key32.ofByteArray? (b : ByteArray) : Option Key32 :=

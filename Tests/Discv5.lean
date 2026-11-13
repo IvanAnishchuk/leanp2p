@@ -1,0 +1,146 @@
+import Tests.Support
+import Libp2p.Discv5
+
+/-!
+# discv5 suite: the wire test vectors
+
+Mirrors devp2p `discv5/discv5-wire-test-vectors.md` (devp2p at
+`2c19a28`, the clone at `../p2p/devp2p`): the four packet encodings,
+which node B unmasks, opens, and decodes, and the four crypto vectors
+(ECDH, key derivation, id signature, AES-GCM). The vectors are copied
+here by hand for the spike; a pinned vendor copy and `VECTORS.lock`
+entry come with the real unit.
+-/
+
+set_option autoImplicit false
+
+namespace Tests.Discv5
+
+open Libp2p.Discv5
+
+private def hex (s : String) : ByteArray := (Bytes.ofHex? s).getD .empty
+
+private def key32 (s : String) : Option Crypto.Key32 := Crypto.Key32.ofByteArray? (hex s)
+private def key16 (s : String) : Option Crypto.Key16 := Crypto.Key16.ofByteArray? (hex s)
+
+private def nodeBKey := "66fb62bfbd66b9177a138c1e5cddbe4f7c30c343e94e68df8769459cb1cde628"
+private def srcId := hex "aaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb"
+private def destId := hex "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9"
+
+private def pingPacket := hex ("00000000000000000000000000000000088b3d4342774649325f313964a39e55" ++
+  "ea96c005ad52be8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d3" ++
+  "4c4f53245d08dab84102ed931f66d1492acb308fa1c6715b9d139b81acbdcc")
+
+private def whoareyouPacket := hex ("00000000000000000000000000000000088b3d434277464933a1ccc59f5967ad" ++
+  "1d6035f15e528627dde75cd68292f9e6c27d6b66c8100a873fcbaed4e16b8d")
+
+private def handshakePacket := hex ("00000000000000000000000000000000088b3d4342774649305f313964a39e55" ++
+  "ea96c005ad521d8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d3" ++
+  "4c4f53245d08da4bb252012b2cba3f4f374a90a75cff91f142fa9be3e0a5f3ef" ++
+  "268ccb9065aeecfd67a999e7fdc137e062b2ec4a0eb92947f0d9a74bfbf44dfb" ++
+  "a776b21301f8b65efd5796706adff216ab862a9186875f9494150c4ae06fa4d1" ++
+  "f0396c93f215fa4ef524f1eadf5f0f4126b79336671cbcf7a885b1f8bd2a5d83" ++
+  "9cf8")
+
+private def challengeData (enrSeq : String) := hex
+  ("000000000000000000000000000000006469736376350001010102030405060708090a0b0c" ++
+   "00180102030405060708090a0b0c0d0e0f10" ++ enrSeq)
+
+/-- The decoded PING of a packet: `(type, request-id, enr-seq)`. -/
+private def pingOf (pt : ByteArray) : Option (UInt8 × List Nat × Nat) :=
+  match decodeMessage pt with
+  | .ok (t, [.bytes rid, .bytes seq]) => some (t, rid, Libp2p.Identity.Rlp.beNat seq)
+  | _ => none
+
+def run (r : Runner) : IO Unit := do
+  r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
+  -- ECDH.
+  match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
+  | none => r.check "discv5: the ECDH key builds" false
+  | some sk =>
+    r.check "discv5: ECDH gives the compressed shared point"
+      ((Crypto.secp256k1Ecdh sk
+          (hex "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231")).toOption ==
+        some (hex "033b11a2a1f214567e1537ce5e509ffd9b21373247f2a3ff6841f4976f53165e7e"))
+    -- Key derivation.
+    match deriveKeys sk (hex "0317931e6e0840220642f230037d285d122bc59063221ef3226b1f403ddc69ca91")
+        (challengeData "0000000000000000") srcId destId with
+    | .ok k =>
+      r.check "discv5: the key derivation gives both keys"
+        (k.initiator.bytes == hex "dccc82d81bd610f4f76d3ebe97a40571" &&
+          k.recipient.bytes == hex "ac74bb8773749920b0d3a8881c173ec5")
+    | .error e => r.check s!"discv5: the key derivation runs ({repr e})" false
+    -- The id signature, both ways.
+    let eph := hex "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231"
+    let sig := hex ("94852a1e2318c4e5e9d422c98eaf19d1d90d876b29cd06ca7cb7546d0fff7b48" ++
+      "4fe86c09a064fe72bdbef73ba8e9c34df0cd2b53e9d65528c2c7f336d5dfc6e6")
+    r.check "discv5: the id signature matches the vector"
+      ((idSign sk (challengeData "0000000000000000") eph destId).toOption == some sig)
+    match Crypto.secp256k1PublicKey sk with
+    | .ok pub =>
+      r.check "discv5: the id signature verifies"
+        (idVerify pub sig (challengeData "0000000000000000") eph destId)
+      r.check "discv5: the id signature fails for another node id"
+        !(idVerify pub sig (challengeData "0000000000000000") eph srcId)
+    | .error _ => r.check "discv5: the static public key builds" false
+  -- AES-GCM.
+  match key16 "9f2d77db7004bf8a1a85107ac686990b",
+      Crypto.Nonce12.ofByteArray? (hex "27b5af763c446acd2749fe8e") with
+  | some k, some n =>
+    r.check "discv5: AES-128-GCM seals the vector"
+      ((Crypto.aes128GcmSeal k n (hex "93a7400fa0d6a694ebc24d5cf570f65d04215b6ac00757875e3f3a5f42107903")
+          (hex "01c20101")).toOption ==
+        some (hex "a5d12a2d94b8ccb3ba55558229867dc13bfa3648"))
+  | _, _ => r.check "discv5: the AES-GCM inputs build" false
+  -- The ping message packet: unmask as node B, open with the zero key.
+  match unmask destId pingPacket, key16 "00000000000000000000000000000000" with
+  | .ok u, some k =>
+    r.check "discv5: the ping packet is a message packet from node A"
+      (u.header.flag == .message && u.header.authdata == srcId &&
+        u.header.nonce == hex "ffffffffffffffffffffffff")
+    match openMessage k u with
+    | .ok pt =>
+      r.check "discv5: the ping packet holds PING, request 1, enr-seq 2"
+        (pingOf pt == some (1, [0, 0, 0, 1], 2))
+      r.check "discv5: masking the same header and message rebuilds the packet"
+        ((mask destId u.iv u.header u.message).toOption == some pingPacket)
+      r.check "discv5: sealing the PING again rebuilds the message"
+        ((sealMessage k u.iv u.header pt).toOption == some u.message)
+    | .error e => r.check s!"discv5: the ping message opens ({repr e})" false
+  | _, _ => r.check "discv5: the ping packet unmasks" false
+  -- WHOAREYOU: the challenge data is `masking-iv ‖ header`.
+  match unmask destId whoareyouPacket with
+  | .ok u =>
+    r.check "discv5: WHOAREYOU carries id-nonce and enr-seq 0"
+      (u.header.flag == .whoareyou &&
+        u.header.authdata == hex "0102030405060708090a0b0c0d0e0f100000000000000000" &&
+        u.message.isEmpty)
+    r.check "discv5: WHOAREYOU's iv and header are the challenge data"
+      (u.iv ++ u.headerBytes == challengeData "0000000000000000")
+  | .error e => r.check s!"discv5: WHOAREYOU unmasks ({repr e})" false
+  -- The handshake packet: node B derives the keys from its own key and
+  -- the ephemeral key in the packet, and opens the PING.
+  match unmask destId handshakePacket, key32 nodeBKey with
+  | .ok u, some bKey =>
+    let ad := u.header.authdata
+    let sigSize := (ad.get! 32).toNat
+    let ephSize := (ad.get! 33).toNat
+    let ephPub := ad.extract (34 + sigSize) (34 + sigSize + ephSize)
+    r.check "discv5: the handshake names node A, a 64-byte signature, a 33-byte key"
+      (u.header.flag == .handshake && ad.extract 0 32 == srcId && sigSize == 64 && ephSize == 33 &&
+        ephPub == hex "039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5")
+    -- Node B's side of ECDH: its static key times the ephemeral public
+    -- key gives the same secret as A's ephemeral key times B's public key.
+    match deriveKeys bKey ephPub (challengeData "0000000000000001") srcId destId with
+    | .ok keys =>
+      r.check "discv5: node B derives the read key of the vector"
+        (keys.initiator.bytes == hex "4f9fac6de7567d1e3b1241dffe90f662")
+      match openMessage keys.initiator u with
+      | .ok pt =>
+        r.check "discv5: the handshake holds PING, request 1, enr-seq 1"
+          (pingOf pt == some (1, [0, 0, 0, 1], 1))
+      | .error e => r.check s!"discv5: the handshake message opens ({repr e})" false
+    | .error e => r.check s!"discv5: node B derives the keys ({repr e})" false
+  | _, _ => r.check "discv5: the handshake packet unmasks" false
+
+end Tests.Discv5

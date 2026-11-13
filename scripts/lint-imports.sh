@@ -84,6 +84,7 @@ leafrank() {
     crypto/facade)      lrank=3 ;;
     libp2p/identity)    lrank=1 ;;
     libp2p/core)        lrank=2 ;;
+    libp2p/discv5)      lrank=2 ;;
     libp2p/security)    lrank=3 ;;
     libp2p/mux)         lrank=3 ;;
     libp2p/negotiate)   lrank=4 ;;

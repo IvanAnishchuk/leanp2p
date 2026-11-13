@@ -198,6 +198,64 @@ LEAN_EXPORT lean_obj_res leanp2p_chacha_open(b_lean_obj_arg key, b_lean_obj_arg 
 }
 
 /* ------------------------------------------------------------------ */
+/* AES-128: CTR and GCM, for discv5 (devp2p discv5-wire.md, Notation)  */
+/* ------------------------------------------------------------------ */
+
+/* AES-128-CTR over `data` with a 16-byte key and IV. Encryption and
+   decryption are the same operation. The Lean side checks the sizes and
+   that `data` fits an `int`. */
+LEAN_EXPORT lean_obj_res leanp2p_aes128_ctr(b_lean_obj_arg key, b_lean_obj_arg iv,
+                                            b_lean_obj_arg data) {
+    size_t n = blen(data);
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    lean_object *out = alloc_bytes(n);
+    int len = 0;
+    int ok = c != NULL
+        && EVP_EncryptInit_ex(c, EVP_aes_128_ctr(), NULL, bptr(key), bptr(iv)) == 1
+        && (n == 0 || EVP_EncryptUpdate(c, lean_sarray_cptr(out), &len, bptr(data), (int)n) == 1)
+        && EVP_EncryptFinal_ex(c, lean_sarray_cptr(out) + len, &len) == 1;
+    EVP_CIPHER_CTX_free(c);
+    return some_or_free(ok, out);
+}
+
+/* AES-128-GCM seal with a 12-byte nonce: the ciphertext, then the
+   16-byte tag. Sizes are checked on the Lean side, as for ChaCha. */
+LEAN_EXPORT lean_obj_res leanp2p_aes128gcm_seal(b_lean_obj_arg key, b_lean_obj_arg nonce,
+                                                b_lean_obj_arg ad, b_lean_obj_arg pt) {
+    size_t n = blen(pt);
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    lean_object *out = alloc_bytes(n + TAG_LEN);
+    uint8_t *o = lean_sarray_cptr(out);
+    int len = 0;
+    int ok = c != NULL
+        && EVP_EncryptInit_ex(c, EVP_aes_128_gcm(), NULL, bptr(key), bptr(nonce)) == 1
+        && (blen(ad) == 0 || EVP_EncryptUpdate(c, NULL, &len, bptr(ad), (int)blen(ad)) == 1)
+        && (n == 0 || EVP_EncryptUpdate(c, o, &len, bptr(pt), (int)n) == 1)
+        && EVP_EncryptFinal_ex(c, o + n, &len) == 1
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, TAG_LEN, o + n) == 1;
+    EVP_CIPHER_CTX_free(c);
+    return some_or_free(ok, out);
+}
+
+/* AES-128-GCM open: `none` on a tag mismatch. */
+LEAN_EXPORT lean_obj_res leanp2p_aes128gcm_open(b_lean_obj_arg key, b_lean_obj_arg nonce,
+                                                b_lean_obj_arg ad, b_lean_obj_arg ct) {
+    size_t n = blen(ct) - TAG_LEN;
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    lean_object *out = alloc_bytes(n);
+    uint8_t *o = lean_sarray_cptr(out);
+    int len = 0;
+    int ok = c != NULL
+        && EVP_DecryptInit_ex(c, EVP_aes_128_gcm(), NULL, bptr(key), bptr(nonce)) == 1
+        && (blen(ad) == 0 || EVP_DecryptUpdate(c, NULL, &len, bptr(ad), (int)blen(ad)) == 1)
+        && (n == 0 || EVP_DecryptUpdate(c, o, &len, bptr(ct), (int)n) == 1)
+        && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, TAG_LEN, (void *)(bptr(ct) + n)) == 1
+        && EVP_DecryptFinal_ex(c, o + n, &len) == 1;
+    EVP_CIPHER_CTX_free(c);
+    return some_or_free(ok, out);
+}
+
+/* ------------------------------------------------------------------ */
 /* Raw-key curves: Ed25519 (RFC 8032) and X25519 (RFC 7748)            */
 /* ------------------------------------------------------------------ */
 
@@ -600,6 +658,33 @@ LEAN_EXPORT lean_obj_res leanp2p_secp256k1_public(b_lean_obj_arg scalar) {
     o[0] = 0x02 | (full[64] & 1);
     memcpy(o + 1, full + 1, 32);
     return some(out);
+}
+
+/* The discv5 `v4` ECDH (devp2p discv5-theory.md, "Identity-Specific
+   Cryptography in the Handshake"): `eph = point * scalar`, and the
+   secret is the 33-byte compressed point, `0x02 | parity(y)` then `x`.
+   EVP_PKEY_derive gives `x` alone, so the shim multiplies on the curve.
+   `none` for a scalar out of range or a point off the curve. */
+LEAN_EXPORT lean_obj_res leanp2p_secp256k1_ecdh(b_lean_obj_arg scalar, b_lean_obj_arg point) {
+    EC_GROUP *g = EC_GROUP_new_by_curve_name(NID_secp256k1);
+    EC_POINT *p = g ? EC_POINT_new(g) : NULL;
+    EC_POINT *r = g ? EC_POINT_new(g) : NULL;
+    BIGNUM *d = BN_bin2bn(bptr(scalar), 32, NULL);
+    BN_CTX *ctx = BN_CTX_new();
+    lean_object *out = alloc_bytes(33);
+    int ok = g != NULL && p != NULL && r != NULL && d != NULL && ctx != NULL
+        && !BN_is_zero(d) && BN_cmp(d, EC_GROUP_get0_order(g)) < 0
+        && EC_POINT_oct2point(g, p, bptr(point), blen(point), ctx) == 1
+        && EC_POINT_mul(g, r, NULL, p, d, ctx) == 1
+        && !EC_POINT_is_at_infinity(g, r)
+        && EC_POINT_point2oct(g, r, POINT_CONVERSION_COMPRESSED, lean_sarray_cptr(out), 33,
+                              ctx) == 33;
+    BN_clear_free(d);
+    BN_CTX_free(ctx);
+    EC_POINT_free(r);
+    EC_POINT_free(p);
+    EC_GROUP_free(g);
+    return some_or_free(ok, out);
 }
 
 /* 1 when `point` is a secp256k1 point that OpenSSL loads: on the curve,

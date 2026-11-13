@@ -260,6 +260,16 @@ private opaque secp256k1SignDigestRaw (scalar : @& ByteArray) (digest : @& ByteA
 private opaque secp256k1VerifyRaw (point : @& ByteArray) (msg : @& ByteArray)
     (sig : @& ByteArray) : Bool
 
+@[extern "leanp2p_secp256k1_ecdh"]
+private opaque secp256k1EcdhRaw (scalar : @& ByteArray) (point : @& ByteArray) : Option ByteArray
+
+/-- The discv5 `v4` ECDH secret: the 33-byte compressed point
+`point * scalar` (devp2p `discv5-theory.md`, "Identity-Specific
+Cryptography in the Handshake"). `invalidKey` for a scalar of zero or
+not below the order, or a point off the curve. -/
+def secp256k1Ecdh (scalar : Key32) (point : ByteArray) : Except CryptoError ByteArray :=
+  liftShim .invalidKey (secp256k1EcdhRaw scalar.bytes point)
+
 /-- `true` when `point` is a SEC1 point on secp256k1, compressed or
 uncompressed. `false` for a point off the curve and every malformed
 input, fail-closed. Trust: the toolchain's OpenSSL 3 loads and checks

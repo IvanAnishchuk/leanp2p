@@ -36,8 +36,8 @@ namespace Crypto
 
 /-! ## Types and errors -/
 
-export Backend (CryptoError CertificateRejection Key32 Digest32 Nonce12 Key32.ofByteArray?
-  Digest32.ofByteArray? Nonce12.ofByteArray? Certificate Certificate.validAt)
+export Backend (CryptoError CertificateRejection Key32 Digest32 Nonce12 Key16 Key32.ofByteArray?
+  Digest32.ofByteArray? Nonce12.ofByteArray? Key16.ofByteArray? Certificate Certificate.validAt)
 
 /-! ## Randomness and key generation: the backend -/
 
@@ -59,7 +59,8 @@ abbrev keccak256 : ByteArray → ByteArray := LeanHazmat.Keccak.keccak256
 
 /-! ## AEAD and key agreement: the backend -/
 
-export Backend (chachaSeal chachaOpen aeadTagLen aeadMaxLen x25519PublicKey x25519)
+export Backend (chachaSeal chachaOpen aeadTagLen aeadMaxLen x25519PublicKey x25519
+  aes128Ctr aes128GcmSeal aes128GcmOpen secp256k1Ecdh)
 
 /-! ## Signatures -/
 
