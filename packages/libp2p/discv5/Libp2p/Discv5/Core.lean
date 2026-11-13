@@ -21,8 +21,15 @@ external endpoint, one per voter. When `voteQuorum` voters name an
 endpoint the record does not hold, the core re-signs the record with
 that endpoint and the next `seq`.
 
-Spike scope: no request timeouts or retries (the shell's), no session
-eviction (the spec's LRU cache), no vote expiry, and no per-IP limits.
+A session belongs to one endpoint. A packet from another endpoint, or
+one that does not open, gets a WHOAREYOU; a challenge still pending for
+that endpoint goes out again unchanged. Only answers to requests we sent
+count: the core keeps each request by id until its answer ends or the
+shell posts `forget`, and keeps only the NODES records at the distances
+asked.
+
+Spike scope: no retries, no session eviction (the spec's LRU cache), no
+vote expiry, and no per-IP limits.
 -/
 
 set_option autoImplicit false
@@ -51,10 +58,23 @@ structure Sent where
   endpoint : Endpoint
   message : Message
 
-/-- A WHOAREYOU we sent, by the node id it challenged. -/
+/-- A WHOAREYOU we sent, by the node id it challenged. A second packet
+we cannot open from the same endpoint gets the same packet again, so the
+peer can still finish the first handshake (geth `v5test`,
+`HandshakeResend`). -/
 structure Challenge where
   challengeData : ByteArray
   endpoint : Endpoint
+  packet : ByteArray
+
+/-- A request awaiting its answer, by request id. Only an answer from
+the node we asked, for a request we sent, counts: an unsolicited NODES
+or PONG changes nothing (geth `v5test`, `UnsolicitedNodes`). -/
+structure Pending where
+  destId : ByteArray
+  message : Message
+  /-- The NODES packets received so far. -/
+  got : Nat := 0
 
 /-- The core state. -/
 structure State where
@@ -64,6 +84,7 @@ structure State where
   sessions : Std.HashMap Nat Session := {}
   sent : Std.HashMap (List UInt8) Sent := {}
   challenges : Std.HashMap Nat Challenge := {}
+  pending : Std.HashMap (List Nat) Pending := {}
   table : Table
   /-- The `recipient-ip`/`port` each PONG reported, newest first, one
   per voter by node id: the votes for our external endpoint
@@ -76,6 +97,9 @@ inductive Event where
   | packet (src : Endpoint) (bytes : ByteArray) (rand : ByteArray)
   /-- Send `m` to the node of `dest` at `endpoint`. -/
   | request (dest : Enr) (endpoint : Endpoint) (m : Message) (rand : ByteArray)
+  /-- The shell gave up on a request: drop its state. Time stays out of
+  the core, so the shell's deadline ends a request this way. -/
+  | forget (requestId : List Nat)
 
 /-- The random bytes an event needs: IV, nonce, id-nonce, ephemeral key,
 and a second IV and nonce for the handshake packet. -/
@@ -113,9 +137,14 @@ private def sendTo (s : State) (destId destPub : ByteArray) (ep : Endpoint) (m :
   let iv := slice rand 0 16
   let nonce := slice rand 16 12
   let remember (s : State) : State :=
-    if m.isRequest then { s with sent := s.sent.insert (nonceKey nonce) { destId, destPub, endpoint := ep, message := m } }
+    if m.isRequest then
+      { s with
+        sent := s.sent.insert (nonceKey nonce) { destId, destPub, endpoint := ep, message := m }
+        pending := s.pending.insert m.requestId { destId, message := m } }
     else s
-  match s.sessions.get? (idNat destId) with
+  -- A session belongs to one endpoint; a node at another endpoint gets a
+  -- new handshake.
+  match (s.sessions.get? (idNat destId)).filter (·.endpoint == ep) with
   | some ses =>
     match messagePacket s.localId destId ses.writeKey iv nonce m with
     | some p => (remember s, [.send ep p])
@@ -177,6 +206,23 @@ def refreshRecord (s : State) : State :=
       | .ok r => { s with localEnr := r }
       | .error _ => s
 
+/-- The NODES packets one answer may take: 16 records, three to a
+packet, as `nodesAnswers` sends them. -/
+def maxNodesPackets : Nat := 6
+
+/-- `rid` is a request we sent to `srcId` and still await. -/
+def solicited (s : State) (srcId : ByteArray) (rid : List Nat) : Bool :=
+  match s.pending.get? rid with
+  | some p => p.destId == srcId
+  | none => false
+
+/-- Drop the state of a request: its pending entry, and the sent packets
+that carried it. -/
+def finish (s : State) (rid : List Nat) : State :=
+  { s with
+    pending := s.pending.erase rid
+    sent := s.sent.filter fun _ v => v.message.requestId != rid }
+
 /-- Handle a decrypted message from `srcId` at `src`. -/
 private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Message)
     (rand : ByteArray) : State × List Action :=
@@ -193,26 +239,51 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
   | .ping rid _ => reply s [.pong rid s.localEnr.seq src.ip src.port]
   | .findNode rid ds => reply s (nodesAnswers s rid ds)
   | .talkReq rid _ _ => reply s [.talkResp rid []]
-  | .pong _ _ ip port =>
+  | .pong rid _ ip port =>
+    if !solicited s srcId rid then (s, []) else
+    let s := finish s rid
     let voter := idNat srcId
     let votes := ((voter, { ip, port }) :: s.votes.filter (·.1 != voter)).take maxVotes
     (refreshRecord { s with votes }, [.response srcId m])
-  | .nodes _ _ rs =>
-    let t := rs.foldl (fun t e => t.insert { id := e.nodeId, record := e }) s.table
-    ({ s with table := t }, [.response srcId m])
-  | .talkResp .. => (s, [.response srcId m])
+  | .nodes rid total rs =>
+    match s.pending.get? rid with
+    | none => (s, [])
+    | some p =>
+      if p.destId != srcId then (s, []) else
+      -- Keep only the records at the distances asked: a NODES answer
+      -- cannot plant records elsewhere in the table (discv5-wire.md,
+      -- "NODES Response").
+      let ds := match p.message with
+        | .findNode _ ds => ds
+        | _ => []
+      let rs := rs.filter fun e => ds.contains (logDistance e.nodeId srcId)
+      let t := rs.foldl (fun t e => t.insert { id := e.nodeId, record := e }) s.table
+      let got := p.got + 1
+      -- The last packet of the answer ends the request; `total` is
+      -- capped, so a peer cannot keep it open.
+      let s := if got ≥ min (max total 1) maxNodesPackets then finish s rid
+        else { s with pending := s.pending.insert rid { p with got } }
+      ({ s with table := t }, [.response srcId (.nodes rid total rs)])
+  | .talkResp rid _ =>
+    if !solicited s srcId rid then (s, []) else
+    (finish s rid, [.response srcId m])
 
 /-- Answer a message we cannot open with WHOAREYOU, and remember the
 challenge (discv5-theory.md, "Step 2"). -/
 private def challenge (s : State) (srcId : ByteArray) (src : Endpoint) (nonce rand : ByteArray) :
     State × List Action :=
+  -- A challenge still pending for this node and endpoint goes out again
+  -- unchanged, so the peer can finish the handshake it started.
+  match (s.challenges.get? (idNat srcId)).filter (·.endpoint == src) with
+  | some ch => (s, [.send src ch.packet])
+  | none =>
   let known := ((s.table.entries.find? (·.id == srcId)).map (·.record.seq)).getD 0
   let seqBytes := ByteArray.mk ((List.range 8).reverse.map fun i => (known / 256 ^ i % 256).toUInt8).toArray
   let h : Header := { flag := .whoareyou, nonce, authdata := slice rand 28 16 ++ seqBytes }
   let iv := slice rand 0 16
   match mask srcId iv h .empty with
   | .ok p =>
-    let ch : Challenge := { challengeData := iv ++ h.encode, endpoint := src }
+    let ch : Challenge := { challengeData := iv ++ h.encode, endpoint := src, packet := p }
     ({ s with challenges := s.challenges.insert (idNat srcId) ch }, [.send src p])
   | .error _ => (s, [])
 
@@ -256,6 +327,8 @@ private def onHandshake (s : State) (src : Endpoint) (u : Unmasked) (rand : Byte
   let recordBytes := ad.extract (34 + sigSize + ephSize) ad.size
   let result : Option (State × List Action) := do
     let ch ← s.challenges.get? (idNat srcId)
+    -- The handshake must come from the endpoint we challenged.
+    if ch.endpoint != src then none
     -- The record in the packet, or the one the table holds.
     let record ← if recordBytes.isEmpty then
         (s.table.entries.find? (·.id == srcId)).map (·.record)
@@ -285,19 +358,23 @@ def step (s : State) : Event → State × List Action
       match u.header.flag with
       | .message =>
         let srcId := u.header.authdata
+        -- The session must belong to the endpoint the packet came from;
+        -- a packet from another endpoint gets a challenge (geth `v5test`,
+        -- `PingMultiIP`).
         let opened := do
-          let ses ← s.sessions.get? (idNat srcId)
-          let pt ← (openMessage ses.readKey u).toOption
-          Message.decode? pt
+          let ses ← (s.sessions.get? (idNat srcId)).filter (·.endpoint == src)
+          (openMessage ses.readKey u).toOption
         match opened with
-        | some m =>
-          -- A response clears the request it answers; a NODES answer
-          -- may come in several packets, so the request stays until the
-          -- shell's timeout in the spike.
-          onMessage s srcId src m rand
         | none => challenge s srcId src u.header.nonce rand
+        | some pt =>
+          -- A message that opens but does not decode, such as a request
+          -- id over 8 bytes, is dropped with no answer.
+          match Message.decode? pt with
+          | some m => onMessage s srcId src m rand
+          | none => (s, [])
       | .whoareyou => onWhoareyou s u rand
       | .handshake => onHandshake s src u rand
+  | .forget rid => (finish s rid, [])
 
 end Core
 

@@ -48,6 +48,13 @@ structure Node where
   private waiters : OnceRef (List (List Nat × Chan Message))
   private nextId : OnceRef Nat
   private tasks : TaskSet
+  /-- Closed by `stop`: the revalidation task parks on it between rounds. -/
+  private stopping : Chan Unit
+  /-- The last liveness check of each table entry, by node id, in
+  milliseconds of the monotonic clock. -/
+  private checked : OnceRef (Std.HashMap Nat Nat)
+  /-- The pause between two liveness checks. -/
+  revalidateMs : Nat
   /-- The UDP port the node listens on. -/
   port : Nat
 
@@ -84,27 +91,10 @@ private partial def reader (n : Node) : Async Unit := do
     n.feed (Event.packet { ip, port } bytes)
     n.reader
 
-/-- Start a node with `key`, bound to `ip`:`port` (0 for the system's
-pick). Its record is signed after the bind, so `udp` names the real
-port; `extra` adds the client's pairs, such as `eth2` and `tcp`. -/
-def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pair := [])
-    (seq : Nat := 1) : Async Node := do
-  let socket ← (Streams.Udp.bind ip port : IO Streams.Udp.Socket)
-  let pairs : List Enr.Pair :=
-    [⟨.ip, .bytes ip⟩, ⟨.udp, .bytes (Rlp.ofScalar socket.port)⟩] ++
-      extra.filter fun p => p.key != .ip && p.key != .udp
-  let record ← match Enr.sign key seq pairs with
-    | .ok r => pure r
-    | .error e => throw (IO.userError s!"discv5: the record does not sign ({repr e})")
-  let n : Node := {
-    core := ← OnceRef.new (Core.init key record), socket
-    waiters := ← OnceRef.new [], nextId := ← OnceRef.new 1, tasks := ← TaskSet.new
-    port := socket.port }
-  n.tasks.spawn n.reader
-  return n
-
-/-- Stop: close the socket, which wakes the reader, and join it. -/
+/-- Stop: close the socket, which wakes the reader, and the stop
+channel, which wakes the revalidation task; then join both. -/
 def stop (n : Node) : Async Unit := do
+  (n.stopping.close : BaseIO Unit)
   Streams.Udp.close n.socket
   n.tasks.joinAll
 
@@ -146,6 +136,9 @@ private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat
     | some r => got := got ++ [r]
     | none => break
   (n.waiters.update (·.filter (·.1 != rid)) : BaseIO Unit)
+  -- The core keeps the request until its answer ends; past the deadline
+  -- the shell ends it here.
+  n.feed fun _ => .forget rid
   return got
 
 /-- PING a node; its PONG, if one came within `timeoutMs`. -/
@@ -194,6 +187,56 @@ def findPeers (n : Node) (pred : Enr → Bool) (count : Nat) : Async (List Enr) 
   let known ← (n.known : BaseIO (List Enr))
   let all := found ++ known.filter fun e => !found.any (·.nodeId == e.nodeId)
   return (all.filter pred).take count
+
+/-- One liveness check: PING the table entry checked longest ago. A node
+that does not answer leaves the table, and the newest replacement of its
+bucket takes its place (`Table.remove`). An entry never checked goes
+first, so a node that just contacted us is checked within a round. -/
+private def revalidateOnce (n : Node) : Async Unit := do
+  let s ← (n.core.get : BaseIO State)
+  let checked ← (n.checked.get : BaseIO (Std.HashMap Nat Nat))
+  let pick (best : Option (Entry × Nat)) (e : Entry) : Option (Entry × Nat) :=
+    let t := (checked.get? (idNat e.id)).getD 0
+    match best with
+    | some (_, bt) => if t < bt then some (e, t) else best
+    | none => some (e, t)
+  let some (e, _) := s.table.entries.foldl pick none | return
+  let now ← (IO.monoMsNow : IO Nat)
+  (n.checked.update (·.insert (idNat e.id) now) : BaseIO Unit)
+  if (← n.ping e.record 1000).isNone then
+    (n.core.update fun s => { s with table := s.table.remove e.id } : BaseIO Unit)
+    (n.checked.update (·.erase (idNat e.id)) : BaseIO Unit)
+
+/-- The revalidation task (discv5-theory.md, "Table Maintenance"): one
+check every `revalidateMs`. Park: the timer wakes it, and so does `stop`,
+which closes `stopping`. `partial`, as the IO loops are. -/
+private partial def revalidator (n : Node) : Async Unit := do
+  let timer ← (Park.sleep n.revalidateMs false : BaseIO (Park Bool))
+  if ← select #[Park.recv n.stopping (fun _ => true), timer] then return
+  n.revalidateOnce
+  n.revalidator
+
+/-- Start a node with `key`, bound to `ip`:`port` (0 for the system's
+pick). Its record is signed after the bind, so `udp` names the real
+port; `extra` adds the client's pairs, such as `eth2` and `tcp`.
+`revalidateMs` paces the liveness checks of the table. -/
+def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pair := [])
+    (seq : Nat := 1) (revalidateMs : Nat := 1000) : Async Node := do
+  let socket ← (Streams.Udp.bind ip port : IO Streams.Udp.Socket)
+  let pairs : List Enr.Pair :=
+    [⟨.ip, .bytes ip⟩, ⟨.udp, .bytes (Rlp.ofScalar socket.port)⟩] ++
+      extra.filter fun p => p.key != .ip && p.key != .udp
+  let record ← match Enr.sign key seq pairs with
+    | .ok r => pure r
+    | .error e => throw (IO.userError s!"discv5: the record does not sign ({repr e})")
+  let n : Node := {
+    core := ← OnceRef.new (Core.init key record), socket
+    waiters := ← OnceRef.new [], nextId := ← OnceRef.new 1, tasks := ← TaskSet.new
+    stopping := ← Chan.new 1, checked := ← OnceRef.new {}, revalidateMs
+    port := socket.port }
+  n.tasks.spawn n.reader
+  n.tasks.spawn n.revalidator
+  return n
 
 end Node
 

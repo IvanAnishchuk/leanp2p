@@ -138,6 +138,165 @@ private def memoryChecks (r : Runner) : IO Unit := do
     r.check "discv5 votes: a record that holds the endpoint stays" (again.localEnr.seq == 2)
   | _, _ => r.check "discv5 memory: the records sign" false
 
+/-! ## geth's conformance scenarios
+
+The behaviours geth's discv5 test suite checks against a node
+(`cmd/devp2p/internal/v5test/discv5tests.go`, go-ethereum `0d06140`),
+played here with our own core as the tester. -/
+
+/-- The datagrams an action list sends. -/
+private def sendsOf (acts : List Action) : List (Endpoint × ByteArray) :=
+  acts.filterMap fun a => match a with
+    | .send d b => some (d, b)
+    | _ => none
+
+/-- The packet kind of a datagram sent to the node `localId`. -/
+private def flagFor (localId : ByteArray) (b : ByteArray) : Option Flag :=
+  (unmask localId b).toOption.map (·.header.flag)
+
+/-- The header nonce of a datagram sent to the node `localId`. -/
+private def nonceFor (localId : ByteArray) (b : ByteArray) : Option (List UInt8) :=
+  (unmask localId b).toOption.map (·.header.nonce.toList)
+
+/-- The one datagram of an action list. -/
+private def onlySend (acts : List Action) : Option ByteArray :=
+  match sendsOf acts with
+  | [(_, b)] => some b
+  | _ => none
+
+private def gethChecks (r : Runner) : IO Unit := do
+  let some ka := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "geth: key A" false
+  let some kb := key32 nodeBKey | r.check "geth: key B" false
+  let some kc := key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
+    | r.check "geth: key C" false
+  let epA : Endpoint := { ip := [127, 0, 0, 1], port := 9001 }
+  let epA2 : Endpoint := { ip := [127, 0, 0, 3], port := 9001 }
+  let epB : Endpoint := { ip := [127, 0, 0, 1], port := 9002 }
+  let epC : Endpoint := { ip := [127, 0, 0, 1], port := 9003 }
+  let pairs (ep : Endpoint) : List Libp2p.Identity.Enr.Pair :=
+    [⟨.ip, .bytes ep.ip⟩, ⟨.udp, .bytes (Libp2p.Identity.Rlp.ofScalar ep.port)⟩]
+  let sign (k : Crypto.Key32) (ep : Endpoint) := Libp2p.Identity.Enr.sign k 1 (pairs ep)
+  match sign ka epA, sign kb epB, sign kc epC with
+  | .ok ea, .ok eb, .ok ec =>
+    let a0 := Core.init ka ea
+    let b0 := Core.init kb eb
+    -- A session between A at epA and B.
+    let (a1, out) := Core.step a0 (.request eb epB (.ping [1] 1) (randFor 0))
+    let (a2, b2, _) := settle a1 b0 epA epB (out.map (true, ·)) 20 0
+
+    -- PingMultiIP: the session's packet from another IP draws WHOAREYOU.
+    let (a3, out) := Core.step a2 (.request eb epB (.ping [2] 1) (randFor 300))
+    match onlySend out with
+    | some p =>
+      let (_, bOut) := Core.step b2 (.packet epA2 p (randFor 301))
+      r.check "geth PingMultiIP: a session packet from another IP draws WHOAREYOU, not PONG"
+        (match sendsOf bOut with
+         | [(d, q)] => d == epA2 && flagFor ea.nodeId q == some .whoareyou
+         | _ => false)
+      let (_, bOut') := Core.step b2 (.packet epA p (randFor 302))
+      r.check "geth PingMultiIP: the same packet from the session's IP opens"
+        (match sendsOf bOut' with
+         | [(_, q)] => flagFor ea.nodeId q == some .message
+         | _ => false)
+    | none => r.check "geth PingMultiIP: A sends one packet" false
+
+    -- FindnodeWrongIP: FINDNODE from another IP gets a challenge.
+    let (_, out) := Core.step a3 (.request eb epB (.findNode [3] [0]) (randFor 310))
+    match onlySend out with
+    | some p =>
+      let (_, bOut) := Core.step b2 (.packet epA2 p (randFor 311))
+      r.check "geth FindnodeWrongIP: FINDNODE from another IP draws WHOAREYOU, not NODES"
+        (match sendsOf bOut with
+         | [(_, q)] => flagFor ea.nodeId q == some .whoareyou
+         | _ => false)
+    | none => r.check "geth FindnodeWrongIP: A sends one packet" false
+
+    -- HandshakeResend: a second packet before the handshake gets the
+    -- first WHOAREYOU again, byte for byte.
+    let (a4, out1) := Core.step a0 (.request eb epB (.ping [4] 1) (randFor 320))
+    let (_, out2) := Core.step a4 (.request eb epB (.ping [5] 1) (randFor 321))
+    match onlySend out1, onlySend out2 with
+    | some p1, some p2 =>
+      let (b5, w1) := Core.step b0 (.packet epA p1 (randFor 322))
+      let (_, w2) := Core.step b5 (.packet epA p2 (randFor 323))
+      r.check "geth HandshakeResend: the second packet gets the first challenge again"
+        (match onlySend w1, onlySend w2 with
+         | some x, some y => x.toList == y.toList && flagFor ea.nodeId x == some .whoareyou
+         | _, _ => false)
+    | _, _ => r.check "geth HandshakeResend: A sends two packets" false
+
+    -- FindnodeHandshake: a FINDNODE as the first packet draws WHOAREYOU
+    -- with that packet's nonce, and NODES after the handshake.
+    let (a6, out) := Core.step a0 (.request eb epB (.findNode [6] [0]) (randFor 330))
+    match onlySend out with
+    | some p =>
+      let (_, w) := Core.step b0 (.packet epA p (randFor 331))
+      r.check "geth FindnodeHandshake: the WHOAREYOU carries the FINDNODE's nonce"
+        (match onlySend w with
+         | some q => (nonceFor eb.nodeId p).isSome && nonceFor ea.nodeId q == nonceFor eb.nodeId p
+         | none => false)
+      let (_, _, got) := settle a6 b0 epA epB (out.map (true, ·)) 20 330
+      r.check "geth FindnodeHandshake: NODES with the request id follows the handshake"
+        (got.any fun (toA, m) => toA && match m with
+          | .nodes [6] _ _ => true
+          | _ => false)
+    | none => r.check "geth FindnodeHandshake: A sends one packet" false
+
+    -- PingLargeRequestID: a 9-byte request id draws no answer.
+    let (_, out) := Core.step a2 (.request eb epB (.ping [1, 2, 3, 4, 5, 6, 7, 8, 9] 1) (randFor 340))
+    match onlySend out with
+    | some p =>
+      let (_, bOut) := Core.step b2 (.packet epA p (randFor 341))
+      r.check "geth PingLargeRequestID: a 9-byte request id draws no answer" bOut.isEmpty
+    | none => r.check "geth PingLargeRequestID: A sends one packet" false
+
+    -- TalkRequest: an empty TALKRESP, also for an empty request id.
+    let (a7, out) := Core.step a2 (.request eb epB (.talkReq [] [0x74] []) (randFor 350))
+    let (_, _, got) := settle a7 b2 epA epB (out.map (true, ·)) 20 350
+    r.check "geth TalkRequest: an empty request id gets an empty TALKRESP"
+      (got.any fun (toA, m) => toA && match m with
+        | .talkResp [] [] => true
+        | _ => false)
+
+    -- UnsolicitedNodes: a NODES nobody asked for plants nothing and draws
+    -- no contact.
+    let (_, out) := Core.step a2 (.request eb epB (.nodes [7] 1 [ec]) (randFor 360))
+    match onlySend out with
+    | some p =>
+      let (b8, bOut) := Core.step b2 (.packet epA p (randFor 361))
+      r.check "geth UnsolicitedNodes: an unasked NODES draws nothing"
+        (bOut.isEmpty)
+      r.check "geth UnsolicitedNodes: the injected record stays out of the table"
+        (!(b8.table.entries.any (·.id == ec.nodeId)))
+    | none => r.check "geth UnsolicitedNodes: A sends one packet" false
+
+    -- An unasked PONG casts no endpoint vote.
+    let (_, out) := Core.step b2 (.request ea epA (.pong [8] 1 [9, 9, 9, 9] 1) (randFor 370))
+    match onlySend out with
+    | some p =>
+      let (a9, _) := Core.step a2 (.packet epB p (randFor 371))
+      r.check "an unasked PONG casts no endpoint vote"
+        (a9.votes.length == a2.votes.length)
+    | none => r.check "an unasked PONG: B sends one packet" false
+
+    -- NODES keep only the records at the distances asked. A asks B for
+    -- distance 1, and B answers with C, which sits at another distance.
+    let dC := logDistance ec.nodeId eb.nodeId
+    let wrong := if dC = 1 then 2 else 1
+    let (a10, _) := Core.step a2 (.request eb epB (.findNode [9] [wrong]) (randFor 380))
+    let (_, out) := Core.step b2 (.request ea epA (.nodes [9] 1 [ec]) (randFor 381))
+    match onlySend out with
+    | some p =>
+      let (a11, aOut) := Core.step a10 (.packet epB p (randFor 382))
+      r.check "NODES drop a record at a distance not asked"
+        (!(a11.table.entries.any (·.id == ec.nodeId)) &&
+          aOut.any fun act => match act with
+            | .response _ (.nodes [9] _ []) => true
+            | _ => false)
+    | none => r.check "NODES at a wrong distance: B sends one packet" false
+  | _, _, _ => r.check "geth: the records sign" false
+
 /-! ## Three nodes over UDP on the loopback -/
 
 /-- The `eth2` key: a pair a consensus client adds to its record. -/
@@ -214,11 +373,46 @@ private def socketChecks (r : Runner) : IO Unit := Conc.Async.run do
   r.check "udp: close wakes a receive on a socket bound to 0.0.0.0"
     (← closeWakes [0, 0, 0, 0])
 
+/-! ## Liveness over UDP -/
+
+/-- A node that checks its table every 100 ms keeps a live peer and
+drops a stopped one (discv5-theory.md, "Table Maintenance"). -/
+private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
+  let some kx := key32 "eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f"
+    | r.check "liveness: key X" false
+  let some ky := key32 nodeBKey | r.check "liveness: key Y" false
+  let some kz := key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
+    | r.check "liveness: key Z" false
+  let lo := [127, 0, 0, 1]
+  let x ← Node.start kx lo 0 (revalidateMs := 100)
+  let y ← Node.start ky lo 0
+  let z ← Node.start kz lo 0
+  let ey ← (y.localEnr : BaseIO _)
+  let ez ← (z.localEnr : BaseIO _)
+  z.stop
+  (x.addEnr ey : BaseIO Unit)
+  (x.addEnr ez : BaseIO Unit)
+  -- Z's check times out after one second; give it three.
+  let mut dropped := false
+  for _ in [0:60] do
+    Conc.select #[← (Conc.Park.sleep 50 () : BaseIO (Conc.Park Unit))]
+    let known ← (x.known : BaseIO (List Libp2p.Identity.Enr))
+    if !known.any (·.nodeId == ez.nodeId) then
+      dropped := true
+      break
+  r.check "liveness: a node that does not answer leaves the table" dropped
+  r.check "liveness: a node that answers stays"
+    ((← (x.known : BaseIO (List Libp2p.Identity.Enr))).any (·.nodeId == ey.nodeId))
+  x.stop
+  y.stop
+
 def run (r : Runner) : IO Unit := do
   r.section "discv5" "devp2p discv5/discv5-wire-test-vectors.md"
   memoryChecks r
+  gethChecks r
   udpChecks r
   socketChecks r
+  livenessChecks r
   -- ECDH.
   match key32 "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736" with
   | none => r.check "discv5: the ECDH key builds" false
