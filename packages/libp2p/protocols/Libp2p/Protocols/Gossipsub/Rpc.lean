@@ -633,7 +633,10 @@ theorem decodeEncode (p : ControlPrune) (h : Valid p) :
 
 end ControlPrune
 
-/-- The control envelope. Field 5 (`idontwant`, v1.2) is out of scope. -/
+/-- The control envelope. Field 5 is gossipsub v1.2's `idontwant`
+(`gossipsub-v1.2.md`, "Protobuf Extension"): `ControlIDontWant` is
+`repeated bytes messageIDs = 1`, the wire shape of `ControlIWant`, so the
+field reuses that type. -/
 structure ControlMessage where
   /-- The IHAVE messages. -/
   ihave : List ControlIHave  -- field 1, repeated nested
@@ -643,6 +646,8 @@ structure ControlMessage where
   graft : List ControlGraft  -- field 3, repeated nested
   /-- The PRUNE messages. -/
   prune : List ControlPrune  -- field 4, repeated nested
+  /-- The IDONTWANT messages (v1.2). -/
+  idontwant : List ControlIWant := []  -- field 5, repeated nested
   deriving DecidableEq, BEq, Repr
 
 namespace ControlMessage
@@ -652,6 +657,7 @@ def entries (c : ControlMessage) : List Pb.Entry :=
   ++ c.iwant.map (fun x => (2, Pb.Value.bytes (Pb.encodeMessage x)))
   ++ c.graft.map (fun x => (3, Pb.Value.bytes (Pb.encodeMessage x)))
   ++ c.prune.map (fun x => (4, Pb.Value.bytes (Pb.encodeMessage x)))
+  ++ c.idontwant.map (fun x => (5, Pb.Value.bytes (Pb.encodeMessage x)))
 
 def entriesValid (c : ControlMessage) : Prop := ∀ e ∈ c.entries, e.Valid
 
@@ -665,18 +671,20 @@ abbrev Valid (c : ControlMessage) : Prop :=
   (∀ x ∈ c.ihave, x.Valid) ∧
   (∀ x ∈ c.iwant, x.Valid) ∧
   (∀ x ∈ c.graft, x.Valid) ∧
-  (∀ x ∈ c.prune, x.Valid)
+  (∀ x ∈ c.prune, x.Valid) ∧
+  (∀ x ∈ c.idontwant, x.Valid)
 
 def toFields (c : ControlMessage) : Pb.Fields :=
   fieldsOf? c.entries
 
-/-- The field table. Each of the four lists decodes as nested messages. -/
+/-- The field table. Each of the five lists decodes as nested messages. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error ControlMessage := do
   let ihave ← subAll? (α := ControlIHave) 1 fs
   let iwant ← subAll? (α := ControlIWant) 2 fs
   let graft ← subAll? (α := ControlGraft) 3 fs
   let prune ← subAll? (α := ControlPrune) 4 fs
-  .ok { ihave, iwant, graft, prune }
+  let idontwant ← subAll? (α := ControlIWant) 5 fs
+  .ok { ihave, iwant, graft, prune, idontwant }
 
 instance : Pb.ProtoMessage ControlMessage where
   toFields := toFields
@@ -686,15 +694,16 @@ instance : Pb.ProtoMessage ControlMessage where
 theorem ofFieldsToFields (c : ControlMessage) (h : Valid c) :
     Pb.ProtoMessage.ofFields? (α := ControlMessage) (Pb.ProtoMessage.toFields c) = .ok c := by
   change ofFields? (toFields c) = .ok c
-  obtain ⟨he, hi, hw, hg, hr⟩ := h
+  obtain ⟨he, hi, hw, hg, hr, hd⟩ := h
   have he' : ∀ e ∈ c.entries, e.Valid := he
   rw [toFields, fieldsOf?, dite_eq_left he']
-  obtain ⟨ih, iw, gr, pr⟩ := c
+  obtain ⟨ih, iw, gr, pr, dw⟩ := c
   have h1 := decodeAll?Encode ih (fun x hx => ControlIHave.decodeEncode x (hi x hx))
   have h2 := decodeAll?Encode iw (fun x hx => ControlIWant.decodeEncode x (hw x hx))
   have h3 := decodeAll?Encode gr (fun x hx => ControlGraft.decodeEncode x (hg x hx))
   have h4 := decodeAll?Encode pr (fun x hx => ControlPrune.decodeEncode x (hr x hx))
-  simp [ofFields?, subAll?, h1, h2, h3, h4, entries, allBytesOfAppend,
+  have h5 := decodeAll?Encode dw (fun x hx => ControlIWant.decodeEncode x (hd x hx))
+  simp [ofFields?, subAll?, h1, h2, h3, h4, h5, entries, allBytesOfAppend,
     allBytesOfMapBytes, Bind.bind, Except.bind]
 
 /-- An encode decodes back to the value. -/

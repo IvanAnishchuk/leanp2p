@@ -270,13 +270,14 @@ def run (r : Runner) : IO Unit := do
   r.check "RPC subscriptions entry with varint wire type skipped, decode succeeds"
     (decodesAs (α := RPC) [8, 1] { subscriptions := [], publish := [], control := none })
 
-  -- Field 5 of ControlMessage (`idontwant` in v1.2) is out of scope. Bytes
-  -- tag is 42, length 1, payload 1. The value drops the field, and the
-  -- re-encode omits it.
-  r.check "ControlMessage idontwant field 5 ignored and dropped on re-encode"
-    (decodesAs (α := ControlMessage) [42, 1, 1]
-        { ihave := [], iwant := [], graft := [], prune := [] } &&
-      Pb.encodeMessage ({ ihave := [], iwant := [], graft := [], prune := [] } : ControlMessage) == [])
+  -- Field 5 of ControlMessage is v1.2's `idontwant` (spike P13). Tag 42,
+  -- length 3, then one `ControlIDontWant` with the id [7]: field 1, tag
+  -- 10, length 1, byte 7. It decodes and re-encodes to the same bytes.
+  let dw : ControlMessage :=
+    { ihave := [], iwant := [], graft := [], prune := [], idontwant := [{ messageIds := [⟨[7]⟩] }] }
+  r.check "ControlMessage idontwant field 5 decodes and re-encodes"
+    (decodesAs (α := ControlMessage) [42, 3, 10, 1, 7] dw &&
+      Pb.encodeMessage dw == [42, 3, 10, 1, 7])
 
   -- Field 99 bytes: tag 794 is [154, 6], length 1, payload 2. The value
   -- drops the field, and the re-encode omits it.

@@ -443,6 +443,26 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', acts) => (validations acts).length = 1 && s'.pending.length = 1
      | _ => false)
 
+  -- IDONTWANT (gossipsub v1.2). A held message at the threshold sends
+  -- IDONTWANT to the mesh peers other than the source.
+  let dParams : Params := { vParams with idontwantThreshold := some 1 }
+  let isDontWant (r : Rpc.RPC) : Bool :=
+    match r.control with
+    | some c => !c.idontwant.isEmpty
+    | none => false
+  r.check "core.idontwant.sent-to-mesh"
+    (match step dParams meshed inbound with
+     | .ok (_, acts) => sends acts isDontWant = 2 && sendsTo pa acts = 0
+     | _ => false)
+  -- `pb` says IDONTWANT for the id before the answer, so the forward on
+  -- Accept skips `pb` and still reaches `pc`.
+  let dontWantFromPb : Event := .rpc pb (Pb.encodeMessage (idontwantRpc [⟨[1]⟩]))
+  r.check "core.idontwant.forward-skips-peer"
+    (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
+        [inbound, dontWantFromPb, .validated ⟨[1]⟩ pa .accept] with
+     | .ok (s', acts) => sendsTo pb acts = 0 && sendsTo pc acts = 1 && s'.dontSend.isEmpty
+     | _ => false)
+
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
   -- invalid, so it is dropped and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }

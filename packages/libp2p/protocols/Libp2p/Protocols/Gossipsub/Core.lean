@@ -148,6 +148,14 @@ structure Params where
   exceed the following limits"). The uncompressed bound needs the
   snappy header, which the client's decoder reads. -/
   maxDataSize : Option Nat := none
+  /-- Send IDONTWANT (gossipsub v1.2) for a held message whose `data` has
+  at least this many bytes; `none` sends none. The spec leaves the
+  policy open ("choose a message size threshold"); Lighthouse sets
+  `idontwant_message_size_threshold`. Only `validateMessages` sends. -/
+  idontwantThreshold : Option Nat := none
+  /-- The most IDONTWANT pairs the router keeps; the oldest go first. The
+  spec leaves the prune strategy to the implementation. -/
+  dontSendCap : Nat := 4096
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -188,6 +196,9 @@ structure State where
   /-- The messages that wait for the application's answer, with their
   ids and the peers that sent them (`Params.validateMessages`). -/
   pending : List (MessageId × Peer × Message) := []
+  /-- The IDONTWANT pairs (gossipsub v1.2): a forward of the id skips
+  the peer. Newest first. -/
+  dontSend : List (Peer × MessageId) := []
 
 /-- The application's answer on one held message
 (`gossipsub-v1.1.md`, "Extended Validators"). -/
@@ -655,6 +666,35 @@ def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
   (s3, r.accepted.map (fun m => Action.deliver m) ++
     forwardPubs s sender r.accepted)
 
+/-- An IDONTWANT of the ids. -/
+def idontwantRpc (ids : List MessageId) : Rpc.RPC :=
+  controlRpc { ihave := [], iwant := [], graft := [], prune := [],
+               idontwant := [{ messageIds := ids }] }
+
+/-- Drop each forward of a message to a peer that sent IDONTWANT for its
+id. Other actions pass. -/
+def dropDontWant (p : Params) (s : State) (acts : List Action) : List Action :=
+  acts.filter fun a => match a with
+    | .sendRpc q r => !(r.publish.any fun m => memB (q, p.msgId m) s.dontSend)
+    | _ => true
+
+theorem mem_dropDontWant {p : Params} {s : State} {acts : List Action} {a : Action}
+    (h : a ∈ dropDontWant p s acts) : a ∈ acts :=
+  (List.mem_filter.1 h).1
+
+/-- Drop the IDONTWANT pairs of one id. -/
+def forgetDontWant (s : State) (id : MessageId) : State :=
+  { s with dontSend := s.dontSend.filter fun e => decide (e.2 ≠ id) }
+
+/-- Record the IDONTWANT ids of a control message from `sender`, up to
+`dontSendCap` pairs. -/
+def noteDontWant (p : Params) (s : State) (sender : Peer) : Option Rpc.ControlMessage → State
+  | none => s
+  | some c =>
+    let ids := c.idontwant.flatMap (·.messageIds)
+    if ids.isEmpty then s
+    else { s with dontSend := (ids.map (sender, ·) ++ s.dontSend).take p.dontSendCap }
+
 /-- `handlePubs` under `Params.validateMessages`: accept as before, but
 hold each accepted message for the application's answer. The seen
 cache records the id at once, so a duplicate during the wait is
@@ -672,7 +712,16 @@ def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
       pending := s.pending ++ r.accepted.map (fun m => (p.msgId m, sender, m)) }
   let s2 := invalid.foldl (fun st m =>
     updateScoreOf st sender (fun sc => Score.invalidDelivery p.score sc m.topic)) s1
-  (s2, r.accepted.map (fun m => Action.validate m (p.msgId m) sender))
+  -- "When the peer receives the first message instance it immediately
+  -- broadcasts ... IDONTWANT with the messageId to all its mesh peers.
+  -- This could be performed prior to the message validation"
+  -- (`gossipsub-v1.2.md`, "Basic scenario").
+  let large := r.accepted.filter fun m => match p.idontwantThreshold with
+    | some t => decide (t ≤ (m.data.getD []).length)
+    | none => false
+  let dontWants := large.flatMap fun m =>
+    (inboundTargets s sender m.topic).map fun q => Action.sendRpc q (idontwantRpc [p.msgId m])
+  (s2, r.accepted.map (fun m => Action.validate m (p.msgId m) sender) ++ dontWants)
 
 /-- The application's answer on a held message. An unknown id is a
 no-op: the answer came twice, or for a message never held. Accept
@@ -693,7 +742,9 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
       let s3 := updateScoreOf s2 src (fun sc =>
         let sc' := Score.firstDelivery p.score sc m.topic
         if memB src (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')
-      (s3, forwardPubs s src [m])
+      -- The forward skips the IDONTWANT peers; the seen cache stops a
+      -- second forward, so the pairs of this id go.
+      (forgetDontWant s3 id, dropDontWant p s (forwardPubs s src [m]))
     | .reject =>
       (updateScoreOf s1 src (fun sc => Score.invalidDelivery p.score sc m.topic), [])
     | .ignore => (s1, [])
@@ -821,7 +872,7 @@ def handleRpc (p : Params) (s : State) (sender : Peer) (rpc : Rpc.RPC) :
   let (s2, a2) := if p.validateMessages then holdPubs p s1 sender rpc.publish
     else handlePubs p s1 sender rpc.publish
   let (s3, a3) := handleControl p s2 sender rpc.control
-  (s3, a2 ++ a3)
+  (noteDontWant p s3 sender rpc.control, a2 ++ a3)
 
 /-- The RPC branch gates: a graylisted peer is ignored, an unknown peer
 is ignored, and a decode failure is the one error. -/
@@ -1946,9 +1997,8 @@ private theorem heartbeatActions_not_deliver (p : Params) (s : State) (now : Mil
 private theorem holdPubs_not_deliver (p : Params) (s : State) (sender : Peer)
     (ms : List Message) (m : Message) : Action.deliver m ∉ (holdPubs p s sender ms).2 := by
   intro h
-  simp only [holdPubs, List.mem_map] at h
-  obtain ⟨_, -, hq⟩ := h
-  cases hq
+  simp only [holdPubs, List.mem_append, List.mem_map, List.mem_flatMap] at h
+  rcases h with ⟨_, -, hq⟩ | ⟨_, -, _, -, hq⟩ <;> cases hq
 
 private theorem handleValidated_not_deliver (p : Params) (s : State) (id : MessageId)
     (source : Peer) (outcome : Validation) (m : Message) :
@@ -1958,7 +2008,7 @@ private theorem handleValidated_not_deliver (p : Params) (s : State) (id : Messa
   split at h
   · simp at h
   · cases outcome with
-    | accept => exact forwardPubs_not_deliver s _ _ m h
+    | accept => exact forwardPubs_not_deliver s _ _ m (mem_dropDontWant h)
     | reject => simp at h
     | ignore => simp at h
 
