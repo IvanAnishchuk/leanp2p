@@ -436,6 +436,17 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', acts) => publishCount acts = 0 && invalidCount s' pa ta = 0 &&
          s'.pending.isEmpty && (Cache.MessageCache.get s'.mcache ⟨[1]⟩).isNone
      | _ => false)
+  -- A held message expires after the cache history: `historyLength`
+  -- heartbeats. The test window is `defaults`' 5 heartbeats of 1000 ms.
+  match step vParams meshed inbound with
+  | .ok (s', _) =>
+    let ttl := vParams.window.historyLength * vParams.heartbeatInterval
+    r.check "core.validate.held-until-expiry"
+      ((expirePending vParams s' (ttl - 1)).pending.length = 1)
+    r.check "core.validate.expires"
+      ((expirePending vParams s' ttl).pending.isEmpty &&
+        (expirePending vParams s' ttl).pendingAt.isEmpty)
+  | .error _ => r.check "core.validate.expiry-setup" false
   -- A duplicate during the wait is dropped by the seen cache.
   r.check "core.validate.duplicate-dropped"
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed

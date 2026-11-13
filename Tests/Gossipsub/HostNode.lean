@@ -63,6 +63,12 @@ def run (r : Runner) : IO Unit := Async.run do
       (← waitPeers p.clock server (·.contains clientPeer) 5)
     r.check "hosts: the client learns the server through its stream"
       (← waitPeers p.clock client (·.contains p.serverPeer) 8)
+    -- The metrics snapshot (spike P12) sees the one peer and no topic.
+    match ← server.stats with
+    | some s =>
+      r.check "hosts: stats count one peer, no topic, no drop"
+        (s.peers == 1 && s.topics == 0 && s.pending == 0 && s.dropped == 0)
+    | none => r.check "hosts: stats answer" false
     r.check "hosts: a meshsub peer stays across heartbeats"
       ((← waitPeers p.clock server (!·.contains clientPeer) 5) == false)
     discard (p.client.closePeer p.serverPeer : BaseIO Bool)

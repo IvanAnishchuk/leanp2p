@@ -196,6 +196,8 @@ structure State where
   /-- The messages that wait for the application's answer, with their
   ids and the peers that sent them (`Params.validateMessages`). -/
   pending : List (MessageId × Peer × Message) := []
+  /-- The receipt time of each held message (`expirePending`). -/
+  pendingAt : List (MessageId × Millis) := []
   /-- The IDONTWANT pairs (gossipsub v1.2): a forward of the id skips
   the peer. Newest first. -/
   dontSend : List (Peer × MessageId) := []
@@ -709,7 +711,8 @@ def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
   let s1 : State :=
     { s with
       seen := r.cache,
-      pending := s.pending ++ r.accepted.map (fun m => (p.msgId m, sender, m)) }
+      pending := s.pending ++ r.accepted.map (fun m => (p.msgId m, sender, m))
+      pendingAt := s.pendingAt ++ r.accepted.map (fun m => (p.msgId m, s.now)) }
   let s2 := invalid.foldl (fun st m =>
     updateScoreOf st sender (fun sc => Score.invalidDelivery p.score sc m.topic)) s1
   -- "When the peer receives the first message instance it immediately
@@ -733,7 +736,8 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
   match s.pending.find? (fun e => decide (e.1 = id)) with
   | none => (s, [])
   | some (_, src, m) =>
-    let s1 : State := { s with pending := s.pending.filter (fun e => decide (e.1 ≠ id)) }
+    let s1 : State := { s with pending := s.pending.filter (fun e => decide (e.1 ≠ id)),
+                               pendingAt := s.pendingAt.filter (fun e => decide (e.1 ≠ id)) }
     -- The score goes to the peer the core recorded at receipt. The
     -- answer's source is the application's copy of the same value.
     match outcome with
@@ -748,6 +752,19 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
     | .reject =>
       (updateScoreOf s1 src (fun sc => Score.invalidDelivery p.score sc m.topic), [])
     | .ignore => (s1, [])
+
+/-- Drop the held messages older than the message cache's history,
+`historyLength` heartbeats: rust-libp2p keeps an unvalidated message in
+its message cache, so it expires with that window. An expired message
+stays in the seen cache, so a later copy is dropped as a duplicate; no
+score moves. The loop calls this at each heartbeat, outside `step`, so
+the step theorems hold unchanged. -/
+def expirePending (p : Params) (s : State) (now : Millis) : State :=
+  let ttl := p.window.historyLength * p.heartbeatInterval
+  let old := (s.pendingAt.filter fun e => decide (e.2 + ttl ≤ now)).map (·.1)
+  if old.isEmpty then s
+  else { s with pending := s.pending.filter (fun e => !memB e.1 old),
+                pendingAt := s.pendingAt.filter (fun e => !memB e.1 old) }
 
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=

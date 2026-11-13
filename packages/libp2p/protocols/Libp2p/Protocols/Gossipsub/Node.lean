@@ -151,6 +151,28 @@ structure Config where
   sizes"). -/
   maxRpcSize : Nat := Constants.rpcCap
 
+/-- A snapshot of the router for metrics: the sizes a client exports.
+Lighthouse's `lighthouse_network` metrics are off in the shadow node
+(`node.rs:107`), so a poll is the whole interface. -/
+structure Stats where
+  /-- The known peers. -/
+  peers : Nat
+  /-- The mesh size of each topic. -/
+  mesh : List (TopicId × Nat)
+  /-- The subscribed topics. -/
+  topics : Nat
+  /-- The ids in the seen cache. -/
+  seen : Nat
+  /-- The messages in the message cache. -/
+  cached : Nat
+  /-- The messages that wait for the application's answer. -/
+  pending : Nat
+  /-- The IDONTWANT pairs held. -/
+  dontSend : Nat
+  /-- Frames dropped by a full or closed peer queue, or by the pending
+  gossip bound (`Node.dropped`). -/
+  dropped : Nat
+
 /-- A running node. Every field is a seam over the loop task, which is the
 only owner of the router state. -/
 structure Node where
@@ -183,6 +205,9 @@ structure Node where
   `update_gossipsub_parameters`). `false` under the same conditions as
   `publish`. -/
   setTopicParams : TopicId → Option Score.TopicParams → BaseIO Bool
+  /-- A snapshot of the router (`Stats`). `none` when the node stopped
+  or its queue is full. -/
+  stats : Conc.Async (Option Stats)
   /-- Close the event queue and join the loop task. The loop serves the
   queued events first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
@@ -563,6 +588,7 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
   let st := { st with pending := later }
   if st.nextTick ≤ now then
     let st ← reconcile env st
+    let st := { st with router := Core.expirePending st.params st.router now }
     let order := env.config.order st.ticks (st.router.peers.map (·.1))
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
@@ -693,6 +719,22 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue, and the loop
       -- serves the queued inspect before it ends.
+      reply.recv
+    stats := do
+      if ← (closing.get : BaseIO Bool) then return none
+      let reply : Conc.Chan Stats ← Conc.Chan.new 1
+      let k : Core.Params → Core.State → BaseIO Unit := fun _ s => do
+        discard <| reply.trySend {
+          peers := s.peers.length
+          mesh := s.mesh.map fun (t, ps) => (t, ps.length)
+          topics := s.topics.length
+          seen := s.seen.entries.length
+          cached := s.mcache.entries.length
+          pending := s.pending.length
+          dontSend := s.dontSend.length
+          dropped := ← drops.get }
+      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv
     setTopicParams := fun topic tp => do
       if ← closing.get then return false
