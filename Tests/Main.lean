@@ -88,6 +88,9 @@ def main : IO UInt32 := do
     Tests.Gossipsub.Partial.run r
     Tests.Gossipsub.HostNode.runPartial r
     return ← r.summary
+  if (← IO.getEnv "LEANP2P_SUITE") == some "mux" then
+    Tests.Mux.run r
+    return ← r.summary
   if (← IO.getEnv "LEANP2P_SUITE") == some "discv5" then
     Tests.Discv5.run r
     return ← r.summary
