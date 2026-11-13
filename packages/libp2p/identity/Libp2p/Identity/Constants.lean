@@ -122,6 +122,14 @@ def nameTcp6 : List Nat := [0x74, 0x63, 0x70, 0x36]
 /-- `udp6`: the IPv6-specific UDP port. -/
 def nameUdp6 : List Nat := [0x75, 0x64, 0x70, 0x36]
 
+/-- `quic`: the libp2p QUIC port of a consensus record (consensus-specs
+phase0 `p2p-interface.md`, "ENR structure"). EIP-778 does not name it,
+so it is a `Key.other`. -/
+def nameQuic : List Nat := [0x71, 0x75, 0x69, 0x63]
+
+/-- `quic6`: the IPv6-specific libp2p QUIC port of a consensus record. -/
+def nameQuic6 : List Nat := [0x71, 0x75, 0x69, 0x63, 0x36]
+
 /-- `v4`: the one identity scheme EIP-778 defines. -/
 def schemeV4 : List Nat := [0x76, 0x34]
 

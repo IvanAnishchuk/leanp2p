@@ -87,6 +87,51 @@ def multiaddrs (r : Enr) : Except Error (List Multiaddr) := do
       | none => [])
   plan.mapM fun (ipProto, a, transport, port) => address ipProto a transport port
 
+/-! ## The consensus profile
+
+The consensus networking spec gives the ports their own meanings
+(phase0 `p2p-interface.md`, "ENR structure"): `tcp`/`tcp6` is the libp2p
+TCP port, `quic`/`quic6` the libp2p QUIC port, and `udp`/`udp6` the
+discv5 port. So the dial addresses read `tcp` and `quic`, and never
+`udp`. The IPv6 fallback to the general port follows EIP-778, as
+`multiaddrs` does; Lighthouse's `dialable_multiaddrs_tcp` reads `tcp6`
+only. A port of 0 is no listener, and gives no address, as in
+Lighthouse. -/
+
+/-- The `quic` key of the consensus spec. -/
+def quicKey : Key := Key.ofName nameQuic
+
+/-- The `quic6` key of the consensus spec. -/
+def quic6Key : Key := Key.ofName nameQuic6
+
+/-- The QUIC multiaddr of one address and one port:
+`/ip4/<ip>/udp/<port>/quic-v1`. -/
+def quicAddress (ipProto : Protocol) (ip : List Nat) (port : Nat) : Except Error Multiaddr :=
+  (Multiaddr.ofByteArray? (ofNatList (component ipProto ip ++
+    component .udp (portValue port) ++ component .«quic-v1» []))).mapError fun _ => .multiaddr
+
+/-- The libp2p addresses of a consensus record: QUIC first, then TCP,
+IPv4 before IPv6 in each. -/
+def dialAddrs (r : Enr) : Except Error (List Multiaddr) := do
+  let ip ← r.ip?
+  let ip6 ← r.ip6?
+  let tcp ← r.port? .tcp
+  let tcp6 ← r.port? .tcp6
+  let quic ← r.port? quicKey
+  let quic6 ← r.port? quic6Key
+  let live (p : Option Nat) : Option Nat := p.filter (· != 0)
+  let quics := (match ip, live quic with
+      | some a, some p => [(Protocol.ip4, a, p)] | _, _ => []) ++
+    (match ip6, live (quic6 <|> quic) with
+      | some a, some p => [(Protocol.ip6, a, p)] | _, _ => [])
+  let tcps := (match ip, live tcp with
+      | some a, some p => [(Protocol.ip4, a, p)] | _, _ => []) ++
+    (match ip6, live (tcp6 <|> tcp) with
+      | some a, some p => [(Protocol.ip6, a, p)] | _, _ => [])
+  let q ← quics.mapM fun (ipProto, a, p) => quicAddress ipProto a p
+  let t ← tcps.mapM fun (ipProto, a, p) => address ipProto a .tcp p
+  return q ++ t
+
 /-! ## The reverse map -/
 
 /-- The parts of one multiaddr: the address protocol and bytes, the

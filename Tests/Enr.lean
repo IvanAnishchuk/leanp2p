@@ -154,6 +154,23 @@ def Enr.run (r : Runner) : IO Unit := do
           (drec.multiaddrs.map bytesOfAddrs))
       r.check "dual stack: the multiaddrs map back to the address pairs"
         (succeedsWith drec.addressPairs (drec.multiaddrs >>= Enr.pairsOfMultiaddrs))
+    -- The consensus profile of a record (phase0 "ENR structure"): `udp`
+    -- is discv5's, so it gives no dial address; `quic` gives
+    -- `/udp/<quic>/quic-v1`, QUIC first; a zero `tcp6` gives none.
+    -- `quic-v1` is multicodec 0x01cd; 0x01cc is the draft `quic`.
+    let quicV1 : List Nat := [0xcd, 0x03]
+    let consensus : List Enr.Pair := [⟨.ip, .bytes [1, 2, 3, 4]⟩, ⟨.ip6, .bytes v6⟩,
+      ⟨Enr.quicKey, .bytes (Rlp.ofScalar 9002)⟩, ⟨.tcp, .bytes (Rlp.ofScalar 9000)⟩,
+      ⟨.tcp6, .bytes []⟩, ⟨.udp, .bytes (Rlp.ofScalar 9001)⟩]
+    match Enr.sign priv 1 consensus with
+    | .error e => r.check s!"the consensus record signs ({repr e})" false
+    | .ok crec =>
+      r.check "consensus: QUIC then TCP, no udp, no zero tcp6"
+        (succeedsWith
+          [[0x04, 1, 2, 3, 4, 0x91, 0x02] ++ port 9002 ++ quicV1,
+            (0x29 :: v6) ++ [0x91, 0x02] ++ port 9002 ++ quicV1,
+            [0x04, 1, 2, 3, 4, 0x06] ++ port 9000]
+          (crec.dialAddrs.map bytesOfAddrs))
 
   -- One rejection per decode rule. Each mutation starts from the
   -- example's items: `[signature, seq, id, v4, ip, …, udp, 765f]`.
