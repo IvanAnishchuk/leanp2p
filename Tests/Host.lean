@@ -614,6 +614,54 @@ private def shutdownChecks (r : Runner) : Async Unit := do
   b.close
   tc.close
 
+/-- A notifiee that offers every event to `seen`. -/
+private def recordEvents (h : Host) : BaseIO (Chan ConnEvent) := do
+  let seen : Chan ConnEvent ← Chan.new 16
+  h.addNotifiee fun e => discard (seen.trySend e)
+  return seen
+
+/-- The connection events and the per-peer close (P3): a dial raises
+`connected` on both sides with the two roles, `peers` lists the peer,
+and `closePeer` on one side raises `disconnected` with the same session
+number on both. -/
+private def eventChecks (r : Runner) : Async Unit := do
+  let net ← Sim.Net.new
+  let tc ← TestClock.new
+  let (a, _) ← mkHost net 21 tc
+  let (b, _) ← mkHost net 22 tc
+  let seenA ← (recordEvents a : BaseIO _)
+  let seenB ← (recordEvents b : BaseIO _)
+  let addrA ← listenOn a "/memory/181"
+  discard <| b.dial (← withPeer addrA a.localPeer)
+  let (sessA, sessB) ← match ← seenA.recv, ← seenB.recv with
+    | some (.connected pa sa ra _), some (.connected pb sb rb addr) =>
+      r.check "host: a dial raises connected on both sides"
+        (pa == b.localPeer && pb == a.localPeer)
+      r.check "host: connected carries each side's role"
+        (ra == .responder && rb == .initiator)
+      r.check "host: the dialer's connected names the listener's address" (addr == addrA)
+      pure (sa, sb)
+    | _, _ =>
+      r.check "host: a dial raises connected on both sides" false
+      pure (0, 0)
+  r.check "host: peers lists the connected peer"
+    ((← (a.peers : BaseIO _)) == [b.localPeer] && (← (b.peers : BaseIO _)) == [a.localPeer])
+  r.check "host: closePeer finds the live session" (← (b.closePeer a.localPeer : BaseIO Bool))
+  match ← seenB.recv, ← seenA.recv with
+  | some (.disconnected pb sb), some (.disconnected pa sa) =>
+    r.check "host: closePeer raises disconnected on both sides"
+      (pb == a.localPeer && pa == b.localPeer)
+    r.check "host: disconnected carries the session of its connected"
+      (sb == sessB && sa == sessA)
+  | _, _ => r.check "host: closePeer raises disconnected on both sides" false
+  r.check "host: no peer is listed after the close"
+    ((← (a.peers : BaseIO _)).isEmpty && (← (b.peers : BaseIO _)).isEmpty)
+  r.check "host: closePeer answers false with no session"
+    !(← (b.closePeer a.localPeer : BaseIO Bool))
+  b.close
+  a.close
+  tc.close
+
 /-- The leftover hand-over on a served stream (§4.7, §5.6). A peer
 writes its stream header, its proposal, and data in one write. The
 handler gets the data in its first read. The peer runs the plain
@@ -840,7 +888,8 @@ def Host.run (r : Runner) : IO Unit := do
   errorChecks r
   for (label, act) in [("pipeline", pipelineChecks r), ("answers", answerChecks r),
       ("policy", policyChecks r), ("silent peer", silentPeerChecks r),
-      ("shutdown", shutdownChecks r), ("hand-over", handOverChecks r),
+      ("shutdown", shutdownChecks r), ("events", eventChecks r),
+      ("hand-over", handOverChecks r),
       ("mplex", mplexChecks r), ("secured", securedChecks r),
       ("secured policy", securedPolicyChecks r),
       ("secured shutdown", securedShutdownChecks r)] do

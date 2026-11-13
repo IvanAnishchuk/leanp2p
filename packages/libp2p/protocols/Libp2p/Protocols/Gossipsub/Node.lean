@@ -571,6 +571,20 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let post : Core.Event → BaseIO Bool := fun e => do
     if ← closing.get then return false
     events.trySend (.event e)
+  -- The host's sessions reach the router here. `current` holds the
+  -- session number of each peer's last `connected`, so a stale
+  -- `disconnected` of a replaced session is dropped (`Host.ConnEvent`).
+  let current ← Conc.OnceRef.new ([] : List (Peer × Nat))
+  host.addNotifiee fun
+    | .connected peer session _ _ => do
+      current.update fun t => (peer, session) :: t.filter (·.1 != peer)
+      discard <| post (.peerJoined peer .meshsub)
+    | .disconnected peer session => do
+      let mine ← current.updateGet fun t =>
+        if t.any (· == (peer, session)) then (true, t.filter (·.1 != peer)) else (false, t)
+      if mine then discard <| post (.peerLeft peer)
+  for peer in ← host.peers do
+    discard <| post (.peerJoined peer .meshsub)
   return {
     publish := fun topic payload => post (.publish (messageOf topic payload))
     subscribe := fun topic callback => do

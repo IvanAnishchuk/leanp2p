@@ -86,6 +86,25 @@ structure Failure where
   /-- What failed. -/
   error : Error
 
+/-- A change in the session that serves a peer. Every committed session
+raises `connected` before its serve task starts. Its serve task raises
+`disconnected` when the session ends while it still holds the peer's
+slot. A session the dedup displaced raises no `disconnected`, since the
+peer stays connected through its successor (`Libp2p.Host.Dedup`), so a
+peer can see two `connected` in a row.
+
+Both carry the session number. The two events of different sessions
+run on different tasks, so a session's `disconnected` can reach a
+notifiee after its successor's `connected`. A notifiee that tracks the
+number of the last `connected` per peer drops such a stale
+`disconnected`. -/
+inductive ConnEvent where
+  /-- A session committed: the peer, its session number, our side of
+  the connection, and the peer's transport address. -/
+  | connected (peer : PeerId) (session : Nat) (role : Role) (remoteAddr : Multiaddr)
+  /-- The live session `session` of the peer ended. -/
+  | disconnected (peer : PeerId) (session : Nat)
+
 /-- The configuration of a host: the ordered seam lists, the identity,
 the handlers, the policy values, the clock, and where the failures of
 owned tasks go (ARCHITECTURE §3.1). `cli/` or a consumer assembles it;
@@ -167,6 +186,9 @@ structure Host where
   sessionTasks : Gate
   /-- The accept loops and the inbound upgrades. -/
   hostTasks : Gate
+  /-- The connection notifiees, in registration order. Each runs on the
+  task that commits or ends a session, so it must not park. -/
+  notifiees : OnceRef (List (ConnEvent → BaseIO Unit))
 
 namespace Host
 
@@ -188,7 +210,8 @@ def new (config : Config) : BaseIO (Except Identity.Error Host) := do
       securedListeners := ← OnceRef.new (some [])
       pending := ← OnceRef.new (some {})
       sessionTasks := ← Gate.new
-      hostTasks := ← Gate.new }
+      hostTasks := ← Gate.new
+      notifiees := ← OnceRef.new [] }
 
 /-! ## Small steps -/
 
@@ -221,6 +244,33 @@ def addrsOf (h : Host) (peer : PeerId) : BaseIO (List Multiaddr) := do
 /-- True when the host serves a live session with `peer`. -/
 def connected (h : Host) (peer : PeerId) : BaseIO Bool := do
   return (SessionTable.live? (← h.sessions.get) peer).isSome
+
+/-- The peers the host serves a live session with. -/
+def peers (h : Host) : BaseIO (List PeerId) := do
+  return (SessionTable.liveEntries (← h.sessions.get)).map (·.1)
+
+/-- Register `f` to hear every later `ConnEvent`. It runs on the task
+that commits or ends a session, so it must not park; a consumer posts
+to its own bounded queue. A peer already connected raises no event for
+the new notifiee: read `peers` after the registration to learn them. -/
+def addNotifiee (h : Host) (f : ConnEvent → BaseIO Unit) : BaseIO Unit :=
+  h.notifiees.update (· ++ [f])
+
+/-- Hand `e` to every notifiee, in registration order. -/
+private def notify (h : Host) (e : ConnEvent) : BaseIO Unit := do
+  for f in ← h.notifiees.get do f e
+
+/-- End the live session of `peer`, as the dedup ends a displaced one:
+close its muxer session, and its serve task marks it dead, joins it, and
+raises `disconnected`. `false` when no live session serves the peer.
+The consensus Goodbye comes first, on a stream the client writes (phase0
+`p2p-interface.md`, "Goodbye"). -/
+def closePeer (h : Host) (peer : PeerId) : BaseIO Bool := do
+  match SessionTable.live? (← h.sessions.get) peer with
+  | none => return false
+  | some e =>
+    discard e.session.upgraded.session.close.toBaseIO
+    return true
 
 /-- The transport address and the expected peer of a dial address. A
 trailing `/p2p/<id>` names the peer and no transport (the addressing
@@ -352,7 +402,12 @@ private def serveSession (h : Host) (peer : PeerId) (e : Entry Served) : Async U
         streams.spawn (h.serveStream ctx e.session.scope s)
       pure (none : Option IO.Error)
     catch err => pure (some err)
-  h.sessions.update (SessionTable.markDead peer e.id)
+  -- The peer leaves only when this session still held its slot: a
+  -- session the dedup displaced finds its successor's number there.
+  let held ← (h.sessions.updateGet fun t =>
+    (((t.get? peer).map (fun s => s.id == e.id && s.live)).getD false,
+      SessionTable.markDead peer e.id t) : BaseIO Bool)
+  if held then h.notify (.disconnected peer e.id)
   discard u.session.close.toBaseIO
   -- The session has ended, so every stream read ends, and the handlers
   -- that park on their streams wake.
@@ -390,6 +445,9 @@ private def register (h : Host) (role : Role) (u : Upgraded) (remoteAddr : Multi
     -- joins it.
     if let some old := displaced then
       discard old.session.upgraded.session.close.toBaseIO
+    -- Before the serve task starts, so its `disconnected` comes after.
+    -- A gate that refuses the task still runs it (`Gate.spawn`).
+    h.notify (.connected u.remotePeer id role remoteAddr)
     let wake : BaseIO Unit := discard u.session.close.toBaseIO
     if !(← h.sessionTasks.spawn (h.serveSession u.remotePeer entry) wake) then
       return .error .closing
