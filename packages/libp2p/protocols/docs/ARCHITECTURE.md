@@ -139,7 +139,10 @@ back.
   the registry stores. Both work on opaque payload bytes; the core holds
   the reader state and the error/EOF distinction.
 - **Gossipsub.** `publish` hands a topic and payload bytes to the node,
-  and `subscribe` registers a delivery callback. Both sit at the seam
+  and `subscribe` registers a delivery callback. `subscribe` never
+  parks, and it answers `false` while the control queue is full.
+  `subscribeWait` parks instead, for a caller that subscribes to many
+  topics at once. Both sit at the seam
   over the loop; the mesh decisions live in the core, and no caller
   sees them. The node speaks `/meshsub/1.3.0`, `1.2.0`, and `1.1.0`.
   It also speaks `/floodsub/1.0.0` when `Config.floodsub` is set. Peer

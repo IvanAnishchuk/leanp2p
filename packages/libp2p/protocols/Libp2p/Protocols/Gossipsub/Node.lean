@@ -246,6 +246,13 @@ structure Node where
   it must not park. `false` under the same conditions as `publish`, and the
   callback then stays unregistered. -/
   subscribe : TopicId → (Message → BaseIO Unit) → BaseIO Bool
+  /-- `subscribe` with a post that parks while the control queue is full,
+  so a burst of subscriptions loses none. A consensus node subscribes to
+  about 200 topics at once, and the queue holds `inputSlots`. The loop's
+  next take wakes the post, and the close of the queue at `stop` wakes it
+  too. `false` once the node stops, and the callback then stays
+  unregistered. -/
+  subscribeWait : TopicId → (Message → BaseIO Unit) → Conc.Async Bool
   /-- Drop every callback of the topic, and leave the topic. `false` under the
   same conditions as `publish`. -/
   unsubscribe : TopicId → BaseIO Bool
@@ -1066,6 +1073,19 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       if !sent then
         subs.update fun s => { s with entries := s.entries.filter (fun entry => entry.id != id) }
       return sent
+    subscribeWait := fun topic callback => do
+      if ← (closing.get : BaseIO Bool) then return false
+      let id ← (subs.updateGet fun s =>
+        (s.next,
+          { next := s.next + 1
+            entries := s.entries ++ [{ id := s.next, topic, callback }] }) : BaseIO Nat)
+      -- Park: the loop's take frees a slot, and `stop` closes the queue.
+      match ← control.send (.event (.subscribe topic)) with
+      | .ok () => return true
+      | .error _ =>
+        (subs.update fun s => { s with entries := s.entries.filter (fun entry => entry.id != id) } :
+          BaseIO Unit)
+        return false
     unsubscribe := fun topic => do
       if ← closing.get then return false
       subs.update fun s => { s with entries := s.entries.filter (fun e => e.topic != topic) }

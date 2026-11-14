@@ -137,15 +137,11 @@ def run (a : Args) : IO UInt32 := do
     onEvent := fun e => events.update (·.push e) })
   IO.println s!"eth2-probe: listening on {s.listenAddrs.map toString}"
   IO.println s!"eth2-probe: record {(← s.localEnr).toText}"
-  -- The subscriptions post to the gossipsub node's control queue of 64 inputs, so a
-  -- refused one waits and posts again.
   let kinds : List Kind := [.beaconBlock, .beaconAggregateAndProof] ++
     (List.range Constants.attestationSubnetCount).map .beaconAttestation ++
     (List.range Constants.dataColumnSidecarSubnetCount).map .dataColumnSidecar
   for k in kinds do
-    for _ in [0:100] do
-      if ← s.subscribe k then break
-      IO.sleep 10
+    unless ← Async.run (s.subscribe k) do IO.eprintln s!"eth2-probe: the subscribe to {repr k} failed"
   let counts ← (OnceRef.new ({} : Counts) : BaseIO _)
   let probed ← (OnceRef.new ([] : List PeerId) : BaseIO _)
   let tasks ← (TaskSet.new : BaseIO TaskSet)

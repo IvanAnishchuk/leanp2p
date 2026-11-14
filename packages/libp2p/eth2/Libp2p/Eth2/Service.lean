@@ -410,9 +410,12 @@ def start (cfg : Config) : Async Service := do
 def topic (s : Service) (k : Kind) : IO TopicId := do
   return ⟨topicOf (← digestNow s.base.config.chain) k⟩
 
-/-- Subscribe to a kind. The messages arrive as `Event.gossip`. -/
-def subscribe (s : Service) (k : Kind) : IO Bool := do
-  s.gossip.subscribe (← s.topic k) fun _ => pure ()
+/-- Subscribe to a kind. The messages arrive as `Event.gossip`. The post
+parks while the gossipsub node's control queue is full
+(`Node.subscribeWait`), since a consensus node subscribes to about 200
+topics at once. `false` once the node stops. -/
+def subscribe (s : Service) (k : Kind) : Async Bool := do
+  s.gossip.subscribeWait (← s.topic k) fun _ => pure ()
 
 /-- Answer a held message. -/
 def report (s : Service) (id : MessageId) (source : PeerId) (v : Gossipsub.Core.Validation) :

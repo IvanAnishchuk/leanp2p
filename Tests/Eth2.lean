@@ -185,8 +185,18 @@ private def serviceChecks (r : Runner) : Async Unit := do
   r.check "eth2 service: the listener gets the dialer's Status"
     (← waitUntil (has evA fun | .status p _ => p == bPeer | _ => false) 5000)
   -- Gossip: both subscribe, and B publishes once A is in B's mesh.
-  discard <| (a.subscribe .beaconBlock : IO Bool)
-  discard <| (b.subscribe .beaconBlock : IO Bool)
+  r.check "eth2 service: the subscribes post" ((← a.subscribe .beaconBlock) && (← b.subscribe .beaconBlock))
+  -- A burst past the control queue of the gossipsub node (`inputSlots`,
+  -- 64): every post parks until the loop takes it, so none is lost.
+  let burst ← (List.range Constants.dataColumnSidecarSubnetCount).allM fun i =>
+    a.subscribe (.dataColumnSidecar i)
+  r.check "eth2 service: a burst of 128 subscribes loses none" burst
+  let allTopics : Async Bool := do
+    match ← a.gossip.stats with
+    | some st => return st.topics == 129
+    | none => return false
+  r.check "eth2 service: the router holds the block topic and the 128 column topics"
+    (← waitUntil allTopics 5000)
   let meshed : Async Bool := do
     match ← b.gossip.stats with
     | some st => return st.mesh.any (·.2 ≥ 1)
