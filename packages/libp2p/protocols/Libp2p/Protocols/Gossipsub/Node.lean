@@ -373,8 +373,8 @@ private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
     -- The newest first: a peer answers `na` to an id it lacks, and the
-    -- negotiation tries v1.2, then v1.1, then floodsub when the node
-    -- speaks it (go's `GossipSubDefaultProtocols` order).
+    -- negotiation tries v1.3, then v1.2, then v1.1, then floodsub when
+    -- the node speaks it (go's `GossipSubDefaultProtocols` order).
     let ids := [Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId] ++
       (if floodsub then [Constants.floodsubId] else [])
     match ← host.newStream peer ids with
