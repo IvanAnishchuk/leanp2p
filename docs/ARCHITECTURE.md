@@ -69,6 +69,8 @@ packages/
     quic/                      QUIC as a SecuredTransport value
     host/                      swarm/host, peerstore, dedup, deadlines
     protocols/                 identify, ping, req/resp, gossipsub
+    eth2/                      the consensus networking: fork digest, topics,
+                               message id, ENR fields, methods, the service
   cli/                         command-line executables: demo node,
                                ping node, interop harness; config and wiring
 ```
@@ -82,10 +84,11 @@ them:
   `{net/yamux, net/tls} → net/streams`,
   `codec/{proto,multiformats} → codec/varint`, and inside `libp2p`
   `identity → core → {security, mux} → {negotiate, quic} → host →
-  protocols`. Implementations import `core`. `negotiate` and `host`
+  protocols → eth2`. Implementations import `core`. `negotiate` and `host`
   import `core` and no implementation (§3.1); `cli/` hands the host the
   `quic` value. `discv5` imports `identity` only, so it has the rank of
-  `core`. It speaks no libp2p. The client joins it to the host.
+  `core`. It speaks no libp2p. `eth2` sits above `protocols` and joins
+  discv5 to the host, the gossipsub node, and the req/resp methods.
 - No package left of `libp2p` mentions libp2p, so other projects can
   use these packages.
 
@@ -1052,6 +1055,7 @@ interface seams exist, and no implementation work is scheduled.
 | host/upgrade/peerstore, dedup, deadlines | everything above composes through them | done (TTLs/limits deferred) |
 | ENR ↔ multiaddr/peer-id mapping | discovery integration | done (W6.1) |
 | **discv5** (Node Discovery v5.1) | "The discovery domain: discv5" (phase0 `p2p-interface.md`): every consensus client finds its peers through it; it runs beside libp2p over UDP | spike on `experiment/client`: `libp2p/discv5`, conformant to geth's `v5test` and the sigp crate (the package docs) |
+| **the consensus profile** | the fork digest (with Fulu's blob schedule), the topics and the message id, the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the methods Status v2, Goodbye, Ping, MetaData v3, BlocksByRange and ByRoot v2, and DataColumnSidecarsByRange and ByRoot v1 (phase0 to fulu `p2p-interface.md`) | spike on `experiment/client`: `libp2p/eth2`, its digest checked against a Lighthouse record (the package docs) |
 
 **Optional (the spec allows them; build them when cheap):**
 

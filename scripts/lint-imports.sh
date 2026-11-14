@@ -91,6 +91,7 @@ leafrank() {
     libp2p/quic)        lrank=4 ;;
     libp2p/host)        lrank=5 ;;
     libp2p/protocols)   lrank=6 ;;
+    libp2p/eth2)        lrank=7 ;;
   esac
 }
 
@@ -193,6 +194,8 @@ while IFS= read -r -d '' f; do
             Quic)      mleaf=quic      ;;
             Host)      mleaf=host      ;;
             Protocols) mleaf=protocols ;;
+            Discv5)    mleaf=discv5    ;;
+            Eth2)      mleaf=eth2      ;;
           esac ;;
         Libp2p*)
           # A dotless `Libp2p...` name has no second segment, so it
