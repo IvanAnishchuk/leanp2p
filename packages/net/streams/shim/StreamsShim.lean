@@ -1,10 +1,12 @@
 import Std.Async.TCP
+import Std.Async.UDP
 
 /-!
-# The TCP shim
+# The socket shim
 
-Two C functions that `Streams.Tcp` needs and the v4.34 runtime does not
-offer.
+Three C functions that the transports need and the v4.34 runtime does
+not offer: two for `Streams.Tcp`, and the exclusive UDP bind for
+`Streams.Udp` and `net/quic`.
 
 Lean v4.34 binds libuv TCP with no close call: the runtime closes a
 socket's handle only when the last reference to the socket goes, and
@@ -25,6 +27,11 @@ peer's reset as `IO.Error.resourceVanished` with that errno, and the
 same constructor carries `EPIPE` and `ENETDOWN`, so `Streams.Tcp` tells
 the reset apart by the code (`c/tcperrno.c`). The package docs say why
 a peer's reset ends the read (`docs/ARCHITECTURE.md`, "Decisions").
+
+`udpBind` binds a UDP socket with no address reuse. `Std.Async.UDP`'s
+own bind always sets SO_REUSEADDR, and on Linux a port-0 bind may then
+take a port another socket holds (`c/udpbind.c` says how the shim avoids
+it).
 -/
 
 set_option autoImplicit false
@@ -44,5 +51,13 @@ ARCHITECTURE §3.6). It takes `Unit`, as the runtime's own platform
 constants do (`System.Platform.getTarget`). -/
 @[extern "leanp2p_tcp_econnreset"]
 opaque econnreset : Unit → UInt32
+
+/-- Bind a fresh UDP socket to `addr` with no address reuse, so no other
+socket shares its port. `addr` is the family byte (4 or 6), the address
+in network order, then the port, big-endian: 7 or 19 bytes. Call it
+once, before any receive or send on the socket. A port another socket
+holds fails with EADDRINUSE. -/
+@[extern "leanp2p_udp_bind"]
+opaque udpBind (socket : @& Std.Internal.UV.UDP.Socket) (addr : @& ByteArray) : IO Unit
 
 end StreamsShim

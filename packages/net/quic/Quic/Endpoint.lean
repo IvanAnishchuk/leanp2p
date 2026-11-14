@@ -2,6 +2,7 @@ import Std.Data.HashMap
 import Std.Async.UDP
 import Conc
 import Streams
+import StreamsShim
 import Tls
 import QuicNative
 import Quic.Constants
@@ -105,8 +106,8 @@ def dial (ctx : Tls.Context) (remote : Multiaddr) (check : Check) (clock : Clock
   let some ra := socketAddress? remote | return .error .address
   let socket ← Std.Async.UDP.Socket.mk
   -- The shim's bind, with no address reuse: a port of its own, which no
-  -- other dial shares (`QuicNative.udpBind`).
-  QuicNative.udpBind socket.native (toShim (anyOf ra))
+  -- other dial shares (`StreamsShim.udpBind`).
+  StreamsShim.udpBind socket.native (toShim (anyOf ra))
   -- A dialing endpoint takes no new connection, so its admission never
   -- runs.
   match ← open_ (α := Unit) ctx socket false (fun _ _ => pure none) clock {} with
@@ -182,8 +183,8 @@ def listen {α : Type} (ctx : Tls.Context) (addr : Multiaddr)
   let some sa := socketAddress? addr
     | throw <| listenFault s!"{addr.describe} is not /ip4|ip6/<addr>/udp/<port>/quic-v1"
   let socket ← Std.Async.UDP.Socket.mk
-  -- The shim's bind, with no address reuse (`QuicNative.udpBind`).
-  QuicNative.udpBind socket.native (toShim sa)
+  -- The shim's bind, with no address reuse (`StreamsShim.udpBind`).
+  StreamsShim.udpBind socket.native (toShim sa)
   match ← open_ ctx socket true admit clock bounds with
   | .error e => throw <| listenFault (toString e)
   | .ok sh =>

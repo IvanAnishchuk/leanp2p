@@ -355,6 +355,25 @@ private def gethChecks (r : Runner) : IO Unit := do
     r.check "FINDNODE relays a live node"
       (askC { bKnows with table := bKnows.table.markLive ec.nodeId } [11] 395)
 
+    -- The NODES packet cap: an answer that claims 255 packets ends after
+    -- `maxNodesPackets`, so a peer cannot hold the request open.
+    let (a12, _) := Core.step a2 (.request eb epB (.findNode [12] [1]) (randFor 397))
+    let (_, _, responses) := (List.range (Core.maxNodesPackets + 1)).foldl
+      (fun (acc : State × State × Nat) i =>
+        let (a, b, count) := acc
+        let (b', out) := Core.step b (.request ea epA (.nodes [12] 255 []) (randFor (400 + 2 * i)))
+        match onlySend out with
+        | some p =>
+          let (a', aOut) := Core.step a (.packet epB p (randFor (401 + 2 * i)))
+          let answered := aOut.any fun act => match act with
+            | .response _ (.nodes [12] _ _) => true
+            | _ => false
+          (a', b', if answered then count + 1 else count)
+        | none => (a, b', count))
+      (a12, b2, 0)
+    r.check "NODES: an answer ends after maxNodesPackets packets"
+      (responses == Core.maxNodesPackets)
+
     -- The session cache is bounded: past `maxSessions`, the least
     -- recently used session goes.
     match Crypto.Key16.ofByteArray? (ByteArray.mk (Array.replicate 16 0)) with
@@ -451,6 +470,15 @@ private def socketChecks (r : Runner) : IO Unit := Conc.Async.run do
     (← closeWakes [127, 0, 0, 2])
   r.check "udp: close wakes a receive on a socket bound to 0.0.0.0"
     (← closeWakes [0, 0, 0, 0])
+  -- The bind takes no address reuse: a second socket on a held port
+  -- fails, where `Std`'s own bind would share the port.
+  let first ← (Streams.Udp.bind [127, 0, 0, 1] 0 : IO Streams.Udp.Socket)
+  let second ← (try
+      discard (Streams.Udp.bind [127, 0, 0, 1] first.port : IO Streams.Udp.Socket)
+      pure true
+    catch _ => pure false : IO Bool)
+  r.check "udp: a second bind to a held port fails" (!second)
+  Streams.Udp.close first
 
 /-! ## Eclipse limits -/
 

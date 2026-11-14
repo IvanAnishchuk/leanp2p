@@ -18,7 +18,7 @@ check. `libp2p/quic` is its caller (root PLAN W4.4).
 | `scripts/verify-upstream.py` | the check of the pin: offline over the hashes and the tree, and against a clone of the pinned commit |
 | `native/include/` | the two build-support headers CMake would write: `config.h` and `ngtcp2/version.h` |
 | `native/c/quic_shim.c` | the shim: the endpoint object, its connections, the send buffers of the streams, and the two queues for the Lean side |
-| `native/QuicNative.lean` | the `@[extern]` declarations of the shim, one per exported function, the event kinds with their conformance theorem, and `udpBind`, the bind with no address reuse ("Decisions", the exclusive bind) |
+| `native/QuicNative.lean` | the `@[extern]` declarations of the shim, one per exported function, and the event kinds with their conformance theorem; the bind with no address reuse is `StreamsShim.udpBind` ("Decisions", the exclusive bind) |
 | `native/lakefile.lean` | the nested Lake package that compiles ngtcp2 and the shim into one archive (PRINCIPLES 4.2) |
 | `Quic/Constants.lean` | every number of the package: the transport parameters, the windows, the timeouts, the queue sizes, and the error codes; one home each (§3.8) |
 | `Quic/Error.lean` | `Quic.Error`, the one error inductive of the package (§3.5), one arm per way a connection ends |
@@ -455,12 +455,12 @@ builds with `-Wall -Werror`.
   change of a frozen seam (RULES.md, "Working ahead of the tree").
 - **The UDP socket is `Std.Async.UDP`, the second exception of root
   §4.1.** `base/conc` wraps `Std.Async` so that no other package
-  imports it, apart from `Std.Async.TCP` in `net/streams`. The UDP
+  imports it, apart from `net/streams` (`Std.Async.TCP`, and
+  `Std.Async.UDP` for discv5's datagram socket). The UDP
   socket is this package's one transport, as TCP is `net/streams`'s.
   The binding stays in `Quic/Loop.lean` (the receive and the send),
-  `Quic/Endpoint.lean` (the socket's creation), and
-  `native/QuicNative.lean`, whose `udpBind` names the socket type for
-  the shim's bind (the next bullet).
+  and `Quic/Endpoint.lean` (the socket's creation, through
+  `StreamsShim.udpBind`, the next bullet).
   The v4.34 socket has no close: its finalizer closes it when its last
   reference goes. The reader parks on the promise of the native
   receive, as the TCP transport's read does (`Streams/Tcp.lean`).
@@ -480,8 +480,11 @@ builds with `-Wall -Werror`.
   check whose dials 1 and 8 held one port hung in a `join`. A listen on
   a port in use would also succeed and split the traffic.
 
-  So `QuicNative.udpBind` binds each endpoint's socket instead of
-  `Std`. The shim opens a socket, binds it with no reuse option, and
+  So `StreamsShim.udpBind` binds each endpoint's socket instead of
+  `Std`. The bind first lived in this package's shim; it moved to the
+  shim of `net/streams` when discv5's `Streams.Udp` needed it too, so
+  every UDP socket of the stack shares one copy
+  (`packages/net/streams/shim/c/udpbind.c`). The shim opens a socket, binds it with no reuse option, and
   hands the descriptor to the `uv_udp_t` inside Lean's socket object
   with `uv_udp_open`. `uv_udp_open` sets the reuse option on the
   descriptor it takes (libuv v1.48.0, `src/unix/udp.c`, line 1040,
@@ -504,8 +507,9 @@ builds with `-Wall -Werror`.
   `udpBind`, so only another process's socket could, and only if the
   kernel's pick for it landed on this port in that window.
 
-  **At a toolchain upgrade**, the guard in `native/c/quic_shim.c`
-  (`LEAN_VERSION_MINOR == 34`) fails the build. Lift it only after these
+  **At a toolchain upgrade**, the guard in
+  `packages/net/streams/shim/c/udpbind.c` (`LEAN_VERSION_MINOR == 34`)
+  fails the build. Lift it only after these
   checks, against the new toolchain's sources:
   1. `lean_uv_udp_socket_object` in `src/runtime/uv/udp.h` still has
      the `uv_udp_t` pointer as its first field.
@@ -517,8 +521,8 @@ builds with `-Wall -Werror`.
      a reuse option, the clear after it does no harm.
   4. If `lean_uv_udp_bind` no longer passes `UV_UDP_REUSEADDR`, or
      `Std.Async.UDP` gains a bind without reuse, use that bind. Then
-     delete `leanp2p_quic_udp_bind`, `QuicNative.udpBind`, and the
-     guard, and keep the three checks.
+     delete `leanp2p_udp_bind`, `StreamsShim.udpBind`, and the
+     guard, and keep the checks.
 
   Then update the `vendor/lean4` pin in `VECTORS.lock` to the new tag,
   run `scripts/vendor-pull.sh`, and run the QUIC suite and

@@ -1,6 +1,6 @@
 /-
-The `net/streams` shim package: the C abort of `Streams.Tcp`, and the
-platform's `ECONNRESET`.
+The `net/streams` shim package: the C abort of `Streams.Tcp`, the
+platform's `ECONNRESET`, and the exclusive UDP bind.
 
 The declarative `lakefile.toml` cannot compile a C file (CLAUDE.md,
 "Configure, don't integrate"), so this directory is a nested Lake
@@ -27,11 +27,17 @@ target tcperrno.o pkg : FilePath := do
   let weak := #["-I", (← getLeanIncludeDir).toString]
   buildO obj (← inputTextFile src) weak #["-fPIC", "-O2", "-Wall", "-Werror"] "cc" getLeanTrace
 
+target udpbind.o pkg : FilePath := do
+  let src := pkg.dir / "c" / "udpbind.c"
+  let obj := pkg.buildDir / "c" / "udpbind.o"
+  let weak := #["-I", (← getLeanIncludeDir).toString]
+  buildO obj (← inputTextFile src) weak #["-fPIC", "-O2", "-Wall", "-Werror"] "cc" getLeanTrace
+
 -- Lake links every `extern_lib` of a dependency into the executables
 -- that import it.
 extern_lib libleanp2p_streams_shim pkg := do
   let lib := pkg.staticLibDir / nameToStaticLib "leanp2p_streams_shim"
-  buildStaticLib lib #[← tcpabort.o.fetch, ← tcperrno.o.fetch]
+  buildStaticLib lib #[← tcpabort.o.fetch, ← tcperrno.o.fetch, ← udpbind.o.fetch]
 
 @[default_target]
 lean_lib StreamsShim where

@@ -1,13 +1,15 @@
 import Std.Async.UDP
 import Conc
+import Bytes
+import StreamsShim
 
 /-!
 # UDP datagrams
 
 A datagram socket for discv5 (spike P5). Root ARCHITECTURE §4.1 lets
 only the transports import a `Std.Async` socket; `net/streams` already
-holds the TCP binding, so this module puts the UDP one beside it. The
-placement is the spike's, and the root docs have not made it.
+holds the TCP binding, so this module puts the UDP one beside it, as
+root §4.1 now records.
 
 The receive parks on `Std.Async.UDP.Socket.recv`, a promise, so a wait
 holds no pool thread (`Std`'s receive *selector* would; see the quic
@@ -17,6 +19,11 @@ datagram to the socket's own address (the loopback for a bind to
 `none`, as QUIC's loop does at its stop.
 
 An address is its bytes: 4 for IPv4, 16 for IPv6, as an ENR holds them.
+
+`bind` goes through the shim's exclusive bind (`StreamsShim.udpBind`),
+as QUIC's endpoint does: `Std`'s own bind sets SO_REUSEADDR, and on
+Linux a port-0 bind may then take a port another socket holds, so two
+nodes would split each other's datagrams.
 -/
 
 set_option autoImplicit false
@@ -58,10 +65,16 @@ private def v6Bytes (a : Std.Net.IPv6Addr) : List Nat :=
 /-- Bind a socket to an IPv4 or IPv6 address (4 or 16 bytes) and a port
 (0 for any). -/
 def bind (ip : List Nat) (port : Nat) : IO Socket := do
-  let some addr := sockAddr ip port
+  let some _ := sockAddr ip port
     | throw (IO.userError "udp: an IPv4 address of 4 bytes or an IPv6 address of 16")
   let s ← Std.Async.UDP.Socket.mk
-  s.bind addr
+  -- The shim's bind, with no address reuse: `Std`'s bind sets
+  -- SO_REUSEADDR, and a port-0 bind could then share a port another
+  -- socket holds (`StreamsShim.udpBind`). The shim takes the family
+  -- byte, the address, and the port, big-endian.
+  let family : Nat := if ip.length == 4 then 4 else 6
+  StreamsShim.udpBind s.native
+    (Bytes.ofNatList (family :: ip ++ [port / 256 % 256, port % 256]))
   let bound ← s.getSockName
   -- A datagram to the loopback never reaches a socket bound to another
   -- address, so the wake goes to the bound address itself; an

@@ -1,5 +1,4 @@
 import TlsNative
-import Std.Async.UDP
 
 /-!
 # The ngtcp2 bindings
@@ -204,14 +203,6 @@ opaque endpointNew (tls : @& TlsNative.Context) (localAddr : @& ByteArray) (acce
   (idleTimeoutMs keepAliveMs handshakeTimeoutMs : UInt64)
   (maxHandshakes retryThreshold maxClosingPeriods : UInt64)
   (connectionRefused invalidToken : UInt64) : IO (Option Endpoint)
-
-/-- Bind a fresh UDP socket to `addr` (the shim's bytes) with no address
-reuse, so no other socket shares its port. `Std.Async.UDP`'s own bind
-always sets SO_REUSEADDR (the package ARCHITECTURE, "Decisions", the
-exclusive bind). Call it once, before any receive or send on the
-socket. A port another socket holds fails with EADDRINUSE. -/
-@[extern "leanp2p_quic_udp_bind"]
-opaque udpBind (socket : @& Std.Internal.UV.UDP.Socket) (addr : @& ByteArray) : IO Unit
 
 /-- Dial `remote` at `now`, with the certificate check `check`: the
 handle of the new connection, or 0. -/
