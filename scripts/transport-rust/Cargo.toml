@@ -1,0 +1,19 @@
+[package]
+name = "transport-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "transport-interop test-plan peer over sigp's rust-libp2p, the fork that Lighthouse runs"
+
+# rust-libp2p comes from the local clone of sigp's fork
+# (../p2p/sigp-rust-libp2p at accba72), the rev that Lighthouse pins
+# (lighthouse Cargo.toml, `libp2p` and `libp2p-mplex`).
+# scripts/interop-matrix.sh checks that commit.
+[dependencies]
+libp2p = { path = "../../../p2p/sigp-rust-libp2p/libp2p", features = [
+  "macros", "noise", "ping", "quic", "secp256k1", "tcp", "tls", "tokio", "yamux",
+] }
+libp2p-mplex = { path = "../../../p2p/sigp-rust-libp2p/muxers/mplex" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[workspace]

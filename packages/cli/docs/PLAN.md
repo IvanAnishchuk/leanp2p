@@ -361,6 +361,14 @@ review independently reproduced each number below on the same commit.
   Lean. The configuration suite checks the parse of `security=tls`,
   `muxer=mplex`, and `transport=quic-v1`, which skips the security and
   the muxer.
+- The rust cells, against sigp's rust-libp2p at `accba72`, the fork and
+  the rev that Lighthouse pins. The peer is `scripts/transport-rust`,
+  which builds offline and runs on the host with a secp256k1 key. Each
+  stack has rust dialing rust (the check of the setup), Lean dialing
+  rust, and rust dialing Lean: `tcp + /noise + yamux`,
+  `tcp + /noise + mplex`, and `quic-v1`. `tcp + /tls + yamux` has the
+  two cross cells. mplex runs here because Lighthouse offers it, and go
+  v0.50 no longer does.
 - The silent-peer scenario, the carried regression (PRINCIPLES 5.4):
   a raw connection that sends nothing fails the upgrade at the
   deadline (§5.4), and teardown closes the pending connection and

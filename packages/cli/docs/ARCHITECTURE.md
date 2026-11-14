@@ -801,6 +801,10 @@ the same `headSha`. Two later body edits reran the license guard as
   the harness, and never on a shipped or proof path. The tree holds
   `interop-matrix.sh` and `interop-slowreader/` under the root
   `scripts/`, beside the W0.3 vector tooling (§7 row 11's note).
+  The rust peer of the matrix is `scripts/transport-rust/`, over sigp's
+  rust-libp2p from the local clone. It speaks the test plan's Redis
+  protocol itself (RPUSH, BLPOP, and the RESP2 replies), since the
+  offline registry has no Redis crate.
   The ping checks are `scripts/ping-go/` and
   `scripts/ping-go-interop.sh`. `ping-go <multiaddr>` dials
   `pingnode serve`. `ping-go listen` serves `pingnode dial`.

@@ -6,6 +6,14 @@
 # (W4.4). Docker appears here and nowhere else (cli ARCHITECTURE,
 # "Decisions").
 #
+# The rust cells run sigp's rust-libp2p, the fork and the rev that
+# Lighthouse pins (../p2p/sigp-rust-libp2p at accba72), through the
+# test-plan peer of scripts/transport-rust. That peer builds offline
+# with cargo and runs on this host, with a secp256k1 key as
+# Lighthouse's. Its cells cover the stacks that Lighthouse offers:
+# tcp + /noise with yamux and with mplex, and quic-v1. tcp + /tls +
+# yamux runs too, for the TLS handshake.
+#
 # The go side is go-libp2p's own test-plan peer, built from the vendored
 # tree (vendor/go-libp2p, v0.50.0) with its own PingDockerfile. Redis and
 # the go containers share one docker network. The Lean `interop` binary
@@ -37,6 +45,7 @@ results="$out/results.csv"
 echo "name,outcome,record" >"$results"
 failed=0
 lean_pid=
+rust_pid=
 
 remove_container() {
   if docker container inspect "$1" >/dev/null 2>/dev/null; then
@@ -46,6 +55,7 @@ remove_container() {
 
 cleanup() {
   if [ -n "$lean_pid" ]; then kill "$lean_pid" 2>/dev/null || true; fi
+  if [ -n "$rust_pid" ]; then kill "$rust_pid" 2>/dev/null || true; fi
   remove_container "$go_listener"
   remove_container "$redis"
   if docker network inspect "$net" >/dev/null 2>/dev/null; then
@@ -61,6 +71,18 @@ docker build -q -t "$go_image" -f "$root/vendor/go-libp2p/test-plans/PingDockerf
   "$root/vendor/go-libp2p" >/dev/null
 docker build -q -t "$slow_image" -f "$root/scripts/interop-slowreader/Dockerfile" \
   --build-context slowreader="$root/scripts/interop-slowreader" "$root/vendor/go-libp2p" >/dev/null
+
+sigp_rev=accba72bb4eafc692ac518339ef2c4080b6f8461
+have=$(git -C "$root/../p2p/sigp-rust-libp2p" rev-parse HEAD)
+if [ "$have" != "$sigp_rev" ]; then
+  echo "interop-matrix: ../p2p/sigp-rust-libp2p is at $have, want $sigp_rev" >&2
+  exit 2
+fi
+echo "building the rust peer (sigp rust-libp2p ${sigp_rev:0:7})" >&2
+CARGO_BUILD_JOBS=2 nice -n19 cargo build -q --offline --release \
+  --manifest-path "$root/scripts/transport-rust/Cargo.toml" \
+  --target-dir "$root/.tmp/transport-rust/target"
+rust="$root/.tmp/transport-rust/target/release/transport-rust"
 
 cleanup
 docker network create "$net" >/dev/null
@@ -102,8 +124,17 @@ start_go_listener() {
     -e redis_addr="$redis:6379" -e test_timeout_seconds="$timeout_s" "$go_image" >/dev/null
 }
 
+# The rust peer runs on this host and listens on loopback, which the
+# Lean dialer on this host reaches.
+start_rust_listener() {
+  # shellcheck disable=SC2046
+  env $(plan_env false "$redis_host") ip=127.0.0.1 "$rust" 2>"$out/$1.listener.log" &
+  rust_pid=$!
+}
+
 stop_listeners() {
   if [ -n "$lean_pid" ]; then kill "$lean_pid" 2>/dev/null || true; wait "$lean_pid" 2>/dev/null || true; lean_pid=; fi
+  if [ -n "$rust_pid" ]; then kill "$rust_pid" 2>/dev/null || true; wait "$rust_pid" 2>/dev/null || true; rust_pid=; fi
   remove_container "$go_listener"
 }
 
@@ -119,6 +150,11 @@ run_go_dialer() {
     >"$out/$1.json" 2>"$out/$1.dialer.log"
 }
 
+run_rust_dialer() {
+  # shellcheck disable=SC2046
+  timeout $((timeout_s + 10)) env $(plan_env true "$redis_host") "$rust" >"$out/$1.json" 2>"$out/$1.dialer.log"
+}
+
 # One CSV field: the value in double quotes, each inner quote doubled.
 csv() { local v=${1//\"/\"\"}; printf '"%s"' "$v"; }
 
@@ -126,7 +162,7 @@ csv() { local v=${1//\"/\"\"}; printf '"%s"' "$v"; }
 # then the JSON keys the output line must carry. A pass needs exit 0
 # and every key.
 record_result() {
-  local file=$1 name=$2 status=$3 line= key ok=1 outcome=success
+  local file=$1 name=$2 status=$3 line='' key ok=1 outcome=success
   shift 3
   [ "$status" = 0 ] || ok=0
   [ -s "$out/$file.json" ] && line=$(tr -d '\n' <"$out/$file.json")
@@ -141,7 +177,7 @@ record_result() {
   echo "$(csv "$name"),$outcome,$(csv "$line")" >>"$results"
 }
 
-# One cell of the matrix: $1 dialer (lean|go), $2 listener (lean|go),
+# One cell of the matrix: $1 dialer (lean|go|rust), $2 listener (lean|go|rust),
 # $3 the transport, $4 the security, $5 the muxer (the gate's stack when
 # absent).
 cell() {
@@ -159,7 +195,7 @@ cell() {
 
 # The listener's published address, once it is in Redis.
 published_addr() {
-  local addr= waited=0
+  local addr='' waited=0
   while [ -z "$addr" ] && [ "$waited" -lt $((timeout_s * 10)) ]; do
     addr=$(docker exec "$redis" redis-cli LINDEX listenerAddr 0)
     [ -n "$addr" ] || { sleep 0.1; waited=$((waited + 1)); }
@@ -184,7 +220,9 @@ silent_peer() {
   IFS=/ read -r _ _ ip _ port _ <<<"$addr"
   start=$(date +%s)
   # The client keeps its write side open, sends nothing, and reads until
-  # the listener closes the connection.
+  # the listener closes the connection. The inner shell expands $0 and
+  # $1, so the single quotes are deliberate.
+  # shellcheck disable=SC2016
   timeout $((unauth_s + 15)) bash -c 'exec 3<>"/dev/tcp/$0/$1"; cat <&3 >/dev/null' "$ip" "$port" &
   local silent=$!
   run_go_dialer "$name" || status=$?
@@ -228,6 +266,18 @@ cell go go quic-v1
 cell lean go quic-v1
 cell go lean quic-v1
 cell lean lean quic-v1
+# The rust x rust cells check the setup, as go x go does.
+cell rust rust
+cell lean rust
+cell rust lean
+cell rust rust tcp noise mplex
+cell lean rust tcp noise mplex
+cell rust lean tcp noise mplex
+cell lean rust tcp tls yamux
+cell rust lean tcp tls yamux
+cell rust rust quic-v1
+cell lean rust quic-v1
+cell rust lean quic-v1
 silent_peer
 slow_reader
 
