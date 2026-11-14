@@ -93,6 +93,8 @@ def sleep (ms : Nat) : Async Unit := do
 structure Running where
   host : Libp2p.Host.Host
   node : Node.Node
+  /-- The identify requests of `fetch`, which `stop` joins. -/
+  requests : Conc.TaskSet
 
 /-- Our host over TCP, Noise, and yamux, with identify answering our
 signed peer record over `listen`, and the gossipsub node over it. When
@@ -111,7 +113,7 @@ def start (config : Node.Config) (listen : Option String) (fetch : Bool) : Async
   let bound ← match listen with
     | some text => do pure [← orFail "listen" (← host.startListening (← addr text))]
     | none => pure []
-  -- The record names the bound address; the seq is the start time, so a
+  -- The record names the bound address. The seq is the start time, so a
   -- restart signs a newer one (RFC 0003).
   let seq ← (Clock.system.nowMs : BaseIO Nat)
   let spr ← orFail "record" (← host.signRecord bound seq)
@@ -120,12 +122,12 @@ def start (config : Node.Config) (listen : Option String) (fetch : Bool) : Async
     (if config.floodsub then [Constants.floodsubId.toString] else [])
   host.setHandler (Identify.respondHandler pub (bound.map (·.toBytes)) protocols "leanp2p-interop"
     (some (Bytes.toNatList spr)))
+  let requests ← Conc.TaskSet.new
   if fetch then
-    -- The notifiee must not park, so each request runs on its own task;
-    -- the host's close ends the stream it waits on.
-    let owner ← Conc.TaskSet.new
+    -- The notifiee must not park, so each request runs on a task of
+    -- `requests`. The host's close ends the stream it waits on.
     host.addNotifiee fun
-      | .connected peer _ _ _ => owner.spawn do
+      | .connected peer _ _ _ => requests.spawn do
           match ← Identify.request host peer Clock.system 5000 with
           | .ok () => IO.println s!"IDENTIFIED {peer}"
           | .error e => IO.eprintln s!"lean: identify {peer}: {e}"
@@ -136,16 +138,18 @@ def start (config : Node.Config) (listen : Option String) (fetch : Bool) : Async
   -- The script reads the address from a file, so it must not wait in
   -- the buffer.
   (← IO.getStdout).flush
-  return { host, node }
+  return { host, node, requests }
 
 /-- Dial a go node at its full multiaddr. -/
 def dial (running : Running) (text : String) : Async PeerId := do
   orFail s!"dial {text}" (← running.host.dial (← addr text))
 
-/-- Stop the node, then the host. -/
+/-- Stop the node, then the host. The host's close ends every identify
+request, so the join of `requests` returns. -/
 def stop (running : Running) : Async Unit := do
   running.node.stop
   running.host.close
+  running.requests.joinAll
 
 /-- Wait up to `ms` for `cond`, checking every 100 ms. -/
 def waitFor (ms : Nat) (cond : Async Bool) : Async Bool := do
@@ -177,7 +181,7 @@ def floodsubMode (target : String) : Async UInt32 := do
       s!"{t} RPC to {q}: {rpc.subscriptions.length} subs, {rpc.publish.length} msgs" |>.toBaseIO)
   let running ← start { floodsub := true, onRpc := trace, onSend := traceOut } none false
   let got : OnceRef Bool ← OnceRef.new false
-  -- The message id is the data, so each publish carries a count; a
+  -- The message id is the data, so each publish carries a count. A
   -- repeat would be a duplicate.
   let count : OnceRef Nat ← OnceRef.new 0
   let publishNext : Async Unit := do
