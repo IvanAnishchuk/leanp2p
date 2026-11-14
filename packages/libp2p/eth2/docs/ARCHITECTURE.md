@@ -6,9 +6,11 @@ the packages below it, and it runs them as one service. The client keeps
 the chain. It answers the gossip validations and the block and column
 requests, and it reads the events.
 
-The spec text is consensus-specs `v1.7.0-beta.4`, the `p2p-interface.md`
-of phase0, altair, deneb, and fulu, and fulu `beacon-chain.md` for the
-fork digest. Every wire value the package uses is the same in
+The spec text is the vendored consensus-specs (`vendor/consensus-specs`,
+pinned at `0216d01` in `VECTORS.lock`): the `p2p-interface.md` of every
+fork to fulu, fulu `beacon-chain.md` for the fork digest, and fulu
+`das-core.md` for the column sidecar. Each of those files equals its
+`v1.7.0-beta.4` copy. Every wire value the package uses is the same in
 `v1.7.0-alpha.11`, the pin of etheorem and of the shadow node. The
 differences between the two are the order of the validation rules,
 the type names, and the partial-column format, and none of them reaches

@@ -233,7 +233,7 @@ private def serviceChecks (r : Runner) : Async Unit := do
   a.stop
 
 def run (r : Runner) : IO Unit := do
-  r.section "eth2" "consensus-specs v1.7.0-beta.4 p2p-interface.md (phase0, altair, fulu), fulu beacon-chain.md"
+  r.section "eth2" "vendor/consensus-specs: specs/*/p2p-interface.md to fulu, fulu beacon-chain.md"
   chainChecks r
   messageIdChecks r
   messageChecks r
