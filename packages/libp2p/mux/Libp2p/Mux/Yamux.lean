@@ -43,9 +43,9 @@ private def mapOpenError (e : Streams.Error) : Error :=
   | .timeout => .timeout detail
 
 /-- A yamux muxer with the host's keepalive policy: the interval in
-milliseconds, or `none` for no keepalive. The policy rides in the
-muxer value the host's `Config.muxers` lists, so the `Muxer` seam keeps
-its shape (OCP; etheorem/leanp2p#93 asked for a seam change). -/
+milliseconds, or `none` for no keepalive. The muxer value in the host's
+`Config.muxers` carries the policy, so the `Muxer` seam keeps its shape
+(OCP). etheorem/leanp2p#93 asked for a seam change. -/
 def yamuxWith (keepalive : Option Nat) : Muxer where
   id := yamuxId
   «open» := fun role connection leftover clock => ExceptT.mk do

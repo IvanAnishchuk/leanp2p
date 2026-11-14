@@ -57,7 +57,7 @@ private def topicScore : Score.TopicParams :=
     invalidMessageDeliveriesWeight := -1
     invalidMessageDeliveriesDecay := scoreScale }
 
-/-- Topic `t` requests partial messages; topic `u` takes full messages.
+/-- Topic `t` requests partial messages, and topic `u` takes full messages.
 A mesh of one, so a heartbeat leaves the other peers for gossip. -/
 private def params : Params :=
   { defaults with
@@ -71,7 +71,7 @@ private def params : Params :=
 private def peerRec : PeerData :=
   { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }
 
-/-- Three peers on topic `t`; the mesh holds `pb`. -/
+/-- Three peers on topic `t`. The mesh holds `pb`. -/
 private def start : State :=
   { peers := [(pa, peerRec), (pb, peerRec), (pc, peerRec)]
     mesh := [(ta, [pb])]
@@ -92,7 +92,7 @@ private def rpcOf (r : Rpc.RPC) : List Nat := Pb.encodeMessage r
 
 private def emptyRpc : Rpc.RPC := { subscriptions := [], publish := [], control := none }
 
-/-- `pa` requests partial messages on `t`; `pc` only supports them. -/
+/-- `pa` requests partial messages on `t`, and `pc` only supports them. -/
 private def subsRpc (requests supports : Bool) : Rpc.RPC :=
   { emptyRpc with subscriptions :=
       [{ subscribe := true, topicid := "t", requestsPartial := requests,
@@ -189,11 +189,11 @@ def run (r : Runner) : IO Unit := do
   let s1 := stateOf (step params s1 (.rpc pc (rpcOf (subsRpc false true))))
   r.check "core: a request implies support"
     (peerPartial s1 pa ta == { requests := true, supports := true })
-  r.check "core: support alone is recorded"
+  r.check "core: the core records support alone"
     (peerPartial s1 pc ta == { requests := false, supports := true })
   let unsub : Rpc.RPC := { emptyRpc with subscriptions :=
     [{ subscribe := false, topicid := "t", requestsPartial := true }] }
-  r.check "core: an unsubscribe drops the choice, and its flags are ignored"
+  r.check "core: an unsubscribe drops the choice, and the core ignores its flags"
     (peerPartial (stateOf (step params s1 (.rpc pc (rpcOf unsub)))) pc ta == {})
 
   -- A full message goes to the mesh, and to no peer that takes partial
@@ -234,13 +234,13 @@ def run (r : Runner) : IO Unit := do
   let (sBad, aBad) := match step params s1 (.rpc pc (rpcOf wrong)) with
     | .ok r => r
     | .error _ => (s1, [])
-  r.check "core: unrequested data is dropped" aBad.isEmpty
+  r.check "core: the core drops unrequested data" aBad.isEmpty
   r.check "core: unrequested data costs one P₇ penalty" (penalty sBad pc == 1)
 
   -- The Extensions message belongs in the first RPC, once.
   let extRpc : Rpc.RPC := { emptyRpc with control := some ctl }
   let e1 := stateOf (step params start (.rpc pb (rpcOf extRpc)))
-  r.check "core: the first RPC's extensions are recorded"
+  r.check "core: the core records the first RPC's extensions"
     (((peerOf e1 pb).bind (·.extensions)) == some ext && penalty e1 pb == 0)
   let e2 := stateOf (step params e1 (.rpc pb (rpcOf extRpc)))
   r.check "core: a second Extensions message costs a P₇ penalty" (penalty e2 pb == 1)

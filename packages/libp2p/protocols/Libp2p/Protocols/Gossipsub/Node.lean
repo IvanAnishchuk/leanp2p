@@ -33,8 +33,8 @@ and linear copying.
 The task set of the node owns the loop, alarm, writer and connector tasks.
 Stop joins them. The host owns the handler tasks of the inbound streams.
 Nothing cancels a task: `stop` closes the two input queues, and the close
-wakes the parked loop. It closes the peer-exchange queue too, which wakes the
-parked connectors; a connector inside a dial ends with the dial. The
+wakes the parked loop. It also closes the peer-exchange queue, which wakes the
+parked connectors. A connector inside a dial ends with the dial. The
 router state and pending gossip are local to the loop. Shared registries,
 subscriptions and the closing flag change through OnceRef.update or
 updateGet (root ARCHITECTURE §4.1). Only the first stop caller joins.
@@ -107,17 +107,18 @@ updateGet (root ARCHITECTURE §4.1). Only the first stop caller joins.
   live inbound stream. Retirement checks the writer id, so an old writer
   cannot remove a newer entry for the same peer.
 - **The shell holds the signed peer records.** The core names the
-  peer-exchange peers by id (`Core.pxPeers`); the send path adds each
-  record the host holds (`fillRecords`), so the core stays free of
-  signatures and IO. On the way in, `pxConnect` checks each record
-  through the host and queues the peer for one of `Config.connectors`
-  dial tasks, in a queue of `Config.maxPendingConnections`. go-libp2p-pubsub
-  splits the work the same way (`pxConnect`, `connector`).
-- **A floodsub peer is marked after its join.** The host announces a
-  connection before any stream negotiates, so the join records
+  peer-exchange peers by id (`Core.pxPeers`). The send path adds each
+  record that the host holds (`fillRecords`), so the core stays free of
+  signatures and IO. For an inbound PX, `pxConnect` checks each record
+  through the host. Then it queues the peer for one of
+  `Config.connectors` dial tasks, in a queue of
+  `Config.maxPendingConnections`. go-libp2p-pubsub splits the work in
+  the same way (`pxConnect`, `connector`).
+- **The node marks a floodsub peer after its join.** The host announces
+  a connection before any stream negotiates, so the join records
   `meshsub`. The stream that negotiates `/floodsub/1.0.0`, ours or the
-  peer's, then posts `Core.Event.protocol`, and the router takes the
-  peer out of every mesh.
+  peer's, then posts `Core.Event.protocol`. The router removes the peer
+  from every mesh.
 -/
 
 set_option autoImplicit false
@@ -177,12 +178,12 @@ structure Config where
   of a payload on a topic. When set, the node keeps every payload as a
   `ByteArray` and the core sees only its id, so a block-sized message
   never becomes a `List Nat`. The node then sets `params.msgId` to read
-  the handle, and checks `params.maxDataSize` itself: an RPC with an
-  oversize payload is dropped whole, with no P₄ penalty. `onValidate`
-  gets the message with its handle in `data`; `Node.payload` reads the
+  the handle, and checks `params.maxDataSize` itself. It drops an RPC
+  with an oversize payload whole, with no P₄ penalty. `onValidate` gets
+  the message with its handle in `data`, and `Node.payload` reads the
   bytes. -/
   payloadId : Option (String → ByteArray → MessageId) := none
-  /-- The heartbeats between opportunistic grafting rounds; rust's
+  /-- The heartbeats between opportunistic grafting rounds. rust's
   `opportunistic_graft_ticks` is 60. -/
   opportunisticGraftTicks : Nat := 60
   /-- Called for each partial message a peer sends on a topic where
@@ -200,8 +201,8 @@ structure Config where
   onPartialGossip : TopicId → List Peer → BaseIO Unit := fun _ _ => pure ()
   /-- Serve and speak `/floodsub/1.0.0` (pubsub `README.md`): the
   handler takes floodsub streams, and our writer proposes floodsub last.
-  go-libp2p-pubsub and Lodestar speak it; rust-libp2p, and so
-  Lighthouse, leave it off by default, and so does this node. -/
+  go-libp2p-pubsub and Lodestar speak it. rust-libp2p, and so
+  Lighthouse, disable it by default, and so does this node. -/
   floodsub : Bool := false
   /-- The dials a peer exchange may queue: go's `MaxPendingConnections`,
   128. A full queue drops the peer, as go's `pxConnect` does. -/
@@ -274,8 +275,8 @@ structure Node where
   or its queue is full. -/
   stats : Conc.Async (Option Stats)
   /-- The payload of a message id on the `ByteArray` path
-  (`Config.payloadId`); `none` off that path, or once it expired with
-  the message cache. -/
+  (`Config.payloadId`). The answer is `none` off that path, and once the
+  payload expired with the message cache. -/
   payload : MessageId → BaseIO (Option ByteArray)
   /-- Send a partial message to a peer. The router sends the whole
   message to a peer that requested partial messages on the topic, the
@@ -286,10 +287,10 @@ structure Node where
   data (a first delivery), `false` for bad data (an invalid delivery).
   `false` under the same conditions as `publish`. -/
   judgePartial : Peer → TopicId → Bool → BaseIO Bool
-  /-- The peers to offer partial messages on a topic: the mesh, or the
-  fanout off a subscribed topic, that can take partial messages, each
-  with its request flag. `none` when the node stopped or its queue is
-  full. -/
+  /-- The peers to offer partial messages on a topic, each with its
+  request flag. They are the peers that can take partial messages: of
+  the mesh for a subscribed topic, or of the fanout for another topic.
+  `none` when the node stopped or its queue is full. -/
   partialPeers : TopicId → Conc.Async (Option (List (Peer × Bool)))
   /-- Close the two input queues and join the loop task. The loop serves
   the queued inputs first, and drops the gossip that waits for its time. This
@@ -326,8 +327,8 @@ inductive Input where
   /-- Read the router: the loop calls `k` with its parameters and state.
   `k` must not park. -/
   | inspect (k : Core.Params → Core.State → BaseIO Unit)
-  /-- Replace the score parameters of one topic; `none` scores the topic
-  no more. -/
+  /-- Replace the score parameters of one topic. With `none`, the router
+  stops the scoring of the topic. -/
   | setTopicParams (topic : TopicId) (tp : Option Score.TopicParams)
 
 /-- One peer's bounded writer queue and its currently open stream. -/
@@ -359,8 +360,8 @@ private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
     -- The newest first: a peer answers `na` to an id it lacks, and the
-    -- negotiation falls back to v1.2, then v1.1, then floodsub when the
-    -- node speaks it (go's `GossipSubDefaultProtocols` order).
+    -- negotiation tries v1.2, then v1.1, then floodsub when the node
+    -- speaks it (go's `GossipSubDefaultProtocols` order).
     let ids := [Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId] ++
       (if floodsub then [Constants.floodsubId] else [])
     match ← host.newStream peer ids with
@@ -405,8 +406,8 @@ private def readFrames (events : Conc.Chan Input) (cap : Nat)
   repeat
     if let some size := expected then
       if cursor = size then
-        -- On the payload path the core gets the RPC with handles; an
-        -- RPC the split refuses is dropped.
+        -- On the payload path, the core gets the RPC with handles. The
+        -- reader drops an RPC that the split refuses.
         if let some small ← (split body : BaseIO (Option ByteArray)) then
           -- Park: the loop frees a slot, or stop closes the event queue.
           if let .error _ ← events.send (.event (.rpc peer (Bytes.toNatList small))) then
@@ -531,8 +532,8 @@ private structure Env where
   closing : Conc.OnceRef Bool
   /-- Frames refused by a full or closed outbound queue. -/
   drops : Conc.OnceRef Nat
-  /-- The peers whose meshsub negotiation failed; cleared by their next
-  `connected`. -/
+  /-- The peers whose meshsub negotiation failed. The next `connected` of
+  a peer removes it. -/
   unsupported : Conc.OnceRef (List Peer)
   /-- The meshsub version each peer negotiated, from our writer's open
   or from the handler that served its stream. -/
@@ -542,8 +543,8 @@ private structure Env where
   payloads : Conc.OnceRef (Std.HashMap MessageId (ByteArray × Millis))
   /-- The peers that got our Extensions message since they joined. The
   message goes once per peer, in the first frame we send it
-  (`gossipsub-v1.3.md`); a writer that reopens its stream sends none,
-  as rust-libp2p sends it once per peer (`behaviour.rs`,
+  (`gossipsub-v1.3.md`). A writer that opens its stream again sends
+  none, as rust-libp2p sends it once per peer (`behaviour.rs`,
   `handle_established_*_connection`). `removePeer` clears the entry. -/
   extSent : Conc.OnceRef (List Peer)
   /-- The peer-exchange peers that wait for a connector. `stop` closes
@@ -554,9 +555,9 @@ private structure Env where
 A full queue drops its frame. Each peer has one writer and one stream. -/
 private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Bool := do
   if ← env.closing.get then return true
-  -- IDONTWANT goes to a v1.2 or v1.3 peer only (`gossipsub-v1.2.md`);
-  -- for any other peer, and before the version is known, the control
-  -- drops it.
+  -- IDONTWANT goes to a v1.2 or v1.3 peer only (`gossipsub-v1.2.md`).
+  -- For any other peer, and while the version is unknown, the control
+  -- message goes without it.
   let version := (← env.versions.get).lookup peer
   let v12 := version == some Constants.meshsubV12Id || version == some Constants.meshsubV13Id
   let rpc := match rpc0.control with
@@ -606,7 +607,8 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
         else none)
     else pure ((Rpc.encodeFrame? rpc env.config.maxRpcSize).map Bytes.ofNatList)
   let some frame := frame? | do
-    -- The frame is dropped; the next one takes the Extensions message.
+    -- The node drops the frame. The next one takes the Extensions
+    -- message.
     if first then env.extSent.update (·.filter (· != peer))
     return false
   if ← env.closing.get then
@@ -618,8 +620,7 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
 /-- Encode and offer one RPC to a peer's queue (`enqueueFrame`). The
 core sends at most one message per RPC (`forwardPubs`, `handleIwant`,
 `publishLocal`), so an RPC over the cap holds one message too large on
-its own: it is dropped and counted in `Node.dropped`, never lost
-unseen. -/
+its own. The node drops it and counts it in `Node.dropped`. -/
 private def enqueue (env : Env) (peer : Peer) (rpc : Rpc.RPC) : BaseIO Unit := do
   if !(← enqueueFrame env peer rpc) then env.drops.update (· + 1)
 
@@ -686,10 +687,11 @@ private def fillRecords (env : Env) (rpc : Rpc.RPC) : BaseIO Rpc.RPC := do
     pure { q with peers }
   return { rpc with control := some { c with prune } }
 
-/-- Handle the peers a prune offered (`Core.Action.pxConnect`): a peer
-whose signed record fails the check is skipped, as go's `pxConnect`
-skips it; a valid record's addresses enter the peerstore. Each peer then
-waits for a connector in the bounded queue; a full queue drops it. -/
+/-- Handle the peers a prune offered (`Core.Action.pxConnect`). The node
+skips a peer whose signed record fails the check, as go's `pxConnect`
+does. The addresses of a valid record enter the peerstore. Each peer
+then waits for a connector in the bounded queue, and a full queue drops
+it. -/
 private def pxConnect (env : Env) (infos : List Rpc.PeerInfo) : BaseIO Unit := do
   for info in infos do
     let some pid := infoPeer? info | continue
@@ -805,9 +807,9 @@ private def stepAndAct (env : Env) (st : LoopState) (event : Core.Event) : BaseI
 private def dueOf (st : LoopState) : Millis :=
   st.pending.foldl (fun due p => Nat.min due p.due) st.nextTick
 
-/-- Bring the router's peers in line with the host's live peers, less
-the peers that speak no meshsub. A `peerJoined` or `peerLeft` lost to a
-full queue, or to the race at start, heals here. -/
+/-- Make the router's peers equal to the host's live peers, less the
+peers that speak no meshsub. A full queue or the race at start can lose
+a `peerJoined` or a `peerLeft`, and this step corrects it. -/
 private def reconcile (env : Env) (st : LoopState) : BaseIO LoopState := do
   let some livePeers := env.host.peers | return st
   let live ← livePeers
@@ -966,7 +968,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     | none => false
   -- The inbound split of the payload path (`Payload.splitInbound`). An RPC
   -- that does not split goes to the core as it came, and the core's
-  -- decoder reports it. An RPC with an oversize payload is dropped.
+  -- decoder reports it. The split drops an RPC with an oversize payload.
   let split : ByteArray → BaseIO (Option ByteArray) := fun body => do
     match config.payloadId with
     | none => return some body
@@ -979,7 +981,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
         payloads.update fun m =>
           ps.foldl (fun m (id, d) => if m.contains id then m else m.insert id (d, t)) m
         return some small
-  -- Every version is served; the handler's id tells the peer's choice.
+  -- The node serves every version. The handler's id tells the peer's
+  -- choice.
   host.setHandler (handler events config.maxRpcSize Constants.meshsubV13Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubId record split)
@@ -1014,8 +1017,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     if ← closing.get then return false
     control.trySend (.event e)
   -- The host's sessions reach the router here. `current` holds the
-  -- session number of each peer's last `connected`, so a stale
-  -- `disconnected` of a replaced session is dropped (`Host.ConnEvent`).
+  -- session number of each peer's last `connected`, so the notifiee
+  -- drops a stale `disconnected` of a replaced session (`Host.ConnEvent`).
   let current ← Conc.OnceRef.new ([] : List (Peer × Nat))
   host.addNotifiee fun
     | .connected peer session role remoteAddr => do
@@ -1037,7 +1040,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       discard <| post (.peerJoined peer .meshsub)
   return {
     -- "MUST NOT emit" a message over the cap (phase0 "Maximum message
-    -- sizes"): an oversize payload is refused here.
+    -- sizes"): `publish` refuses an oversize payload here.
     publish := fun topic payload =>
       match config.payloadId with
       | some idOf =>

@@ -6,14 +6,14 @@ import Libp2p.Identity
 
 The six messages a consensus node uses (devp2p `discv5-wire.md`,
 "Protocol Messages"): PING, PONG, FINDNODE, NODES, TALKREQ, TALKRESP.
-The topic messages (REGTOPIC to TOPICNODES) are left out: the consensus
-spec finds subnet peers through the record's `attnets` and `syncnets`
-(phase0 `p2p-interface.md`, "How are we going to discover peers in a
-gossipsub topic?").
+The module leaves out the topic messages (REGTOPIC to TOPICNODES). The
+consensus spec finds subnet peers through the record's `attnets` and
+`syncnets` (phase0 `p2p-interface.md`, "How are we going to discover
+peers in a gossipsub topic?").
 
-Each message is `message-type ‖ RLP(message-data)`, and every
+Each message is `message-type ‖ RLP(message-data)`. Every
 `message-data` list starts with the request id, an RLP byte array of at
-most 8 bytes, which a response mirrors.
+most 8 bytes. A response mirrors the request id.
 
 ## The model and the production path
 
@@ -24,12 +24,16 @@ behind one conversion each way, so the two views cannot drift
 (CLAUDE.md, "Proofs and tests", rule 2).
 
 The round trip is a theorem for each message a node builds itself:
-`decodeModel? (encodeModel m) = some m` when `m` is well formed
-(`WellFormed`: a request id of at most 8 bytes, every byte below 256,
-each number within its field's width, and payloads that fit a packet).
-NODES is the exception: its records decode through `Enr.decode?`, which
-verifies a secp256k1 signature over the FFI, so its round trip is
-checked by the wire vectors and the suite (rule 3).
+`decodeModel? (encodeModel m) = some m` when `m` is well formed. A
+well-formed message (`WellFormed`) has:
+- a request id of at most 8 bytes
+- every byte below 256
+- each number within its field's width
+- payloads that fit a packet
+
+NODES is the exception. Its records decode through `Enr.decode?`, which
+verifies a secp256k1 signature over the FFI. So the wire vectors and the
+suite check its round trip (rule 3).
 -/
 
 set_option autoImplicit false
@@ -60,7 +64,7 @@ namespace Message
 def requestId : Message → List Nat
   | .ping r _ | .pong r _ _ _ | .findNode r _ | .nodes r _ _ | .talkReq r _ _ | .talkResp r _ => r
 
-/-- True for a request; a response answers one. -/
+/-- True for a request. A response answers a request. -/
 def isRequest : Message → Bool
   | .ping .. | .findNode .. | .talkReq .. => true
   | _ => false
@@ -74,7 +78,7 @@ def body : Message → Nat × Rlp.Item
   | .pong r seq ip port => (0x02, .list [.bytes r, scalar seq, .bytes ip, scalar port])
   | .findNode r ds => (0x03, .list [.bytes r, .list (ds.map scalar)])
   | .nodes r total rs =>
-    -- A record is an RLP list on the wire; its encoding is that list.
+    -- A record is an RLP list on the wire, and its encoding is that list.
     let items := rs.filterMap fun e =>
       match Rlp.decode? (toNatList (Enr.encode e)) with
       | .ok (v, []) => some v.item
@@ -135,10 +139,12 @@ def decode? (pt : ByteArray) : Option Message := decodeModel? (toNatList pt)
 /-! ## The round trip -/
 
 /-- The messages whose round trip is a theorem, and the bounds each
-field needs. Every byte list holds bytes. The request id has at most 8
-bytes; `seq` and `total` fit 8 bytes and the ports and distances 2; an
-IP address has 4 or 16 bytes; the TALK payloads and the distance list
-fit a 1280-byte packet. -/
+field needs:
+- Every byte list holds bytes.
+- The request id has at most 8 bytes.
+- `seq` and `total` fit 8 bytes, and the ports and distances fit 2.
+- An IP address has 4 or 16 bytes.
+- The TALK payloads and the distance list fit a 1280-byte packet. -/
 def WellFormed : Message → Prop
   | .ping r seq => r.length ≤ 8 ∧ (∀ b ∈ r, b < 256) ∧ seq < 256 ^ 8
   | .pong r seq ip port =>

@@ -265,8 +265,8 @@ private opaque secp256k1EcdhRaw (scalar : @& ByteArray) (point : @& ByteArray) :
 
 /-- The discv5 `v4` ECDH secret: the 33-byte compressed point
 `point * scalar` (devp2p `discv5-theory.md`, "Identity-Specific
-Cryptography in the Handshake"). `invalidKey` for a scalar of zero or
-not below the order, or a point off the curve. -/
+Cryptography in the Handshake"). The answer is `invalidKey` for a
+scalar of zero or not below the order, and for a point off the curve. -/
 def secp256k1Ecdh (scalar : Key32) (point : ByteArray) : Except CryptoError ByteArray :=
   liftShim .invalidKey (secp256k1EcdhRaw scalar.bytes point)
 

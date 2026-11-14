@@ -154,14 +154,15 @@ def Enr.run (r : Runner) : IO Unit := do
           (drec.multiaddrs.map bytesOfAddrs))
       r.check "dual stack: the multiaddrs map back to the address pairs"
         (succeedsWith drec.addressPairs (drec.multiaddrs >>= Enr.pairsOfMultiaddrs))
-    -- The consensus profile of a record (phase0 "ENR structure"): `udp`
-    -- is discv5's, so it gives no dial address; `quic` gives
-    -- `/udp/<quic>/quic-v1`, QUIC first; a zero `tcp6` gives none.
-    -- `quic-v1` is multicodec 0x01cd; 0x01cc is the draft `quic`.
+    -- The consensus profile of a record (phase0 "ENR structure"):
+    -- - `udp` is discv5's, so it gives no dial address.
+    -- - `quic` gives `/udp/<quic>/quic-v1`, and QUIC comes first.
+    -- - A zero `tcp6` gives no address.
+    -- `quic-v1` is multicodec 0x01cd, and 0x01cc is the draft `quic`.
     let quicV1 : List Nat := [0xcd, 0x03]
     -- The consensus keys carry no IPv6 fallback (phase0 "ENR structure":
-    -- `quic` is the IPv4 port, `quic6` the IPv6 one), so `ip6` gets an
-    -- address only from `quic6` and `tcp6`; a zero `tcp6` gives none.
+    -- `quic` is the IPv4 port, `quic6` the IPv6 one). So `ip6` gets an
+    -- address only from `quic6` and `tcp6`.
     let consensus : List Enr.Pair := [⟨.ip, .bytes [1, 2, 3, 4]⟩, ⟨.ip6, .bytes v6⟩,
       ⟨Enr.quicKey, .bytes (Rlp.ofScalar 9002)⟩, ⟨Enr.quic6Key, .bytes (Rlp.ofScalar 9003)⟩,
       ⟨.tcp, .bytes (Rlp.ofScalar 9000)⟩, ⟨.tcp6, .bytes []⟩, ⟨.udp, .bytes (Rlp.ofScalar 9001)⟩]

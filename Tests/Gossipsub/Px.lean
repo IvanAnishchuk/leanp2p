@@ -5,24 +5,24 @@ import Libp2p.Protocols.Gossipsub.Core
 /-!
 # Gossipsub suite: peer exchange and floodsub peers
 
-The core half of the two features; `scripts/pubsub-interop.sh` runs the
-node half against go-libp2p-pubsub.
+This suite checks the core half of the two features.
+`scripts/pubsub-interop.sh` runs the node half against go-libp2p-pubsub.
 
 Peer exchange follows `gossipsub-v1.1.md`, "PRUNE Backoff and Peer
 Exchange", and go-libp2p-pubsub's `makePrune` and `handlePrune`:
 
-* a GRAFT into a full mesh is pruned with the other peers of the topic,
-  when `doPX` is on, and with none when it is off;
-* the prune names no peer to a target below score 0, and no peer below
-  score 0;
-* an unsubscribe prunes with the peer exchange too;
-* a received prune's peers become one `pxConnect` when the sender's
-  score is not below `acceptPXThreshold`, the topic is ours, and the
-  peer is new; `prunePeers` caps them.
+* The prune of a GRAFT into a full mesh names the other peers of the
+  topic when `doPX` is set, and no peer when it is not.
+* The prune names no peer to a target below score 0, and no peer below
+  score 0.
+* An unsubscribe prunes with the peer exchange too.
+* A received prune's peers become one `pxConnect` when three conditions
+  hold: the sender's score is at or above `acceptPXThreshold`, the topic
+  is ours, and the peer is new. `prunePeers` caps them.
 
-Floodsub peers follow go-libp2p-pubsub's `rpcs`: they get our messages
-and our forwards, never a GRAFT or an IHAVE, and a `protocol` event
-takes a peer out of the mesh.
+Floodsub peers follow go-libp2p-pubsub's `rpcs`. They get our messages
+and our forwards, and never a GRAFT or an IHAVE. A `protocol` event
+removes a peer from the mesh.
 -/
 
 set_option autoImplicit false
@@ -142,7 +142,8 @@ def run (r : Runner) : IO Unit := do
   let (_, actsCap) := stepOf { params with prunePeers := 1 } start
     (.rpc pc (Pb.encodeMessage (graftOf ta)))
   r.check "px.send.cap" ((pxTo pc actsCap).length == 1)
-  -- A peer below score 0 is not offered, and a target below 0 gets none.
+  -- The prune offers no peer below score 0, and a target below 0 gets no
+  -- peer.
   let negD := withScore start pd (-5)
   let (_, actsNeg) := stepOf params negD (.rpc pc (Pb.encodeMessage (graftOf ta)))
   r.check "px.send.skips-negative"
@@ -155,11 +156,11 @@ def run (r : Runner) : IO Unit := do
 
   /- ## Accepting -/
   let px := [infoOf pe, infoOf pc]
-  -- A score at the threshold 0 is accepted ("below this threshold is
-  -- ignored"); `pc` is known, so only `pe` remains.
+  -- The core accepts a score at the threshold 0 ("below this threshold
+  -- is ignored"). `pc` is known, so only `pe` remains.
   let (_, a0) := stepOf params start (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
   r.check "px.accept.at-threshold" (connects a0 == [(pa, [infoOf pe])])
-  -- A score below it is ignored.
+  -- The core ignores a score below it.
   let (_, aLow) := stepOf params (withScore start pa (-1)) (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
   r.check "px.accept.below-threshold" (connects aLow).isEmpty
   let lifted := withScore start pa 1
@@ -168,7 +169,7 @@ def run (r : Runner) : IO Unit := do
   -- A prune of a topic we did not join brings nothing.
   let (_, a2) := stepOf params lifted (.rpc pa (Pb.encodeMessage (pruneOf tb px)))
   r.check "px.accept.unknown-topic" (connects a2).isEmpty
-  -- An entry whose peer id does not decode is dropped.
+  -- The core drops an entry whose peer id does not decode.
   let (_, a3) := stepOf params lifted
     (.rpc pa (Pb.encodeMessage (pruneOf ta [{ peerId := some [1, 2, 3], signedPeerRecord := none }])))
   r.check "px.accept.bad-id" (connects a3).isEmpty
@@ -177,7 +178,7 @@ def run (r : Runner) : IO Unit := do
   let (_, a4) := stepOf { params with prunePeers := 2 } lifted
     (.rpc pa (Pb.encodeMessage (pruneOf ta many)))
   r.check "px.accept.cap" ((connects a4).map (·.2.length) == [2])
-  -- The prune still leaves the mesh.
+  -- The prune still removes `pa` from the mesh.
   let (s5, _) := stepOf params lifted (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
   r.check "px.accept.prunes-mesh" (!memB pa (meshOf s5 ta))
 
@@ -194,7 +195,7 @@ def run (r : Runner) : IO Unit := do
   let thin : State := { flood with mesh := [(ta, [])] }
   let (st, aTick) := stepOf params thin (.tick 1000 [pe, pc, pd])
   r.check "flood.never-meshed" (!memB pe (meshOf st ta) && (sentTo pe aTick).isEmpty)
-  -- A `protocol` event takes a mesh peer out of the mesh.
+  -- A `protocol` event removes a mesh peer from the mesh.
   let (sp, _) := stepOf params start (.protocol pa .floodsub)
   r.check "flood.protocol-leaves-mesh" (!memB pa (meshOf sp ta) && isFlood sp pa)
   -- The prune names no floodsub peer.

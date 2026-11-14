@@ -29,10 +29,10 @@ ARCHITECTURE, contract 4):
    sessions it gave, which share its socket; stage 4 closed them.
 
 After the joins, `close` empties the handler table and the notifiee
-list. A closed host serves no stream and raises no event, so neither is
-read again. A handler or notifiee often holds its own host, as
+list. A closed host serves no stream and raises no event, so nothing
+reads the two again. A handler or notifiee often holds its own host, as
 `Identify.pushHandler h` does, and the host holds it in turn. Reference
-counting frees no such cycle, so without this step the host, its
+counting frees no such cycle. Without this step, the host, its
 sessions, and everything they reach would stay allocated until exit
 (#102).
 
@@ -119,8 +119,8 @@ def close (h : Host) (onStage : Stage → BaseIO Unit := fun _ => pure ()) : Asy
   for l in securedListeners do
     listenerFault := listenerFault <|> (← capture l.join)
 
-  -- Every task that reads the tables has been joined; break the cycles
-  -- through closures that hold the host (module doc).
+  -- The joins above took every task that reads the tables. Break the
+  -- cycles through closures that hold the host (module doc).
   (h.handlers.set {} : BaseIO Unit)
   (h.notifiees.set [] : BaseIO Unit)
 

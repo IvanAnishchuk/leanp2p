@@ -127,7 +127,7 @@ vendor verify included.
 - relay and circuit, DCUtR, AUTONAT
 - WebSockets, WebRTC, pnet, libp2p-HTTP
 - peer records and signed envelopes (built on `experiment/client` for
-  gossipsub's peer exchange; the identity package docs, unit 3)
+  gossipsub's peer exchange, in unit 3 of the identity package docs)
 
 Each item must keep compiling against its seam. None may block a P0 or
 P1 unit.

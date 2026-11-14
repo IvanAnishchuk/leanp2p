@@ -8,16 +8,16 @@
 # replaces the modules with), with the host Go toolchain on two cores.
 # The Lean side is the `pubsub-interop` executable (Tests/Interop/Pubsub).
 #
-# 1. record: go consumes our signed peer record, and we open go's (the
-#    byte vector of Tests/Record.lean is go's; this rerun checks the
-#    other direction).
-# 2. floodsub: a go floodsub-only node and our node with floodsub on
+# 1. record: go consumes our signed peer record. The byte vector of
+#    Tests/Record.lean is go's record, which we open, so this run checks
+#    the other direction.
+# 2. floodsub: a go floodsub-only node and our node with floodsub set
 #    exchange one message each way.
 # 3. px-accept: go node G runs gossipsub with peer exchange and a mesh
-#    bound of two, and H1 and H2 fill its mesh. We join; G prunes our
+#    bound of two, and H1 and H2 fill its mesh. We join. G prunes our
 #    GRAFT with H1 and H2 and their records. We pass when we connect to
 #    one of them.
-# 4. px-send: we run with peer exchange and a mesh bound of two; go nodes
+# 4. px-send: we run with peer exchange and a mesh bound of two. go nodes
 #    A1 and A2 fill our mesh, then A3 joins. Our prune of A3 names A1 and
 #    A2 with their records, and A3 passes when it connects to one of them.
 # 5. partial requester: a go node that requests partial messages (v1.3)
@@ -64,9 +64,9 @@ fi
 [[ -x "$lean" ]] || { echo "pubsub-interop: build pubsub-interop first" >&2; exit 2; }
 
 # Start a go node in the background with its output in $out/$1.out, and
-# wait for its ADDR line; sets `addr` and `pid`. It runs in this shell,
-# not in a command substitution, so `pids` keeps the process for the
-# cleanup.
+# wait for its ADDR line. The function sets `addr` and `pid`. It runs in
+# this shell, outside a command substitution, so `pids` keeps the
+# process for the cleanup.
 go_node() {
   local name=$1
   shift

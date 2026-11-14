@@ -3,14 +3,15 @@
 //!
 //! `query <port> <enr>`: start a node on 127.0.0.1:<port>, then PING the
 //! target, FINDNODE it at distance 0, and TALKREQ its `echo` protocol.
-//! Prints one line per answer and exits 0 when all three came back right.
+//! Print one line per answer, and exit 0 when all three answers are
+//! correct.
 //!
 //! `serve <port> <seconds>`: start a node on 127.0.0.1:<port>, print
-//! `ENR <text>`, answer TALKREQ `echo` with the request (any other
-//! protocol empty), and serve for <seconds>.
+//! `ENR <text>`, and serve for <seconds>. The node answers TALKREQ `echo`
+//! with the request, and any other protocol with an empty answer.
 
-use enr::{CombinedKey, Enr};
 use discv5::{ConfigBuilder, Discv5, Event, ListenConfig};
+use enr::{CombinedKey, Enr};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -25,7 +26,11 @@ async fn node(port: u16) -> Discv5 {
     builder.ip4(Ipv4Addr::LOCALHOST);
     builder.udp4(port);
     let enr = builder.build(&key).expect("enr");
-    let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip: Ipv4Addr::LOCALHOST, port }).build();
+    let config = ConfigBuilder::new(ListenConfig::Ipv4 {
+        ip: Ipv4Addr::LOCALHOST,
+        port,
+    })
+    .build();
     let mut d = Discv5::new(enr, key, config).expect("discv5");
     d.start().await.expect("start");
     d
@@ -62,7 +67,8 @@ async fn main() {
                     ok = false
                 }
             }
-            let contact = discv5::NodeContact::try_from_enr(target.clone(), d.ip_mode()).expect("contact");
+            let contact =
+                discv5::NodeContact::try_from_enr(target.clone(), d.ip_mode()).expect("contact");
             match d.talk_req(contact, b"echo".to_vec(), vec![1, 2, 3]).await {
                 Ok(resp) => {
                     println!("TALKRESP {resp:?}");

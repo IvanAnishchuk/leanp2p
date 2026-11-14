@@ -17,7 +17,7 @@ import lint is green.
 | 0 | none | this documentation pair, the first work unit of the package (ARCHITECTURE §2) | written, and consistent with the root docs |
 | 1 | W2.2, W2.3, W3.3 | root W5.1: `KeyType`, `PubKey`/`PrivKey` with the `ProtoMessage` instances, the per-type marshalings, the strict unmarshal, and `PeerId` | the unit 1 milestones below pass, and the root W5.1 row holds |
 | 2 | W5.1, W3.2 | root W6.1: the package's own RLP behind its `Codec` surface (ARCHITECTURE, "The RLP is the package's own"), the ENR record with its `v4` signature over the keccak-256 digest, and the peer-id/multiaddr mapping | the unit 2 milestones below pass, and the root W6.1 row holds |
-| 3 | W5.1 | signed envelopes and peer records (RFC 0002, RFC 0003): the wire model with its theorems, sign, and the checked open; the spike adds it for gossipsub's peer exchange | the unit 3 milestones below pass, and go-libp2p consumes our record |
+| 3 | W5.1 | signed envelopes and peer records (RFC 0002, RFC 0003): the wire model with its theorems, sign, and the checked open, which the spike adds for gossipsub's peer exchange | the unit 3 milestones below pass, and go-libp2p consumes our record |
 
 Units 0 and 1 are done. The unit 1 suite is `Tests/Identity.lean`, and
 the theorems live in `Libp2p/Identity/KeyType.lean` (the table),
@@ -115,12 +115,12 @@ Milestones for unit 3 (`Tests/Record.lean`, `scripts/pubsub-interop.sh`):
   byte-identical, and the vector opens to its peer, seq, and addresses.
 - go-libp2p's `ConsumeEnvelope` accepts our record.
 - One rejection each: a flipped signature byte, an unknown payload type,
-  a record that names another peer than its signer, and bytes that are
-  not an envelope. The legacy RFC 0003 pair opens, and a signature does
-  not verify under the other domain.
-- The host store keeps the newest record per peer: an equal or older
-  `seq` leaves it, a newer one replaces it, and a record for another
-  peer than the expected one is refused.
+  a record that names a peer other than its signer, and bytes that are
+  not an envelope. The legacy RFC 0003 pair opens. A signature does not
+  verify under the other domain.
+- The host store keeps the newest record per peer. An equal or older
+  `seq` leaves it, and a newer one replaces it. The store refuses a
+  record for a peer other than the expected one.
 
 ## Vector stance
 

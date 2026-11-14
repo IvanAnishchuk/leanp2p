@@ -275,7 +275,7 @@ private def peerstoreChecks (r : Runner) : Async Unit := do
   r.check "a TTL address is live before its expiry" (Peerstore.addrsOf timed large 149 == [a1])
   r.check "a TTL address hides at its expiry" (Peerstore.addrsOf timed large 150).isEmpty
   r.check "prune drops the expired peer" ((Peerstore.prune timed 150).size == 0)
-  -- A re-add with no TTL keeps the address for good.
+  -- A second add with no TTL keeps the address with no expiry.
   let kept := Peerstore.addAddrs large [a1] timed (nowMs := 120)
   r.check "a re-add without TTL keeps the address" (Peerstore.addrsOf kept large 10000 == [a1])
   -- The peer cap refuses a new peer and still takes a known one.
@@ -704,7 +704,7 @@ private def eventChecks (r : Runner) : Async Unit := do
     r.check "host: disconnected carries the session of its connected"
       (sb == sessB && sa == sessA)
   | _, _ => r.check "host: closePeer raises disconnected on both sides" false
-  r.check "host: no peer is listed after the close"
+  r.check "host: the host lists no peer after the close"
     ((← (a.peers : BaseIO _)).isEmpty && (← (b.peers : BaseIO _)).isEmpty)
   r.check "host: closePeer answers false with no session"
     !(← (b.closePeer a.localPeer : BaseIO Bool))
@@ -712,10 +712,10 @@ private def eventChecks (r : Runner) : Async Unit := do
   a.close
   tc.close
 
-/-- The limiting resource manager on a real host (root §9, delta 4): a
-connection admits one stream, so a second stream while the first is
-open is refused with `gated .resources`, and a third after the first
-closes is admitted. -/
+/-- The limiting resource manager on a real host (root §9, delta 4). A
+connection admits one stream, so the host refuses a second stream while
+the first is open, with `gated .resources`. After the first stream
+resets, a new stream opens. -/
 private def limitedHostChecks (r : Runner) : Async Unit := do
   let net ← Sim.Net.new
   let tc ← TestClock.new
@@ -727,7 +727,7 @@ private def limitedHostChecks (r : Runner) : Async Unit := do
   match ← b.newStream a.localPeer [echoId] with
   | .error e => r.check s!"host limits: the first stream opens ({e})" false
   | .ok (_, s1) =>
-    r.check "host limits: a second stream is refused while the first is open"
+    r.check "host limits: the host refuses a second stream while the first is open"
       ((← b.newStream a.localPeer [echoId]) matches .error (.gated .resources))
     s1.reset
     r.check "host limits: a stream opens again once the first is gone"
@@ -749,7 +749,7 @@ private def probeChecks (r : Runner) : Async Unit := do
   discard <| b.dial (← withPeer addrA a.localPeer)
   discard <| seenB.recv
   r.check "host probe: the probe starts" (← b.startProbe)
-  -- The probe loop arms its interval timer; advance past it.
+  -- The probe loop arms its interval timer. Advance past it.
   discard tc.nextTimer
   tc.advance 1000
   match ← seenB.recv with

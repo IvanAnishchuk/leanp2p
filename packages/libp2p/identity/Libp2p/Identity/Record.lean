@@ -50,10 +50,10 @@ pin it (rule 3).
 
 **Domain and payload type.** RFC 0003 names `libp2p-routing-state` and
 `"/libp2p/routing-state-record"`. go-libp2p signs with
-`libp2p-peer-record` and the multicodec 0x0301 instead, and rust-libp2p
-calls that pair its interop form and keeps the RFC pair as legacy. The
-seal writes go's pair. The open accepts either pair, each with its own
-domain.
+`libp2p-peer-record` and the multicodec 0x0301 instead. rust-libp2p opens
+that pair with `from_signed_envelope_interop`, and it keeps the RFC pair
+as the legacy form. The seal writes go's pair. The open accepts either
+pair, each with its own domain.
 -/
 
 set_option autoImplicit false
@@ -106,7 +106,7 @@ instance (e : EnvelopeMsg) : Decidable e.Valid := by
 def toFields (e : EnvelopeMsg) : Pb.Fields := fieldsOfEntries e.entries
 
 /-- The message of a field table. A missing field is empty. A present
-field of another wire type is `badField`, as the go protobuf runtime
+field of another wire type gives `badField`, as the go protobuf runtime
 rejects it. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error EnvelopeMsg := do
   let publicKey ← Pb.bytesField? envelopeKeyField fs
@@ -128,7 +128,7 @@ theorem ofFieldsToFields (e : EnvelopeMsg) (h : e.Valid) :
   have h' : ∀ x ∈ e.entries, x.Valid := h
   rw [toFields, fieldsOfEntries, dite_eq_left h']
   obtain ⟨k, t, p, s⟩ := e
-  -- Each field is either absent (an empty payload) or one entry; the
+  -- Each field is either absent (an empty payload) or one entry. The
   -- sixteen cases differ only in which lookups miss.
   by_cases hk : k = [] <;> by_cases ht : t = [] <;> by_cases hp : p = [] <;>
     by_cases hs : s = [] <;>
@@ -154,7 +154,7 @@ def addressEntries (a : List Nat) : List Pb.Entry := optBytes addressMultiaddrFi
 def encodeAddress (a : List Nat) : List Nat := Pb.encodeFields (fieldsOfEntries (addressEntries a))
 
 /-- The multiaddr bytes of an encoded `AddressInfo`. A missing field is
-empty; the typed layer drops an empty address. -/
+empty, and the typed layer drops an empty address. -/
 def decodeAddress (bs : List Nat) : Except Pb.Error (List Nat) := do
   let (fs, _) ← Pb.decodeFields? bs
   let a ← Pb.bytesField? addressMultiaddrField fs
@@ -197,8 +197,8 @@ def decodeAddresses : List (List Nat) → Except Pb.Error (List (List Nat))
     let as ← decodeAddresses rest
     .ok (a :: as)
 
-/-- The message of a field table. A missing `peer_id` is empty and a
-missing `seq` is zero; the typed layer rejects the empty peer id. -/
+/-- The message of a field table. A missing `peer_id` is empty, and a
+missing `seq` is zero. The typed layer rejects the empty peer id. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error PeerRecordMsg := do
   let peerId ← Pb.bytesField? recordPeerIdField fs
   let seq ← Pb.varintField? recordSeqField fs
@@ -287,8 +287,8 @@ def unsignedBytes (domain payloadType payload : List Nat) : List Nat :=
 
 /-! ## The typed envelope -/
 
-/-- A signed envelope with a checked public key. The signature is not
-checked by the type: `Envelope.open?` checks it against a domain. -/
+/-- A signed envelope with a checked public key. The type does not check
+the signature: `Envelope.open?` checks it against a domain. -/
 structure Envelope where
   /-- The signer's public key. -/
   publicKey : PubKey
@@ -363,8 +363,8 @@ def toMsg (r : PeerRecord) : PeerRecordMsg where
 /-- The payload bytes. -/
 def marshal (r : PeerRecord) : ByteArray := ofNatList (Pb.encodeMessage r.toMsg)
 
-/-- The record of payload bytes. An address that does not decode is
-dropped, as go-libp2p's `addrsFromProtobuf` drops it; rust-libp2p
+/-- The record of payload bytes. The decode drops an address that does
+not decode, as go-libp2p's `addrsFromProtobuf` does. rust-libp2p
 rejects the whole record. -/
 def unmarshal? (b : ByteArray) : Except Error PeerRecord := do
   let (m, _) ← (Pb.decodeMessage? (α := PeerRecordMsg) (toNatList b)).mapError .message

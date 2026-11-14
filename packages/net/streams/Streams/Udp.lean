@@ -7,22 +7,22 @@ import StreamsShim
 # UDP datagrams
 
 A datagram socket for discv5 (spike P5). Root ARCHITECTURE §4.1 lets
-only the transports import a `Std.Async` socket; `net/streams` already
+only the transports import a `Std.Async` socket. `net/streams` already
 holds the TCP binding, so this module puts the UDP one beside it, as
-root §4.1 now records.
+root §4.1 records.
 
 The receive parks on `Std.Async.UDP.Socket.recv`, a promise, so a wait
-holds no pool thread (`Std`'s receive *selector* would; see the quic
-ARCHITECTURE, "Decisions"). `close` sets a flag, then sends an empty
-datagram to the socket's own address (the loopback for a bind to
-`0.0.0.0`), which wakes a parked receive; the receive then answers
-`none`, as QUIC's loop does at its stop.
+holds no pool thread. `Std`'s receive *selector* would hold one (the
+quic ARCHITECTURE, "Decisions"). `close` sets a flag, then sends an
+empty datagram to the socket's own address. For a bind to `0.0.0.0`,
+that address is the loopback. The datagram wakes a parked receive, and
+the receive answers `none`, as QUIC's loop does at its stop.
 
 An address is its bytes: 4 for IPv4, 16 for IPv6, as an ENR holds them.
 
 `bind` goes through the shim's exclusive bind (`StreamsShim.udpBind`),
-as QUIC's endpoint does: `Std`'s own bind sets SO_REUSEADDR, and on
-Linux a port-0 bind may then take a port another socket holds, so two
+as QUIC's endpoint does. `Std`'s own bind sets SO_REUSEADDR. On Linux,
+a port-0 bind may then take a port that another socket holds, and two
 nodes would split each other's datagrams.
 -/
 
@@ -68,16 +68,16 @@ def bind (ip : List Nat) (port : Nat) : IO Socket := do
   let some _ := sockAddr ip port
     | throw (IO.userError "udp: an IPv4 address of 4 bytes or an IPv6 address of 16")
   let s ← Std.Async.UDP.Socket.mk
-  -- The shim's bind, with no address reuse: `Std`'s bind sets
-  -- SO_REUSEADDR, and a port-0 bind could then share a port another
-  -- socket holds (`StreamsShim.udpBind`). The shim takes the family
-  -- byte, the address, and the port, big-endian.
+  -- The shim's bind, with no address reuse (`StreamsShim.udpBind`).
+  -- `Std`'s bind sets SO_REUSEADDR, and a port-0 bind could then share
+  -- a port that another socket holds. The shim takes the family byte,
+  -- the address, and the port, big-endian.
   let family : Nat := if ip.length == 4 then 4 else 6
   StreamsShim.udpBind s.native
     (Bytes.ofNatList (family :: ip ++ [port / 256 % 256, port % 256]))
   let bound ← s.getSockName
   -- A datagram to the loopback never reaches a socket bound to another
-  -- address, so the wake goes to the bound address itself; an
+  -- address, so the wake goes to the bound address itself. An
   -- unspecified bind takes the loopback of its family.
   let wakeIp :=
     if ip == [0, 0, 0, 0] then [127, 0, 0, 1]
@@ -85,15 +85,16 @@ def bind (ip : List Nat) (port : Nat) : IO Socket := do
     else ip
   return { native := s, closed := ← OnceRef.new false, wakeIp, port := bound.port.toNat }
 
-/-- Send one datagram. A send to an address of the wrong shape, or one
-the system refuses, is dropped: UDP promises no delivery. -/
+/-- Send one datagram. The send drops a datagram to an address of the
+wrong shape, and a datagram that the system refuses: UDP promises no
+delivery. -/
 def send (s : Socket) (bytes : ByteArray) (ip : List Nat) (port : Nat) : Async Unit := do
   let some addr := sockAddr ip port | return ()
   try s.native.send bytes (some addr) catch _ => pure ()
 
-/-- The next datagram and its source: the address bytes (4 or 16) and the port.
-`none` once the socket is closed. Park: a datagram wakes it, and so does
-`close`'s own datagram. -/
+/-- The next datagram and its source: the address bytes (4 or 16) and
+the port, or `none` once the socket is closed. Park: a datagram wakes
+it, and so does the datagram of `close`. -/
 partial def recv (s : Socket) : Async (Option (ByteArray × List Nat × Nat)) := do
   if ← (s.closed.get : BaseIO Bool) then return none
   let (bytes, src) ← try s.native.recv maxDatagram.toUInt64

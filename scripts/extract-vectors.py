@@ -1312,7 +1312,7 @@ def extract_discv5() -> None:
     """The discv5 wire test vectors: the four packets node B decodes, with
     the inputs each one lists, and the four crypto vectors. A packet block
     opens with a line ending in `):`, lists its inputs as `# name = 0x..`
-    comments, and ends with its hex lines; a crypto section opens with
+    comments, and ends with its hex lines. A crypto section opens with
     `### Title` and lists `name = 0x..` or `name: 0x..` lines."""
     d = "vendor/devp2p"
     path = "discv5/discv5-wire-test-vectors.md"

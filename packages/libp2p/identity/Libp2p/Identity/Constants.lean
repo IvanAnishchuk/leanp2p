@@ -67,10 +67,10 @@ def maxInlineKeyBytes : Nat := 42
 
 /-! ## Signed envelopes and peer records
 
-RFC 0002 (`RFC/0002-signed-envelopes.md`) fixes the envelope fields, and
-RFC 0003 (`RFC/0003-routing-records.md`) the peer record fields. The
-domain and the payload type of a peer record are go-libp2p's
-(`core/peer/record.go`): the RFC text names an older pair, which
+RFC 0002 (`RFC/0002-signed-envelopes.md`) fixes the envelope fields.
+RFC 0003 (`RFC/0003-routing-records.md`) fixes the peer record fields.
+The domain and the payload type of a peer record are go-libp2p's
+(`core/peer/record.go`). The RFC text names an older pair, which
 rust-libp2p keeps as its legacy form. -/
 
 /-- `PublicKey public_key = 1` of the envelope. -/

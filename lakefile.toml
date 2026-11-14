@@ -287,10 +287,11 @@ root = "Tests.Interop.Mplex"
 name = "noise-interop"
 root = "Tests.Interop.Noise"
 
-# The Lean side of the pubsub interop checks against go-libp2p-pubsub:
-# signed peer records, floodsub, and peer exchange. Run it through
-# `scripts/pubsub-interop.sh`. Like `noise-interop`, it is not part of
-# `lake test`.
+# The Lean side of the pubsub interop checks: signed peer records,
+# floodsub, peer exchange, and the v1.3 partial messages. Run it through
+# `scripts/pubsub-interop.sh` (go-libp2p-pubsub) and
+# `scripts/pubsub-rust-interop.sh` (rust-libp2p). Like `noise-interop`,
+# it is not part of `lake test`.
 [[lean_exe]]
 name = "pubsub-interop"
 root = "Tests.Interop.Pubsub"

@@ -219,7 +219,7 @@ LEAN_EXPORT lean_obj_res leanp2p_aes128_ctr(b_lean_obj_arg key, b_lean_obj_arg i
 }
 
 /* AES-128-GCM seal with a 12-byte nonce: the ciphertext, then the
-   16-byte tag. Sizes are checked on the Lean side, as for ChaCha. */
+   16-byte tag. The Lean side checks the sizes, as for ChaCha. */
 LEAN_EXPORT lean_obj_res leanp2p_aes128gcm_seal(b_lean_obj_arg key, b_lean_obj_arg nonce,
                                                 b_lean_obj_arg ad, b_lean_obj_arg pt) {
     size_t n = blen(pt);

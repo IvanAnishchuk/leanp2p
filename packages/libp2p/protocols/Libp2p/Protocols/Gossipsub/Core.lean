@@ -37,16 +37,18 @@ application. The application then offers them its partial messages.
 Floodsub peers (`PubsubProto.floodsub`) are a separate forward set
 (`floodTargets`): they join no mesh, take no gossip, and get every
 message of their topics, as go-libp2p-pubsub's `rpcs` treats a peer
-without the mesh feature. Peer exchange runs both ways: a prune of an
-oversubscribed mesh, of a full mesh's GRAFT, and of an unsubscribe names
-other peers when `doPX` is on (`pxPeers`), and a received prune's peers
-become `Action.pxConnect` past `acceptPXThreshold` (`pxAccept`).
+without the mesh feature. Peer exchange runs in both directions:
+- With `doPX` set, three prunes name other peers (`pxPeers`): the prune
+  of an oversubscribed mesh, the prune of a GRAFT into a full mesh, and
+  the prune of an unsubscribe.
+- The peers of a received prune become `Action.pxConnect` when the
+  sender's score is at or above `acceptPXThreshold` (`pxAccept`).
 
 Gaps that remain:
 
 - `validationOk` uses `strictNoSign`, with no per-topic policy.
-  `defaults.msgId` is the payload, because that policy leaves `from`
-  and `seqno` absent and the spec's default id would be empty for every
+  `defaults.msgId` is the payload. That policy leaves `from` and
+  `seqno` absent, so the spec's default id would be empty for every
   accepted message.
 - A graft for a topic the router does not subscribe to is ignored. The
   v1.0 spec answers with a prune, and the v1.1 spam measures say to
@@ -55,11 +57,13 @@ Gaps that remain:
   (`Params.partialTopics`), so a node never changes its `SubOpts` flags
   on a topic it already announced.
 
-The spec sections are `vendor/specs/pubsub/gossipsub/gossipsub-v1.0.md`
-(the router, the message cache, the mesh, the fanout, the heartbeat),
-`gossipsub-v1.1.md` (the score gates, the backoff, the spam measures),
-`gossipsub-v1.2.md` (IDONTWANT), and `gossipsub-v1.3.md` with
-`partial-messages.md` (the extensions).
+The spec sections, under `vendor/specs/pubsub/gossipsub/`:
+- `gossipsub-v1.0.md`: the router, the message cache, the mesh, the
+  fanout, the heartbeat
+- `gossipsub-v1.1.md`: the score gates, the backoff, the spam measures
+- `gossipsub-v1.2.md`: IDONTWANT
+- `gossipsub-v1.3.md` with `partial-messages.md`: the extensions
+
 The root `docs/ARCHITECTURE.md` section 3.3 fixes the shape: one total
 `step` that returns `Except ProtocolError (State × List Action)`, with
 time as an input.
@@ -170,35 +174,38 @@ structure Params where
   snappy header, which the client's decoder reads. -/
   maxDataSize : Option Nat := none
   /-- Send IDONTWANT (gossipsub v1.2) for a held message whose `data` has
-  at least this many bytes; `none` sends none. The spec leaves the
-  policy open ("choose a message size threshold"); Lighthouse sets
-  `idontwant_message_size_threshold`. Only `validateMessages` sends. -/
+  at least this many bytes. `none` sends no IDONTWANT. The spec leaves
+  the policy open ("choose a message size threshold"), and Lighthouse
+  sets `idontwant_message_size_threshold`. Only `validateMessages`
+  sends. -/
   idontwantThreshold : Option Nat := none
-  /-- The most IDONTWANT pairs the router keeps; the oldest go first. The
+  /-- The most IDONTWANT pairs the router keeps. The oldest go first. The
   spec leaves the prune strategy to the implementation. -/
   dontSendCap : Nat := 4096
-  /-- The spam measures (`gossipsub-v1.1.md`, lines 621 to 644): the most
-  IHAVE messages one peer may send per heartbeat (rust-libp2p's
-  `max_ihave_messages_heartbeat`, 10), the most ids we ask one peer for
-  per heartbeat (rust's control cap, 5000), and the most times we answer
-  one peer's IWANT for one id (rust's `gossip_retransimission`, 3). -/
+  /-- The spam measures (`gossipsub-v1.1.md`, lines 621 to 644):
+  - `maxIhaveMessages`: the most IHAVE messages one peer may send per
+    heartbeat (rust-libp2p's `max_ihave_messages_heartbeat`, 10)
+  - `maxIhaveLength`: the most ids we ask one peer for per heartbeat
+    (rust's control cap, 5000)
+  - `gossipRetransmission`: the most times we answer one peer's IWANT
+    for one id (rust's `gossip_retransimission`, 3) -/
   maxIhaveMessages : Nat := 10
   maxIhaveLength : Nat := 5000
   gossipRetransmission : Nat := 3
   /-- How long a departed peer's score stays (`gossipsub-v1.1.md`, lines
   212 to 214: "the score is retained for some period of time when a peer
-  disconnects"). rust's default is 1 h; Lighthouse sets 100 epochs. -/
+  disconnects"). rust's default is 1 h, and Lighthouse sets 100 epochs. -/
   retainScore : Millis := 3600000
   /-- "A shorter backoff period can be used in case of an unsubscribe
   event" (`gossipsub-v1.1.md`, lines 108 to 110). go and rust use 10 s. -/
   unsubscribeBackoff : Millis := 10000
   /-- Flood publishing (`gossipsub-v1.1.md`, lines 145 to 163): our own
   messages go to every subscribed peer at or above `publishThreshold`.
-  go and rust turn it on by default; Lighthouse turns it off
+  go and rust enable it by default. Lighthouse disables it
   (`config.rs:519`), so the default here is off. -/
   floodPublish : Bool := false
   /-- `D_out`: the outbound peers a mesh keeps (`gossipsub-v1.1.md`,
-  lines 186 to 203); rust's `mesh_outbound_min` is 2. It must stay below
+  lines 186 to 203). rust's `mesh_outbound_min` is 2. It must stay below
   `D_lo` and at most `D/2`. -/
   dOut : Nat := 2
   /-- Opportunistic grafting (`gossipsub-v1.1.md`, lines 260 to 279): at
@@ -212,8 +219,9 @@ structure Params where
   partialTopics : List (TopicId × PartialOpts) := []
   /-- Peer exchange on prune (`gossipsub-v1.1.md`, "Peer Exchange"): a
   prune we send names up to `prunePeers` other peers of the topic. go and
-  rust turn it off by default, and so does this router. Teku turns it
-  on. The acceptance side always runs, gated by `acceptPXThreshold`. -/
+  rust disable it by default, and so does this router. Teku enables it.
+  The acceptance side always runs, behind the gate of
+  `acceptPXThreshold`. -/
   doPX : Bool := false
   /-- The most peers one prune names, and the most peers we take from one
   received prune. go's `PrunePeers` and rust's `prune_peers` are 16. -/
@@ -324,8 +332,8 @@ inductive Event where
   | partialJudged (peer : Peer) (topic : TopicId) (valid : Bool)
   /-- The pubsub protocol a known peer negotiated. The host announces a
   connection before any stream negotiates, so a join records `meshsub`,
-  and this event corrects it. A peer that turns out to speak floodsub
-  leaves every mesh and fanout. -/
+  and this event corrects it. A peer that speaks floodsub leaves every
+  mesh and fanout. -/
   | protocol (peer : Peer) (proto : PubsubProto)
   deriving Repr
 
@@ -447,7 +455,7 @@ def scoreOf (p : Params) (s : State) (q : Peer) : Score :=
   | none => 0
 
 /-- The peer speaks floodsub (`/floodsub/1.0.0`). Such a peer joins no
-mesh and gets no gossip; it gets every message of its topics, as
+mesh and gets no gossip. It gets every message of its topics, as
 go-libp2p-pubsub's `rpcs` sends to peers without the mesh feature. -/
 def isFlood (s : State) (q : Peer) : Bool :=
   ((peerOf s q).map (fun pd => pd.proto == .floodsub)).getD false
@@ -594,7 +602,7 @@ def floodTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
     decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1)).map Prod.fst
 
 /-- One publish RPC per accepted message, to each mesh peer, explicit
-peer, and floodsub peer other than the sender. The targets are read from
+peer, and floodsub peer other than the sender. The targets come from
 the pre-state. -/
 def forwardPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) : List Action :=
   ms.flatMap fun m =>
@@ -678,13 +686,13 @@ def announced (s : State) (topic : TopicId) : List Peer :=
   (s.peers.filter (fun e => memB topic e.2.subs)).map Prod.fst
 
 /-- The peer exchange of a prune to `target` on `topic`
-(`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"): up to
-`prunePeers` other gossipsub peers of the topic, each at or above score
-0, when `doPX` is on. A target below score 0 gets none: "no PX
+(`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"). With `doPX`
+set, it names up to `prunePeers` other gossipsub peers of the topic,
+each at or above score 0. A target below score 0 gets none: "no PX
 information is emitted towards those peers". Each entry carries the
-peer id only; the node adds the signed peer record the host holds, as
-go-libp2p-pubsub's `makePrune` reads it from the certified address
-book. go shuffles the candidates; this core takes them in state order,
+peer id only. The node adds the signed peer record that the host holds,
+as go-libp2p-pubsub's `makePrune` reads it from the certified address
+book. go shuffles the candidates. This core takes them in state order,
 so a transcript replays. -/
 def pxPeers (p : Params) (s : State) (target : Peer) (topic : TopicId) : List Rpc.PeerInfo :=
   if p.doPX && decide (0 ≤ scoreOf p s target) then
@@ -693,11 +701,11 @@ def pxPeers (p : Params) (s : State) (target : Peer) (topic : TopicId) : List Rp
       |>.map fun q => { peerId := some (Bytes.toNatList q.toBytes), signedPeerRecord := none }
   else []
 
-/-- The peers a heartbeat grafts: `need` candidates, then, when the mesh
-is still `outNeed` short of outbound peers, outbound candidates only up
-to that quota ("the router selects outbound peers from the candidates
-and grafts them", `gossipsub-v1.1.md`, lines 186 to 203). An inbound
-peer never fills the outbound quota. -/
+/-- The peers a heartbeat grafts. First come `need` candidates. When the
+mesh is still `outNeed` short of outbound peers, outbound candidates
+follow, up to that quota ("the router selects outbound peers from the
+candidates and grafts them", `gossipsub-v1.1.md`, lines 186 to 203). An
+inbound peer never fills the outbound quota. -/
 def pickAdded (cands : List Peer) (isOut : Peer → Bool) (need outNeed : Nat) : List Peer :=
   let base := cands.take need
   let extra := ((cands.filter isOut).filter (fun q => !memB q base)).take
@@ -713,19 +721,23 @@ theorem mem_pickAdded {cands : List Peer} {isOut : Peer → Bool} {need outNeed 
   · exact List.mem_of_mem_take h
   · exact (List.mem_filter.1 (List.mem_filter.1 (List.mem_of_mem_take h)).1).1
 
-/-- One topic plan. An overfull mesh keeps its `dScore` best and its
-`D_out` outbound peers and fills to `d`; an underfull mesh, or one short
-of outbound peers, takes candidates from the order (`pickAdded`); and a
-candidate is outside the mesh, outside backoff, known, not explicit, and
-at or above score 0. The kept list is cut at `dHigh`, so the mesh bound
-holds by construction. -/
+/-- One topic plan:
+- An overfull mesh keeps its `dScore` best and its `D_out` outbound
+  peers, and fills to `d`.
+- An underfull mesh, or one short of outbound peers, takes candidates
+  from the order (`pickAdded`).
+- A candidate is outside the mesh, outside backoff, known, not explicit,
+  and at or above score 0.
+
+The plan cuts the kept list at `dHigh`, so the mesh bound holds by
+construction. -/
 def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
     (topic : TopicId) : TopicPlan :=
   let ps := meshOf s topic
   -- An overfull mesh keeps its `dScore` best-scoring peers, then fills to
   -- `d` from the rest (`gossipsub-v1.1.md`, lines 247 to 258), and prunes
-  -- the others. Ties and the fill favour the back of the mesh list, as
-  -- the old rule did, and the kept peers keep their mesh order.
+  -- the others. Ties and the fill prefer the back of the mesh list, and
+  -- the kept peers keep their mesh order.
   let best := (ps.reverse.mergeSort (fun a b => decide (scoreOf p s b ≤ scoreOf p s a))).take
     p.mesh.dScore
   let isOut (q : Peer) : Bool := ((peerOf s q).map (·.outbound)).getD false
@@ -878,8 +890,8 @@ known peer keeps its record. -/
 def join (p : Params) (s : State) (peer : Peer) (proto : PubsubProto) :
     State × List Action :=
   -- A peer back within `retainScore` of its departure gets its old score
-  -- (`gossipsub-v1.1.md`, lines 212 to 214), so a reconnect does not wash
-  -- a bad score.
+  -- (`gossipsub-v1.1.md`, lines 212 to 214), so a reconnect does not
+  -- reset a bad score.
   let kept := (s.retained.find? (fun e => decide (e.1 = peer ∧ s.now < e.2.2 + p.retainScore))).map
     (·.2.1)
   let s0 : State := { s with retained := s.retained.filter (fun e => decide (e.1 ≠ peer)) }
@@ -911,8 +923,9 @@ def applySubOpts (subs : List TopicId) (o : Rpc.SubOpts) : List TopicId :=
   else subs.filter (fun u => decide (u ≠ t))
 
 /-- One subscription option against the partial-messages choices. A
-subscribe records the flags; an unsubscribe drops them, and its own
-flags are ignored (`partial-messages.md`, "Changes to `SubOpts`"). -/
+subscribe records the flags. An unsubscribe drops them, and the core
+ignores the flags of the unsubscribe itself (`partial-messages.md`,
+"Changes to `SubOpts`"). -/
 def applyPartialOpts (ps : List (TopicId × PartialOpts)) (o : Rpc.SubOpts) :
     List (TopicId × PartialOpts) :=
   let t : TopicId := ⟨o.topicid⟩
@@ -1002,12 +1015,13 @@ def noteDontWant (p : Params) (s : State) (sender : Peer) : Option Rpc.ControlMe
     if ids.isEmpty then s
     else { s with dontSend := (ids.map (sender, ·) ++ s.dontSend).take p.dontSendCap }
 
-/-- `handlePubs` under `Params.validateMessages`: accept as before, but
-hold each accepted message for the application's answer. The seen
-cache records the id at once, so a duplicate during the wait is
-dropped. The message cache, the delivery scores, and the forward wait
-for `Validation.accept` (`handleValidated`), so gossip and IWANT never
-serve a message the application has not accepted. -/
+/-- `handlePubs` under `Params.validateMessages`. It accepts as
+`handlePubs` does, then holds each accepted message for the
+application's answer. The seen cache records the id at once, so the
+core drops a duplicate during the wait. The message cache, the delivery
+scores, and the forward wait for `Validation.accept` (`handleValidated`).
+So gossip and IWANT never serve a message that the application did not
+accept. -/
 def holdPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
     State × List Action :=
   let valid := ms.filter (fun m => validationOk p m)
@@ -1062,7 +1076,7 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
         if memB q (meshOf s m.topic) then
           updateScoreOf st q (fun sc => Score.meshDelivery p.score sc m.topic)
         else st) s3
-      -- The forward skips the IDONTWANT peers; the seen cache stops a
+      -- The forward skips the IDONTWANT peers. The seen cache stops a
       -- second forward, so the pairs of this id go.
       (forgetDontWant s4 id, dropDontWant p s (dropForPartial p s (forwardPubs p s src [m])))
     | .reject =>
@@ -1073,11 +1087,11 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
     | .ignore => (s1, [])
 
 /-- Drop the held messages older than the message cache's history,
-`historyLength` heartbeats: rust-libp2p keeps an unvalidated message in
+`historyLength` heartbeats. rust-libp2p keeps an unvalidated message in
 its message cache, so it expires with that window. An expired message
-stays in the seen cache, so a later copy is dropped as a duplicate; no
-score moves. The loop calls this at each heartbeat, outside `step`, so
-the step theorems hold unchanged. -/
+stays in the seen cache, so the core drops a later copy as a duplicate,
+and no score changes. The loop calls this at each heartbeat, outside
+`step`, so the step theorems hold unchanged. -/
 def expirePending (p : Params) (s : State) (now : Millis) : State :=
   let ttl := p.window.historyLength * p.heartbeatInterval
   let old := (s.pendingAt.filter fun e => decide (e.2 + ttl ≤ now)).map (·.1)
@@ -1085,11 +1099,15 @@ def expirePending (p : Params) (s : State) (now : Millis) : State :=
   else { s with pending := s.pending.filter (fun e => !memB e.1 old),
                 pendingAt := s.pendingAt.filter (fun e => !memB e.1 old) }
 
-/-- Opportunistic grafting (`gossipsub-v1.1.md`, lines 260 to 279): a mesh
+/-- Opportunistic grafting (`gossipsub-v1.1.md`, lines 260 to 279). A mesh
 whose median peer score is below `opportunisticGraftThreshold` grafts up
-to `opportunisticGraftPeers` peers that announced the topic, sit outside
-the mesh and its backoff, are not explicit, and score above the median.
-The answer is the state with the meshes grown and the grafts to send. -/
+to `opportunisticGraftPeers` peers. Each grafted peer:
+- announced the topic
+- is outside the mesh and its backoff
+- is not explicit
+- scores above the median
+
+The answer is the state with the meshes grown, and the grafts to send. -/
 def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List Action :=
   s.mesh.foldl (fun (st, acts) (t, ps) =>
     if ps.isEmpty then (st, acts) else
@@ -1107,14 +1125,14 @@ def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List 
 before each tick), so the heartbeat theorems hold unchanged. Each part
 cites #95:
 
-* fanout expiry (`gossipsub-v1.0.md`, lines 449 to 473): a topic with no
-  publish for `fanoutTtl` loses its fanout;
-* broken IWANT promises (`gossipsub-v1.1.md`, spam measures): each
+* Fanout expiry (`gossipsub-v1.0.md`, lines 449 to 473): a topic with no
+  publish for `fanoutTtl` loses its fanout.
+* Broken IWANT promises (`gossipsub-v1.1.md`, spam measures): each
   promise past its deadline adds one P₇ behaviour penalty to its peer,
-  and leaves the table;
+  and leaves the table.
 * P₆ (`gossipsub-v1.1.md`, "P₆"): each peer's IP colocation count is the
-  number of known peers on its IP address;
-* opportunistic grafting, on the heartbeats the loop marks
+  number of known peers on its IP address.
+* Opportunistic grafting, on the heartbeats that the loop marks
   (`opportunistic`): see `opportunisticGrafts`. -/
 def maintain (p : Params) (s : State) (now : Millis) (opportunistic : Bool := false) :
     State × List Action :=
@@ -1149,8 +1167,9 @@ def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
 promised, and record the promise. -/
 def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) :
     State × List Action :=
-  -- The spam measures: past `maxIhaveMessages` IHAVEs this heartbeat the
-  -- peer is ignored, and we ask it for at most `maxIhaveLength` ids.
+  -- The spam measures: past `maxIhaveMessages` IHAVEs this heartbeat,
+  -- the core ignores the peer. We ask it for at most `maxIhaveLength`
+  -- ids.
   let (count, asked) := s.ihaveSeen.getD sender (0, 0)
   if p.maxIhaveMessages ≤ count then (s, [])
   else
@@ -1269,17 +1288,20 @@ def controlActions (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMess
 
 /-- The peer exchange a prune offers, as the connect actions. A prune
 counts when we joined its topic, as go and rust skip a prune of an
-unknown topic. A sender below `acceptPXThreshold` is ignored: the spec's
+unknown topic.
+
+The core ignores a sender below `acceptPXThreshold`. The spec's
 parameter table says "PX information by peers below this threshold is
 ignored", and go and rust read it so (`score < acceptPXThreshold`). The
-prose of "Peer Scoring" says "exceeds", which would refuse a peer at the
-threshold, so at the default 0 every new peer; the table, its
-constraint "Must be >= 0", and both implementations settle it. From each
-prune the action keeps
-up to `prunePeers` entries whose peer id decodes and names a peer we do
-not know; go truncates after a shuffle, this core in wire order. The
-score is read from the state before the prunes, as go's
-`handlePrune` reads it. -/
+prose of "Peer Scoring" says "exceeds". That reading would refuse a
+peer at the threshold, so at the default 0 it would refuse every new
+peer. The table, its constraint "Must be >= 0", and both
+implementations decide the question.
+
+From each prune, the action keeps up to `prunePeers` entries whose peer
+id decodes and names a peer we do not know. go truncates after a
+shuffle, and this core truncates in wire order. The core reads the
+score from the state before the prunes, as go's `handlePrune` does. -/
 def pxAccept (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) : List Action :=
   if decide (p.thresholds.acceptPXThreshold ≤ scoreOf p s sender) then
     c.prune.filterMap fun q =>
@@ -1303,7 +1325,7 @@ def handleControl (p : Params) (s : State) (sender : Peer) :
   | some c => (controlPrunes p s sender c, controlActions p s sender c ++ pxAccept p s sender c)
 
 /-- Note the sender's Extensions message. It belongs in the first RPC,
-once; a later one costs a P₇ penalty (`gossipsub-v1.3.md`, "Peer Scoring
+once. A later one costs a P₇ penalty (`gossipsub-v1.3.md`, "Peer Scoring
 on Protocol Violations"). -/
 def noteExtensions (s : State) (sender : Peer) (rpc : Rpc.RPC) : State :=
   match peerOf s sender with
@@ -1337,7 +1359,8 @@ def handlePartialIn (p : Params) (s : State) (sender : Peer) :
 /-- The application sends a partial message to `q`. A peer that
 requested partial messages on the topic gets it whole. A peer that only
 supports them gets the metadata without the data. Any other peer gets
-nothing; so does any topic where we cannot send them. -/
+nothing. On a topic where we cannot send partial messages, no peer gets
+one. -/
 def sendPartial (p : Params) (s : State) (q : Peer) (pm : Rpc.PartialMessage) : List Action :=
   let t := partialTopic pm
   let theirs := peerPartial s q t
@@ -1549,9 +1572,9 @@ def defaults : Params where
 /-- The spec's parameter constraints a parameter set breaks, each named
 (`gossipsub-v1.1.md`, the parameter tables, lines 548 to 588, and the
 thresholds, lines 228 to 245). `Params.Valid` carries only `d ≤ dHigh`,
-the bound the mesh theorems consume; a node checks the rest here at
+the bound the mesh theorems consume. A node checks the rest here at
 start. `defaults` breaks the threshold rules on purpose: every threshold
-and weight is 0, which turns scoring off. -/
+and weight is 0, which disables scoring. -/
 def Params.problems (p : Params) : List String :=
   let g := p.score.global
   let t := p.thresholds
@@ -2792,7 +2815,7 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
       rw [hacts] at hdel
       exact absurd hdel (handleValidated_not_deliver p s id source outcome m)
   | peerInfo peer outbound ip =>
-      -- The step only records the peer's facts; it emits no action.
+      -- The step only records the peer's facts. It emits no action.
       simp only [step] at hstep
       split at hstep <;>
         (simp only [Except.ok.injEq, Prod.mk.injEq] at hstep

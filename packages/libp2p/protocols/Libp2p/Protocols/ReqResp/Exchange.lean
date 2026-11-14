@@ -222,7 +222,7 @@ and `emit`, which writes one chunk at once. So the answer never sits
 in memory whole, and the responder may wait between chunks to
 rate-limit: "The responder MAY rate-limit chunks by withholding each
 chunk until capacity is available" (phase0, "Responding side"). An
-`emit` that fails ends the answer; `respond` should stop then. The
+`emit` that fails ends the answer, and `respond` should stop then. The
 stream closes after `respond` returns. -/
 def serveStreaming (ctx : Libp2p.Core.StreamContext) (s : Streams.Stream) (m : Method)
     (clock : Conc.Clock) (timeoutMs : Nat)

@@ -184,7 +184,7 @@ def aes128GcmSeal (key : Key16) (nonce : Nonce12) (ad pt : ByteArray) :
   else liftShim .fault (aes128GcmSealRaw key.bytes nonce.bytes ad pt)
 
 /-- AES-128-GCM open. A message shorter than the tag, or a tag that
-does not verify, is `authFailed`. -/
+does not verify, gives `authFailed`. -/
 def aes128GcmOpen (key : Key16) (nonce : Nonce12) (ad ct : ByteArray) :
     Except CryptoError ByteArray :=
   if ct.size > aeadMaxLen || ad.size > aeadMaxLen then .error .invalidInput

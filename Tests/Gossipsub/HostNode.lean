@@ -28,7 +28,7 @@ private def nap : Async Unit := do
   select #[t]
 
 /-- Wait until `ok` holds for the node's peer list, for up to `rounds`
-heartbeats. A stream's negotiation runs on tasks, not on the test
+heartbeats. A stream's negotiation runs on tasks, outside the test
 clock, so the wait polls in real time (50 ms steps, ten per heartbeat)
 and advances the clock one heartbeat only after the tasks had their
 time. A clock that races ahead fires yamux's 10 s write deadline
@@ -69,7 +69,7 @@ def run (r : Runner) : IO Unit := Async.run do
       (← waitPeers p.clock server (!·.contains clientPeer))
     server.stop
     r.check "hosts: the pair closes with no fault (unsupported)" (← p.close).isNone
-  -- Both run gossipsub, the client first, so its handler is up before the
+  -- Both run gossipsub, the client first, so its handler is set before the
   -- server's writer opens. The peer stays, then leaves at the close.
   do
     let p ← hostPair
@@ -138,9 +138,9 @@ def run (r : Runner) : IO Unit := Async.run do
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (payload)" (← p.close).isNone
-  -- A message over the RPC cap (spike P7): counted in `dropped`, not lost
-  -- unseen. The client's cap is 64 bytes; the server subscribes, so the
-  -- client's publish goes to it through the fanout.
+  -- A message over the RPC cap (spike P7): the node counts it in
+  -- `dropped`. The client's cap is 64 bytes. The server subscribes, so
+  -- the client's publish goes to it through the fanout.
   do
     let p ← hostPair
     let server ← (Node.start (HostSeam.ofHost p.server) { clock := p.clock.clock } :
@@ -158,12 +158,12 @@ def run (r : Runner) : IO Unit := Async.run do
       if ← waitStats p.clock client (·.dropped ≥ 1) 1 then
         counted := true
         break
-    r.check "hosts: an RPC over the cap is counted in dropped" counted
+    r.check "hosts: the node counts an RPC over the cap in dropped" counted
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (over cap)" (← p.close).isNone
   -- An explicit peer (spike P9): the client keeps the server, and dials it
-  -- back at its next check after the session ends.
+  -- again at its next check after the session ends.
   do
     let p ← hostPair
     let cfg : Node.Config :=
@@ -173,15 +173,15 @@ def run (r : Runner) : IO Unit := Async.run do
     let client ← (Node.start (HostSeam.ofHost p.client) cfg : BaseIO Node.Node)
     r.check "hosts: the explicit peer joins"
       (← waitPeers p.clock client (·.contains p.serverPeer) 4)
-    -- The redial can come within one check interval, so the end shows in
-    -- the host's event, not in the router's peer list.
+    -- The redial can come within one check interval, so the test reads
+    -- the end from the host's event. The router's peer list can miss it.
     let ended : Chan Unit ← Chan.new 4
     (p.client.addNotifiee fun
       | .disconnected q _ => if q == p.serverPeer then discard (ended.trySend ()) else pure ()
       | _ => pure () : BaseIO Unit)
     discard (p.client.closePeer p.serverPeer : BaseIO Bool)
     r.check "hosts: the explicit peer's session ends" ((← ended.recv).isSome)
-    -- The next check, at most 2000 ms of test clock away, dials it back.
+    -- The next check, at most 2000 ms of test clock away, dials it again.
     let mut back := false
     for i in [0:80] do
       if ← (p.client.connected p.serverPeer : BaseIO Bool) then
@@ -189,7 +189,7 @@ def run (r : Runner) : IO Unit := Async.run do
         break
       nap
       if i % 10 == 9 then p.clock.advance 1000
-    r.check "hosts: the node dials its explicit peer back" back
+    r.check "hosts: the node dials its explicit peer again" back
     r.check "hosts: the explicit peer is in the router again"
       (← waitPeers p.clock client (·.contains p.serverPeer) 4)
     client.stop
@@ -245,7 +245,7 @@ def runPartial (r : Runner) : IO Unit := Async.run do
   let pm : Rpc.PartialMessage :=
     { topicId := some (Bytes.toNatList (Bytes.ofString topic.name)), groupId := some [0, 1, 2],
       partialMessage := some [7, 7, 7], partsMetadata := some [0xff] }
-  r.check "partial: the send is accepted" (← (client.sendPartial p.serverPeer pm : BaseIO Bool))
+  r.check "partial: the node accepts the send" (← (client.sendPartial p.serverPeer pm : BaseIO Bool))
   let mut got : Option (Peer × Rpc.PartialMessage) := none
   for i in [0:40] do
     if let some x ← (partials.tryRecv : BaseIO _) then
@@ -255,7 +255,7 @@ def runPartial (r : Runner) : IO Unit := Async.run do
     if i % 10 == 9 then p.clock.advance 1000
   r.check "partial: the server's application gets the partial message from the client"
     (got == some (p.client.localPeer, pm))
-  r.check "partial: the application's judgment is accepted"
+  r.check "partial: the node accepts the application's judgment"
     (← (server.judgePartial p.client.localPeer topic true : BaseIO Bool))
   -- Many RPCs crossed by now: subscriptions, grafts, the partial message.
   r.check "partial: the client sent the Extensions message once"

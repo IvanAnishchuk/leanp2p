@@ -61,18 +61,22 @@ def run (r : Runner) : IO Unit := do
       | .sendRpc _ rpc => n + (Pb.encodeMessage rpc).length | _ => n) 0
     let t3 ← IO.monoMsNow
     IO.println s!"bigmsg: re-encoded the forwards, {out} bytes, in {t3 - t2} ms"
-    r.check "bigmsg: the message is forwarded to the other mesh peer" (0 < out)
+    r.check "bigmsg: the core forwards the message to the other mesh peer" (0 < out)
 
 /-- The same 10 MiB message on the `ByteArray` payload path
-(`LEANP2P_SUITE=bigmsgB`): the raw RPC splits into a small RPC and the
-payload, the core steps on the small one, and the forward joins the
-payload back. Compare the peak with `run`'s. -/
+(`LEANP2P_SUITE=bigmsgB`):
+1. The raw RPC splits into a small RPC and the payload.
+2. The core steps on the small RPC.
+3. The forward joins the payload to the small RPC again.
+
+Compare the peak with `run`'s. -/
 def runB (r : Runner) : IO Unit := do
   r.section "gossipsub big message, ByteArray path" "(spike F3: a measurement)"
   let size := Constants.maxPayloadSize
   let payload : ByteArray := ⟨(Array.range size).map (·.toUInt8)⟩
   let idOf (_ : String) (d : ByteArray) : MessageId := ⟨(d.extract 0 20).toList.map (·.toNat)⟩
-  -- The raw RPC, built by hand around the payload as a peer would send it.
+  -- The raw RPC, with its fields written directly around the payload, as
+  -- a peer would send it.
   let header : Message :=
     { «from» := none, data := none, seqno := none, topic := ta, signature := none, key := none }
   let inner := Bytes.ofNatList (Pb.encodeMessage header)

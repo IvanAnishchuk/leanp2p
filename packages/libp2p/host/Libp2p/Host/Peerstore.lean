@@ -18,17 +18,17 @@ first arrived in.
 
 ## Limits and TTLs (root §9, delta 3)
 
-Discovery feeds the store from untrusted records, so it is bounded
-three ways:
+Discovery feeds the store from untrusted records, so the store has
+three bounds:
 
-* a peer keeps at most `Limits.addrsPerPeer` addresses; an add past
-  the cap drops the oldest;
-* an address may carry an expiry; `addrsOf` hides it after that, and
-  `prune` removes it. A re-add refreshes the expiry;
-* the store keeps at most `Limits.peers` peers; an add of a new peer
-  past the cap is refused. The connected peers' addresses matter more
-  than a stranger's, and the store cannot tell them apart, so it keeps
-  what it has.
+* A peer keeps at most `Limits.addrsPerPeer` addresses. An add past
+  the cap drops the oldest.
+* An address may carry an expiry. `addrsOf` hides it after that, and
+  `prune` removes it. A new add of the address refreshes the expiry.
+* The store keeps at most `Limits.peers` peers, and refuses a new peer
+  past the cap. The addresses of the connected peers matter more than
+  a stranger's. The store cannot tell them apart, so it keeps what it
+  has.
 -/
 
 set_option autoImplicit false
@@ -37,8 +37,8 @@ namespace Libp2p.Host
 
 open Multiformats Libp2p.Identity
 
-/-- One stored address and its expiry on the host clock; `none` never
-expires. -/
+/-- One stored address and its expiry on the host clock. An address
+with `none` never expires. -/
 structure PeerAddr where
   addr : Multiaddr
   expiresMs : Option Nat
@@ -46,7 +46,7 @@ structure PeerAddr where
 /-- The bounds of the store. -/
 structure Limits where
   /-- The most addresses one peer keeps. go-libp2p's peerstore has no
-  per-peer cap; its connection manager trims peers instead. -/
+  per-peer cap. Its connection manager trims peers instead. -/
   addrsPerPeer : Nat := 16
   /-- The most peers the store keeps. -/
   peers : Nat := 10000
@@ -65,7 +65,7 @@ def PeerAddr.live (nowMs : Nat) (a : PeerAddr) : Bool :=
 
 /-- Add `addrs` to the addresses of `peer`, each once. An address the
 peer has takes the later expiry. The newest `limits.addrsPerPeer`
-stay. A new peer past `limits.peers` is refused. -/
+stay. The store refuses a new peer past `limits.peers`. -/
 def addAddrs (peer : PeerId) (addrs : List Multiaddr) (s : Peerstore)
     (nowMs : Nat := 0) (ttlMs : Option Nat := none) (limits : Limits := {}) : Peerstore :=
   if !s.contains peer && limits.peers ≤ s.size then s

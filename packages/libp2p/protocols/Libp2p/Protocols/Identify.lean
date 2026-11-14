@@ -492,8 +492,8 @@ private def listenMultiaddrs (m : Identify) : List Multiformats.Multiaddr :=
 /-- Store what a validated message says about `pid`: its listen
 addresses, and its signed peer record when the record verifies and names
 `pid` (`Host.consumeRecord`). go-libp2p's `consumeMessage` keeps the
-record in its certified address book the same way; a record that fails
-the check is dropped and the listen addresses stay. -/
+record in its certified address book in the same way. The store drops a
+record that fails the check, and the listen addresses stay. -/
 def store (h : Libp2p.Host.Host) (m : Identify) (pid : Libp2p.Identity.PeerId) : BaseIO Unit := do
   h.addAddrs pid (listenMultiaddrs m)
   if let some spr := m.signedPeerRecord then
@@ -519,7 +519,7 @@ def push (h : Libp2p.Host.Host) (peer : Libp2p.Identity.PeerId)
 /-- Ask a connected `peer` for its identify message on a new stream,
 check it against `peer`, and store it (`store`): its listen addresses
 and its signed peer record. go-libp2p's identify service does this for
-every new connection (`IdentifyConn`); the owner of a host calls it from
+every new connection (`IdentifyConn`). The owner of a host calls it from
 its connection notifiee, on a task of its own. -/
 def request (h : Libp2p.Host.Host) (peer : Libp2p.Identity.PeerId) (clock : Conc.Clock)
     (timeoutMs : Nat) : Conc.Async (Except String Unit) := do

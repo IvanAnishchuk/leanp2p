@@ -5,9 +5,9 @@
 # protocol scenarios against a live node from two tester addresses,
 # 127.0.0.1 and 127.0.0.2. Prysm's discovery is the same code:
 # beacon-chain/p2p/discovery.go imports go-ethereum/p2p/discover, at
-# go-ethereum v1.17.4. The pinned commit below is later than v1.17.4;
-# the discv5 protocol code between them changed only in metrics and a
-# TALKREQ drop counter, and the test suite gained scenarios.
+# go-ethereum v1.17.4. The pinned commit below is later than v1.17.4.
+# Between the two, the discv5 protocol code changed only in metrics and
+# a TALKREQ drop counter, and the test suite gained scenarios.
 #
 # The tool builds from a go-ethereum clone at that commit
 # (DISCV5_GETH_SRC, default ../p2p/go-ethereum-discv5 beside the repo),

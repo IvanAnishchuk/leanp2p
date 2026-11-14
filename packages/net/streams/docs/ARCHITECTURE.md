@@ -21,7 +21,7 @@ discipline and the no-reader-strand contract (§4.7), the framing caps
 | `Streams/Framing.lean` | `Framing`, length-prefix reads: the `Prefix` shapes, the `Frame` codec with its `LawfulCodec` proof, the `ByteArray` path, and the IO read; the caps of §5.1 apply before allocation |
 | `Streams/Stream.lean` | `Stream`, the application view over a muxer loop, with `prependBytes`; `Completions`, the tag table, as a pure state with its theorems; `LoopPort`, what a muxer shell gives one stream |
 | `Streams/Tcp.lean` | the TCP transport, the production `Transport` value, over the libuv sockets that `Std.Async.TCP` exports (§9, delta 7); the mapping between a multiaddr and a socket address |
-| `Streams/Udp.lean` | a datagram socket over `Std.Async.UDP`, IPv4 and IPv6, for discv5 (the spike on `experiment/client`); it binds through the shim with no address reuse, and its `close` wakes a parked receive with a datagram to its own address |
+| `Streams/Udp.lean` | a datagram socket over `Std.Async.UDP`, IPv4 and IPv6, for discv5 (the spike on `experiment/client`). It binds through the shim with no address reuse. Its `close` wakes a parked receive with a datagram to its own address |
 | `Streams/Sim.lean` | the in-memory sim, the test `Transport` value, with the dial/listen/echo harness and the byte-splitting hostile mode |
 | `shim/` | a nested Lake package, as `crypto/backend` is: `StreamsShim.abort`, which ends every pending request of a TCP socket, `StreamsShim.econnreset`, the platform's `ECONNRESET`, and `StreamsShim.udpBind`, the UDP bind with no address reuse that `Streams.Udp` and `net/quic` share (see "Decisions") |
 
@@ -30,8 +30,8 @@ re-exports the public submodules, including `Sim.lean` (§10, row 9), so
 a suite imports one name. `Streams/Tcp.lean` is the only module that
 calls the sockets of `Std.Async.TCP` (§9, delta 7): a second transport
 or a toolchain API change touches one module. `Streams/Udp.lean` holds
-the UDP socket the same way, for discv5, and root §4.1 names both. The shim names the
-socket type for its binding, and its C file checks the toolchain
+the UDP socket for discv5 in the same way, and root §4.1 names both
+modules. The shim names the socket type for its binding, and its C file checks the toolchain
 version (see "Decisions").
 
 The spike modules `Net/{Transport,Tcp}.lean`,
@@ -205,21 +205,20 @@ The names are §7 row 8's. The types follow §3.1.
   An `#error` on every toolchain but v4.34 makes a
   bump check that fact again. The socket argument is borrowed (`@&`,
   PRINCIPLES 4.1). The teardown aborts when a write is in flight, and
-  the peer gets an RST (§4.7). It aborts too when the read found the
-  connection reset: a `shutdown` on a reset connection never completes,
+  the peer gets an RST (§4.7). It also aborts when the read found the
+  connection reset. A `shutdown` on a reset connection never completes,
   and its request would hold the socket open (issue #102, the 48-byte
-  libuv handle). With no write in flight and no reset, it takes the
-  FIN path. A dial that outlives its deadline aborts its connect. A
+  libuv handle). With no write in flight and no reset, the teardown
+  takes the FIN path. A dial that outlives its deadline aborts its connect. A
   `Socket.close` in the runtime would replace the shim. The check:
   "the teardown aborted the stuck write: the peer meets a reset".
 - **Every UDP socket binds through the shim, with no address reuse.**
-  The v4.34 runtime binds UDP with `UV_UDP_REUSEADDR`, and on Linux a
-  port-0 bind may then take a port another socket holds, so two sockets
-  split each other's datagrams. `shim/c/udpbind.c` opens, binds, and
-  hands the descriptor to the runtime's handle, then clears the option
-  that `uv_udp_open` sets. QUIC met the failure first and held the bind
-  in its own shim; the bind moved here when discv5's `Streams.Udp` needed
-  it too, so both share one copy. The check: "udp: a second bind to a
+  The v4.34 runtime binds UDP with `UV_UDP_REUSEADDR`. On Linux, a
+  port-0 bind may then take a port that another socket holds, and the
+  two sockets split each other's datagrams. `shim/c/udpbind.c` opens a
+  socket, binds it, and hands the descriptor to the runtime's handle.
+  Then it clears the option that `uv_udp_open` sets. `Streams.Udp` and
+  `net/quic` share this one copy. The check: "udp: a second bind to a
   held port fails" (`Tests/Discv5.lean`).
 - **The peer's reset ends the read as EOF.** §3.5 sorts the channels
   by meaning. End of stream is "the peer finished; an orderly event",

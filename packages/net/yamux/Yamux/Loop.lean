@@ -540,8 +540,9 @@ def teardown (sh : Shared) (ending : Ending) (p : Ports) : BaseIO Unit := do
     inbox.close
   -- The queued streams stay acceptable, with the bytes that reached them
   -- before the end. Each holds closures over `sh`, and `sh` holds the
-  -- queue, so an owner must accept until `none` (the host's serve task
-  -- does); streams it leaves queued keep the session allocated (#102).
+  -- queue. So an owner must accept until `none`, as the host's serve
+  -- task does. A stream that the owner leaves queued keeps the session
+  -- allocated (#102).
   sh.accepts.close
   let last : Option GoAwayCode := match ending with
     | .closed => some .normal

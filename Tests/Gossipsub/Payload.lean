@@ -5,13 +5,13 @@ import Libp2p.Protocols.Gossipsub.Core
 /-!
 # Gossipsub suite: the `ByteArray` payload path
 
-Pins `Payload.splitInbound` and `Payload.joinOutbound` to the model
-codec over random RPCs (CLAUDE.md, "Proofs and tests", rule 2):
+This suite pins `Payload.splitInbound` and `Payload.joinOutbound` to the
+model codec over random RPCs (CLAUDE.md, "Proofs and tests", rule 2):
 
-* the model decode of the split RPC equals the model decode of the
-  original with each message's `data` replaced by its handle, and the
-  payloads come out by id;
-* the model decode of the joined bytes equals the original RPC.
+* The model decode of the split RPC equals the model decode of the
+  original with each message's `data` replaced by its handle. The split
+  returns the payloads by id.
+* The model decode of the joined bytes equals the original RPC.
 -/
 
 set_option autoImplicit false

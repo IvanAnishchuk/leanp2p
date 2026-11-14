@@ -271,11 +271,12 @@ private def connection (sock : Socket) : IO Connection := do
     for (_, p) in writing do p.resolve (.error closedError)
     discard sock.cancelRecv.toBaseIO
     -- A write in flight may never complete (a peer that stops reading),
-    -- and it holds the socket; so does a shutdown queued behind it. The
-    -- abort fails it, and the handle closes. A connection the read found
-    -- broken (the peer's reset) takes the abort too: a shutdown on it
-    -- never completes, and its request would hold the socket for good
-    -- (#102). Otherwise the graceful path sends the FIN.
+    -- and it holds the socket. A shutdown queued behind it holds the
+    -- socket too. The abort fails the write, and the handle closes. A
+    -- connection that the read found broken (the peer's reset) also
+    -- takes the abort. A shutdown on it never completes, and the
+    -- shutdown's request would hold the socket open (#102). Otherwise
+    -- the graceful path sends the FIN.
     if writing.isEmpty && !broken then finish sock else StreamsShim.abort sock
 
   let read : Async (Option ByteArray) := do

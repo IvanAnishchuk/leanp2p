@@ -10,7 +10,7 @@
 //	verify HEX               consume a signed peer record as gossipsub's
 //	                         peer exchange does, and print its peer, seq,
 //	                         and addresses.
-//	node FLAGS               run one pubsub host; see the flags below.
+//	node FLAGS               run one pubsub host, with the flags below.
 //
 // A node prints `ADDR <multiaddr>/p2p/<id>` once it listens, `GOT <data>`
 // for each message from a peer, `TOPIC-PEERS <n>` when its topic peer
@@ -293,7 +293,7 @@ func nodeMode(args []string) {
 			defer tick.Stop()
 			last := -1
 			// The message id is the data, so each publish carries a
-			// count: a repeat would be a duplicate and go nowhere.
+			// count. The routers would drop a repeat as a duplicate.
 			count := 0
 			for {
 				select {

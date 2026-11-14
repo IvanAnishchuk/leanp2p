@@ -11,11 +11,12 @@ The wire messages of gossipsub v1.1 to v1.3, their `ProtoMessage`
 instances, and the length-delimited frame step.
 
 The field numbers come from the vendored specs: `vendor/specs/pubsub/README.md`
-for `RPC`, `SubOpts`, and `Message`, `gossipsub-v1.0.md` for the control
-envelope and its four messages, `gossipsub-v1.1.md` for the prune
-peers and the backoff, `gossipsub-v1.2.md` for IDONTWANT, and
-`extensions/extensions.proto` for the v1.3 Extensions message, the
-`SubOpts` partial flags, and the partial-messages RPC.
+for `RPC`, `SubOpts`, and `Message`, and these for the rest:
+- `gossipsub-v1.0.md`: the control envelope and its four messages
+- `gossipsub-v1.1.md`: the prune peers and the backoff
+- `gossipsub-v1.2.md`: IDONTWANT
+- `extensions/extensions.proto`: the v1.3 Extensions message, the
+  `SubOpts` partial flags, and the partial-messages RPC
 
 Proto has no nested-message value. A nested message goes on the wire as a
 `.bytes` entry that holds its encoding, and the decoder decodes that
@@ -42,8 +43,8 @@ namespace Libp2p.Protocols.Gossipsub
 The strict singular readers are `codec/proto`'s (`Pb.bytesField?`,
 `Pb.strField?`, `Pb.varintField?`), the one home of the rule. This
 module adds a strict bool reader, which only gossipsub needs. Each
-reader gates on `Pb.hasField`, so a present field of another wire type
-is `badField` rather than a miss. -/
+reader checks `Pb.hasField` first, so a present field of another wire
+type gives `badField`. -/
 
 /-- A strict bool. A miss and varint 0 are `false`, varint 1 is `true`,
 and every other present value is `badField`. -/
@@ -306,7 +307,7 @@ namespace Rpc
 
 /-- One subscription option. Field 1 is the bool, field 2 the topic.
 Fields 3 and 4 are the partial-messages flags (`extensions.proto`,
-`SubOpts`); a peer without the extension ignores them. -/
+`SubOpts`). A peer without the extension ignores them. -/
 structure SubOpts where
   /-- True subscribes, false unsubscribes. -/
   subscribe : Bool            -- field 1, bool
@@ -321,7 +322,8 @@ structure SubOpts where
 namespace SubOpts
 
 /-- The wire view: field 1 as a varint, field 2 as the topic bytes, and
-fields 3 and 4 only when true. A v1.1 subscription so keeps its bytes. -/
+fields 3 and 4 only when true. So a v1.1 subscription keeps its v1.1
+bytes. -/
 def entries (s : SubOpts) : List Pb.Entry :=
   [(1, .varint (if s.subscribe then 1 else 0)),
    (2, .bytes (Bytes.toNatList (Bytes.ofString s.topicid)))] ++
@@ -662,7 +664,7 @@ end ControlPrune
 
 /-- The v1.3 Extensions control message (`gossipsub-v1.3.md`, "The
 Extensions Control Message"). A peer sends it once, in the first RPC on
-its stream. Field 10 is the partial-messages extension; the decoder
+its stream. Field 10 is the partial-messages extension. The decoder
 drops unknown extensions, as the spec requires. -/
 structure ControlExtensions where
   /-- The sender supports partial messages. -/
@@ -715,7 +717,7 @@ end ControlExtensions
 
 /-- The partial-messages RPC (`extensions.proto`,
 `PartialMessagesExtension`). The application defines `partialMessage`
-and `partsMetadata`; the library forwards them (`partial-messages.md`,
+and `partsMetadata`, and the library forwards them (`partial-messages.md`,
 "Application-Library Interface"). -/
 structure PartialMessage where
   /-- The topic, as bytes. -/

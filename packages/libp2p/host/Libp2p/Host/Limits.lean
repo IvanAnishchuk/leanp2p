@@ -5,19 +5,18 @@ import Libp2p.Core
 /-!
 # The limiting resource manager (root §9, delta 4)
 
-A `ResourceManager` that counts. The limits of delta 4: per connection,
-the stream count and the buffered bytes; per peer, the connections,
-the streams, and the bytes; and over the host, the connections and a
-memory ceiling.
+A `ResourceManager` that counts. The limits of delta 4:
+- per connection: the stream count and the buffered bytes
+- per peer: the connections, the streams, and the bytes
+- over the host: the connections and a memory ceiling
 
-The counts sit in one table, changed only by the pure functions of
-`Table` under one `OnceRef.updateGet` each (contract 1; PRINCIPLES
-3.3). A reservation holds its own cell, and its release runs once.
+The counts are in one table. Only the pure functions of `Table` change
+it, each under one `OnceRef.updateGet` (contract 1, PRINCIPLES 3.3). A
+reservation holds its own cell, and its release runs once.
 
-A connection counts against its peer only after `setPeer`. Its
-reservations before that count against the connection and the host
-alone, and `setPeer` moves them onto the peer, or refuses when they do
-not fit.
+A connection counts against its peer only after `setPeer`. Before that,
+its reservations count against the connection and the host alone.
+`setPeer` moves them onto the peer, or refuses when they do not fit.
 -/
 
 set_option autoImplicit false
@@ -26,7 +25,7 @@ namespace Libp2p.Host.Limits
 
 open Conc Libp2p.Core Libp2p.Identity
 
-/-- The bounds. The defaults are spike placeholders with no source; a
+/-- The bounds. The defaults are spike placeholders with no source. A
 consensus client sets its own. -/
 structure Bounds where
   /-- Connections over the host. -/
@@ -68,7 +67,8 @@ namespace Table
 /-- The use of a peer, zero when it has none. -/
 def peerUse (t : Table) (p : PeerId) : PeerUse := t.peers.getD p {}
 
-/-- Store a peer's use; a peer with no connection leaves the table. -/
+/-- Store a peer's use. A peer with no connection, no stream, and no
+bytes leaves the table. -/
 def setPeerUse (t : Table) (p : PeerId) (u : PeerUse) : Table :=
   if u.connections = 0 && u.streams = 0 && u.memory = 0 then { t with peers := t.peers.erase p }
   else { t with peers := t.peers.insert p u }
@@ -155,7 +155,7 @@ def closeConn (id : Nat) (t : Table) : Table :=
 
 end Table
 
-/-- A share that releases once: the first call runs `act`. -/
+/-- A reservation that releases once: the first call runs `act`. -/
 private def once (act : BaseIO Unit) : BaseIO Reservation := do
   let done ← OnceRef.new false
   return { release := do

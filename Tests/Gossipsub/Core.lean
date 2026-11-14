@@ -447,7 +447,7 @@ def run (r : Runner) : IO Unit := do
       ((expirePending vParams s' ttl).pending.isEmpty &&
         (expirePending vParams s' ttl).pendingAt.isEmpty)
   | .error _ => r.check "core.validate.expiry-setup" false
-  -- A duplicate during the wait is dropped by the seen cache.
+  -- The seen cache drops a duplicate during the wait.
   r.check "core.validate.duplicate-dropped"
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
         [inbound, .rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))] with
@@ -482,7 +482,7 @@ def run (r : Runner) : IO Unit := do
         (.rpc pa (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))) with
      | .ok (_, acts) => sendsTo pd acts = 1 && sendsTo pb acts = 1
      | _ => false)
-  -- A GRAFT from an explicit peer is rejected with a PRUNE.
+  -- The core rejects a GRAFT from an explicit peer with a PRUNE.
   r.check "core.explicit.graft-pruned"
     (match step baseParams { known with explicit := [pa] }
         (.rpc pa (Pb.encodeMessage (rpcOfControl (controlOf [graftOf ta] [])))) with
@@ -549,7 +549,7 @@ def run (r : Runner) : IO Unit := do
       (memB pc (meshOf m ta) && graftCount ta acts = 1)
   | .error _ => r.check "core.opportunistic.setup" false
   -- The delivery record. A duplicate from mesh peer `pb` within the
-  -- window counts toward P₃; the topic's window is 10 ms here.
+  -- window counts toward P₃. The topic's window is 10 ms here.
   -- `scoreTopic` caps the P₃ counter at 0, so this topic lifts the cap.
   let windowTopic : Score.TopicParams :=
     { scoreTopic with meshMessageDeliveriesWindow := 10, meshMessageDeliveriesCap := 10 }
@@ -573,7 +573,7 @@ def run (r : Runner) : IO Unit := do
      | _ => false)
 
   -- The spam measures. An IHAVE past `maxIhaveMessages` in one heartbeat
-  -- gets no IWANT; the ids are fresh, so each earlier one does.
+  -- gets no IWANT. The ids are fresh, so each earlier IHAVE gets one.
   let ihaveOf (n : Nat) : Event :=
     .rpc pa (Pb.encodeMessage (rpcOfControl
       { ihave := [{ topicId := "t", messageIds := [⟨[100 + n]⟩] }], iwant := [], graft := [],
@@ -583,7 +583,8 @@ def run (r : Runner) : IO Unit := do
     (match Libp2p.Protocols.Gossipsub.Core.run capped known [ihaveOf 1, ihaveOf 2, ihaveOf 3] with
      | .ok (_, acts) => sendsTo pa acts = 2
      | _ => false)
-  -- An IWANT for one id is answered `gossipRetransmission` times, no more.
+  -- The core answers an IWANT for one id at most `gossipRetransmission`
+  -- times.
   let cachedState : State :=
     { known with mcache := (Cache.MessageIndex.empty baseParams.window).put ⟨[7]⟩ (msgOf ta [7]) }
   let iwant7 : Event := .rpc pa (Pb.encodeMessage (iwantRpc [⟨[7]⟩]))
@@ -592,8 +593,8 @@ def run (r : Runner) : IO Unit := do
         [iwant7, iwant7, iwant7, iwant7] with
      | .ok (_, acts) => publishCount acts = 3
      | _ => false)
-  -- Score retention: `pa` leaves with one invalid delivery and comes back
-  -- within `retainScore` to the same count, not to zero.
+  -- Score retention: `pa` leaves with one invalid delivery and returns
+  -- within `retainScore`. Its count is still one.
   r.check "core.retain.score-survives-reconnect"
     (match Libp2p.Protocols.Gossipsub.Core.run cfgParams known
         [.rpc pa (Pb.encodeMessage (rpcOfPublish [badMsg])), .peerLeft pa,
@@ -601,9 +602,9 @@ def run (r : Runner) : IO Unit := do
      | .ok (s', _) => invalidCount s' pa ta = 1
      | _ => false)
 
-  -- `dScore`: an overfull mesh keeps its best-scoring peer. `pa` scores
-  -- above the others through P₂ first deliveries, and the old rule would
-  -- have pruned it from the front.
+  -- `dScore`: an overfull mesh keeps its best-scoring peer. `pa` is at
+  -- the front of the mesh list, where the fill does not reach, and scores
+  -- above the others through P₂ first deliveries.
   let firstTopic : Score.TopicParams :=
     { scoreTopic with firstMessageDeliveriesWeight := 1000, firstMessageDeliveriesCap := 10 }
   let firstTopics : TopicId → Option Score.TopicParams := fun t =>
@@ -637,7 +638,8 @@ def run (r : Runner) : IO Unit := do
            | none => false
          | _ => false
      | _ => false)
-  -- Flood publishing reaches every subscribed peer, not the mesh alone.
+  -- Flood publishing reaches every subscribed peer, inside and outside the
+  -- mesh.
   r.check "core.publish.flood"
     (match step { baseParams with floodPublish := true } { known with mesh := [(ta, [pa])] }
         (.publish (msgOf ta [5])) with
@@ -649,8 +651,8 @@ def run (r : Runner) : IO Unit := do
     (match step baseParams known (.appScore pa (-7)) with
      | .ok (s', acts) => acts.isEmpty && ((peerOf s' pa).map (·.score.appScore)) == some (-7)
      | _ => false)
-  -- The parameter constraints. `defaults` turns scoring off with zero
-  -- thresholds, so it breaks the threshold rules; a scored set passes.
+  -- The parameter constraints. `defaults` disables scoring with zero
+  -- thresholds, so it breaks the threshold rules. A scored set passes.
   r.check "core.params.defaults-break-thresholds"
     (defaults.problems.contains "GossipThreshold must be < 0" &&
       !defaults.problems.contains "D_out must be less than D_lo")
@@ -665,7 +667,7 @@ def run (r : Runner) : IO Unit := do
     ({ scored with dOut := 4 }.problems.contains "D_out must be at most D/2")
 
   -- The data cap (phase0 "Maximum message sizes"): a message over it is
-  -- invalid, so it is dropped and the sender takes P₄.
+  -- invalid. The core drops it, and the sender takes P₄.
   let capParams : Params := { cfgParams with maxDataSize := some 2 }
   r.check "core.size.over-cap-rejected"
     (match step capParams meshed

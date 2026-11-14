@@ -1,10 +1,10 @@
 # leanp2p discv5: plan
 
 This plan refines the root `docs/PLAN.md` for `libp2p/discv5`. The root
-plan has no unit for it yet: it calls discv5 out of scope (root PLAN
-W6.1, ARCHITECTURE §8). The spike on `experiment/client` built it,
-because a consensus node finds its peers through it, and the units
-below record that work for the root plan to take in.
+plan has no unit for it, and root W6.1 keeps discv5 out of scope. A
+consensus node finds its peers through discv5, so the spike on
+`experiment/client` holds the package. The units below are the input
+for a root unit.
 
 ## Units
 
@@ -16,23 +16,24 @@ below record that work for the root plan to take in.
 | 3 | unit 2 | the node table and the core (`Table.lean`, `Core.lean`) | two cores handshake and answer in memory |
 | 4 | unit 3, W4.1 | the node over UDP (`Node.lean`): the lookup, revalidation, the rate limit, IPv6 | the conformance suites below pass |
 
-All four units are done on `experiment/client`.
+All five units are done on `experiment/client`.
 
 ## Consumers
 
-A consensus client calls `findPeers` with a predicate over records, a
-fork-digest match on `eth2` and a subnet match on `attnets` or
-`syncnets`, and dials what comes back through the host. The ENR side of
-`libp2p/identity` maps each record to a peer id and a multiaddr.
+A consensus client calls `findPeers` with a predicate over records. The
+predicate matches the fork digest in `eth2` and a subnet in `attnets` or
+`syncnets`. The client dials the records that `findPeers` returns
+through the host. The ENR side of `libp2p/identity` maps each record to
+a peer id and a multiaddr.
 
 ## Test milestones
 
 `Tests/Discv5.lean`, run alone with `LEANP2P_SUITE=discv5`:
 
 - The wire vectors of `discv5-wire-test-vectors.md` (devp2p at
-  `2c19a28`): the four packets unmask, open, and decode at node B, and
-  the four crypto vectors (ECDH, key derivation, id signature,
-  AES-GCM) match. Our encoder writes the vector PING's bytes.
+  `2c19a28`). The four packets unmask, open, and decode at node B. The
+  four crypto vectors match: ECDH, key derivation, id signature, and
+  AES-GCM. Our encoder writes the bytes of the vector PING.
 - Two cores in memory: the handshake in both roles, PING and PONG,
   FINDNODE and NODES, TALKREQ and TALKRESP, the votes and their expiry.
 - The geth scenarios, replayed in memory: the session bound to its
@@ -60,7 +61,9 @@ and Rust tooling:
 
 ## Vector stance
 
-The wire vectors are copied into `Tests/Discv5.lean` from the devp2p
-clone at `2c19a28`; a pinned vendor copy and a `VECTORS.lock` entry come
-with the root unit. The conformance harnesses pin their upstream code
-by commit (geth) and by exact crate version with a lock file (sigp).
+`VECTORS.lock` pins `vendor/devp2p` at `2c19a28`, with the test vector
+file alone, since the repository has no license file.
+`scripts/extract-vectors.py` extracts it to
+`Tests/vectors/discv5-wire.json`, and the suite reads that file. The
+conformance harnesses pin their upstream code by commit (geth), and by
+exact crate version with a lock file (sigp).

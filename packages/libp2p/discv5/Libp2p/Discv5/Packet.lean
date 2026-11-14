@@ -8,18 +8,18 @@ import Libp2p.Identity
 The wire protocol of devp2p `discv5/discv5-wire.md` (protocol version
 v5.1, `version = 0x0001`), which the consensus networking spec names for
 peer discovery (phase0 `p2p-interface.md`, "The discovery domain:
-discv5"). This module holds the pure codec and the crypto the handshake
-needs; the session table, the node table, the lookup, and the UDP loop
-are not here.
+discv5"). This module holds the pure codec and the crypto that the
+handshake needs. The session table, the node table, the lookup, and the
+UDP loop are in other modules.
 
 A packet is `masking-iv ‖ masked-header ‖ message`:
 
-* `masking-iv` is 16 random bytes;
-* the header is `static-header ‖ authdata`, masked with AES-128-CTR
-  under the first 16 bytes of the destination's node id and the IV;
-* the static header is `"discv5" ‖ version ‖ flag ‖ nonce ‖
-  authdata-size`, 23 bytes;
-* the message is AES-128-GCM under the session key, with the packet's
+* `masking-iv` is 16 random bytes.
+* The header is `static-header ‖ authdata`, masked with AES-128-CTR
+  under the first 16 bytes of the destination's node id and the IV.
+* The static header is `"discv5" ‖ version ‖ flag ‖ nonce ‖
+  authdata-size`, 23 bytes.
+* The message is AES-128-GCM under the session key, with the packet's
   nonce, and with `masking-iv ‖ header` as the associated data.
 
 CTR is a stream cipher, so the recipient unmasks the static header
@@ -112,7 +112,7 @@ structure Unmasked where
   message : ByteArray
 
 /-- Unmask a packet sent to the node `localId`. The static header comes
-first; its `authdata-size` fixes how far the CTR run goes. -/
+first. Its `authdata-size` sets the length of the CTR run. -/
 def unmask (localId packet : ByteArray) : Except Error Unmasked := do
   if packet.size < minPacket || maxPacket < packet.size then throw .size
   let iv := packet.extract 0 ivLen
@@ -155,11 +155,14 @@ structure SessionKeys where
   initiator : Crypto.Key16
   recipient : Crypto.Key16
 
-/-- `secret = ecdh(dest-pubkey, ephemeral-key)`; then
-`HKDF-Extract(challenge-data, secret)` and `HKDF-Expand` with
-`"discovery v5 key agreement" ‖ node-id-A ‖ node-id-B` to 32 bytes.
+/-- The session keys:
+1. `secret = ecdh(dest-pubkey, ephemeral-key)`
+2. `HKDF-Extract(challenge-data, secret)`
+3. `HKDF-Expand` with `"discovery v5 key agreement" ‖ node-id-A ‖
+   node-id-B`, to 32 bytes
+
 ECDH is symmetric, so the recipient calls the same function with its
-static key and the initiator's ephemeral public key; `idA` stays the
+static key and the initiator's ephemeral public key. `idA` stays the
 initiator's id on both sides. -/
 def deriveKeys (ephemeralKey : Crypto.Key32) (destPubkey challengeData idA idB : ByteArray) :
     Except Error SessionKeys := do

@@ -84,8 +84,8 @@ them:
   `identity → core → {security, mux} → {negotiate, quic} → host →
   protocols`. Implementations import `core`. `negotiate` and `host`
   import `core` and no implementation (§3.1); `cli/` hands the host the
-  `quic` value. `discv5` imports `identity` only and sits at the rank
-  of `core`: it speaks no libp2p, and the client joins it to the host.
+  `quic` value. `discv5` imports `identity` only, so it has the rank of
+  `core`. It speaks no libp2p. The client joins it to the host.
 - No package left of `libp2p` mentions libp2p, so other projects can
   use these packages.
 
@@ -628,8 +628,8 @@ socket. Each binding stays inside its package: `Streams/Tcp.lean` and
 `Streams/Udp.lean`, and in `net/quic` the modules `Quic/Loop.lean` (the
 receive and the send) and `Quic/Endpoint.lean` (the socket's creation).
 The `Std` bind of a UDP socket always sets SO_REUSEADDR, which lets two
-sockets share a port, so every UDP socket binds through the streams
-shim instead (`StreamsShim.udpBind`; the quic ARCHITECTURE,
+sockets share a port. So every UDP socket binds through the streams
+shim instead, with `StreamsShim.udpBind` (the quic ARCHITECTURE,
 "Decisions", the exclusive bind). When the toolchain API moves, the
 wrapper and those modules are the ones to change.
 
@@ -1081,7 +1081,7 @@ interface seams exist, and no implementation work is scheduled.
   secp256k1. RSA comes from the go-libp2p defaults, and the eth2 spec
   does not use it.
 - **Peer records and signed envelopes (RFC 0002, RFC 0003).** Consensus
-  does not require them; identify and gossipsub's peer exchange carry
+  does not require them. Identify and gossipsub's peer exchange carry
   them. The spike on `experiment/client` built them in
   `libp2p/identity` (`Record.lean`).
 - **kad-dht, peer routing, content routing.** Consensus has no DHT.

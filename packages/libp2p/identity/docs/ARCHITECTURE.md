@@ -106,17 +106,20 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
   checked encoder. Other bases and codec failures at the multibase
   boundary map to `Enr.Error.text`.
 - Signed peer records (RFC 0002, RFC 0003). `EnvelopeMsg` and
-  `PeerRecordMsg` are the wire model over the byte model, each with its
-  table law and `decodeEncode` theorem; proto3 keeps an empty `bytes`
-  field and a zero `seq` off the wire, as go-libp2p writes them.
-  `Envelope` holds a checked `PubKey`; `Envelope.sign` signs
-  `unsignedBytes`, the domain, the payload type, and the payload, each
+  `PeerRecordMsg` are the wire model over the byte model. Each has its
+  table law and its `decodeEncode` theorem. Proto3 keeps an empty
+  `bytes` field and a zero `seq` off the wire, as go-libp2p writes them.
+  `Envelope` holds a checked `PubKey`. `Envelope.sign` signs
+  `unsignedBytes`: the domain, the payload type, and the payload, each
   after its uvarint length. `PeerRecord.sign` seals with go-libp2p's
-  domain and payload type, and `PeerRecord.open?` runs the RFC 0003
-  order: payload type, signature, decode, then the signer's peer id
-  against the record's. The host keeps the newest record of each peer
-  (`libp2p/host`), identify carries it, and gossipsub's peer exchange
-  hands it on.
+  domain and payload type. `PeerRecord.open?` runs the RFC 0003 order:
+  1. the payload type
+  2. the signature
+  3. the decode
+  4. the signer's peer id against the record's
+
+  The host keeps the newest record of each peer (`libp2p/host`).
+  Identify carries it, and gossipsub's peer exchange hands it on.
 
 ## Owned contracts and how the package keeps them
 
@@ -201,9 +204,10 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
    checks the payload type, verifies the signature under the domain of
    that type, and only then decodes the payload (RFC 0003: "a peer MUST
    validate the signature before deserializing"). A record whose
-   `peer_id` is not the signer's is `recordPeer`. An Ed25519 seal is
-   deterministic, so `Tests/Record.lean` pins our bytes to go-libp2p's
-   for one record, and `scripts/pubsub-interop.sh` has go consume ours.
+   `peer_id` is not the signer's fails with `recordPeer`. An Ed25519
+   seal is deterministic, so `Tests/Record.lean` pins our bytes to
+   go-libp2p's for one record. `scripts/pubsub-interop.sh` has go
+   consume our record.
 
 ## Decisions
 
@@ -240,14 +244,15 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
   module.
 - **The peer record speaks go-libp2p's domain and payload type.** RFC
   0003 names `libp2p-routing-state` and `"/libp2p/routing-state-record"`.
-  go-libp2p signs with `libp2p-peer-record` and the multicodec 0x0301,
-  and rust-libp2p calls that pair its interop form, the RFC pair its
-  legacy form. The spec and both implementations disagree, so the choice
-  is a decision (PRINCIPLES 2.1): the seal writes go's pair, the form
-  every peer exchange of the consensus clients carries, and the open
-  accepts both pairs, each verified under its own domain. An address
-  that does not decode is dropped from the record, as go-libp2p's
-  `addrsFromProtobuf` drops it; rust-libp2p refuses the whole record.
+  go-libp2p signs with `libp2p-peer-record` and the multicodec 0x0301.
+  rust-libp2p opens that pair with `from_signed_envelope_interop`, and
+  its `from_signed_envelope` opens the RFC pair as the legacy form. Both
+  implementations disagree with the spec, so the choice is a decision
+  (PRINCIPLES 2.1). The seal writes go's pair. The open accepts both
+  pairs, and it verifies each under its own domain.
+  `PeerRecord.unmarshal?` drops an address that does not decode, as
+  go-libp2p's `addrsFromProtobuf` does. rust-libp2p refuses the whole
+  record.
 - **The strictness depth stops at the DER shell.** A full DER parse
   here would duplicate the backend's parser, and two parsers drift.
   The shell check is enough to gate the id derivation; the verifier

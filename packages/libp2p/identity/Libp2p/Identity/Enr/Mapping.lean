@@ -93,11 +93,12 @@ The consensus networking spec gives the ports their own meanings
 (phase0 `p2p-interface.md`, "ENR structure"): "An IPv4 QUIC port
 (`quic` field) ... and/or the corresponding IPv6 port (`quic6` field)",
 and the same for `tcp`/`tcp6` (libp2p TCP) and `udp`/`udp6` (discv5).
-So the dial addresses read `tcp` and `quic`, never `udp`, and an IPv6
-address takes only `tcp6` and `quic6`: no fallback to the IPv4 port,
-which EIP-778's generic rule has and `multiaddrs` keeps. Lighthouse's
-`dialable_multiaddrs_tcp` reads it the same way. A port of 0 is no
-listener, and gives no address, as in Lighthouse. -/
+So the dial addresses read `tcp` and `quic`, never `udp`. An IPv6
+address takes only `tcp6` and `quic6`, with no fallback to the IPv4
+port. EIP-778's generic rule has that fallback, and `multiaddrs` keeps
+it. Lighthouse's `dialable_multiaddrs_tcp` reads the record in the same
+way. A port of 0 means no listener, so it gives no address, as in
+Lighthouse. -/
 
 /-- The `quic` key of the consensus spec. -/
 def quicKey : Key := Key.ofName nameQuic

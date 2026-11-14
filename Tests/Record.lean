@@ -11,19 +11,20 @@ The checks of `Libp2p.Identity.Record` and of the host's record store:
 
 * The domain and payload-type constants are the ASCII bytes of their
   strings.
-* go-libp2p v0.51.0 vector: `scripts/pubsub-go record R 7 …` sealed the
-  record of the Ed25519 key of 32 bytes of `R`, with seq 7 and two
+* The go-libp2p v0.51.0 vector: `scripts/pubsub-go record R 7 …` sealed
+  the record of the Ed25519 key of 32 bytes of `R`, with seq 7 and two
   addresses. Ed25519 signs deterministically, so our signature of the
   same record must give the same bytes. The vector also opens, and names
   the peer, the seq, and the addresses.
-* A secp256k1 record round-trips through sign and open; its signature
-  draws a nonce, so only the open is checked.
+* A secp256k1 record round-trips through sign and open. Its signature
+  draws a nonce, so the suite checks only the open.
 * The rejections, one each: a flipped signature byte, an unknown payload
-  type, a record that names another peer than its signer, and bytes that
+  type, a record that names a peer other than its signer, and bytes that
   are not an envelope. The legacy pair of RFC 0003 opens.
-* The host store: a newer `seq` replaces the record, an older or equal
-  one does not, and a record for another peer than the expected one is
-  refused. A taken record adds its addresses to the peerstore.
+* The host store: a newer `seq` replaces the record, and an older or
+  equal one does not. The store refuses a record for a peer other than
+  the expected one. A record that the store takes adds its addresses to
+  the peerstore.
 -/
 
 set_option autoImplicit false

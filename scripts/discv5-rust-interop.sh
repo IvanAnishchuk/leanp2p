@@ -3,14 +3,17 @@
 # discv5 crate at 0.12.0 (lighthouse Cargo.lock), both directions.
 #
 # rust-to-lean: the suite binary serves in `discv5serve` mode and prints
-# its ENR; the helper (scripts/discv5-rust) PINGs it, FINDNODEs it at
+# its ENR. The helper (scripts/discv5-rust) PINGs it, FINDNODEs it at
 # distance 0, and TALKREQs its `echo` protocol.
-# lean-to-rust: the helper serves and prints its ENR; the suite binary in
+# lean-to-rust: the helper serves and prints its ENR. The suite binary in
 # `discv5client` mode sends the same three requests.
 #
-# Each direction passes when the querying side exits 0, which needs a
-# PONG, the target's own record in NODES, and `echo` answered with
-# [1, 2, 3]. The helper builds with cargo on two cores into
+# Each direction passes when the querying side exits 0. That needs:
+# - a PONG
+# - the target's own record in NODES
+# - the answer [1, 2, 3] to `echo`
+#
+# The helper builds with cargo on two cores into
 # .tmp/discv5-interop/rust-target.
 set -euo pipefail
 

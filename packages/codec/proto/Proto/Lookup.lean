@@ -8,10 +8,11 @@ occurrence of the requested number. Repeated accessors keep wire order.
 Nested parsing reports malformed payloads through the wire error type.
 
 The strict readers (`bytesField?`, `strField?`, `varintField?`) are the
-one home of the rule every message table of the stack follows: a
-present singular field of the wrong wire type, or a string that is not
-UTF-8, is `badField`, gated by `hasField`, and a missing field is
-`none`.
+one home of a rule that every message table of the stack follows:
+- A present singular field of the wrong wire type gives `badField`.
+- A string that is not UTF-8 gives `badField`.
+- A missing field gives `none`. `hasField` tells a missing field from a
+  present one.
 -/
 
 set_option autoImplicit false
@@ -66,8 +67,8 @@ def getAllStrs (num : Nat) (fs : Fields) : List String :=
 def hasField (num : Nat) (fs : Fields) : Bool :=
   fs.entries.any fun e => e.1 == num
 
-/-- A strict singular payload: a present field must be length-delimited,
-else `badField`; a miss is `none`. -/
+/-- A strict singular payload. A present field that is not
+length-delimited gives `badField`, and a missing field gives `none`. -/
 def bytesField? (num : Nat) (fs : Fields) : Except Error (Option (List Nat)) :=
   if hasField num fs then
     match getBytes? num fs with
@@ -75,8 +76,9 @@ def bytesField? (num : Nat) (fs : Fields) : Except Error (Option (List Nat)) :=
     | none => .error .badField
   else .ok none
 
-/-- A strict singular string: a present field must be length-delimited
-and valid UTF-8, else `badField`; a miss is `none`. -/
+/-- A strict singular string. A present field that is not
+length-delimited, or not valid UTF-8, gives `badField`. A missing field
+gives `none`. -/
 def strField? (num : Nat) (fs : Fields) : Except Error (Option String) :=
   if hasField num fs then
     match (getBytes? num fs).bind (fun bs => Bytes.toString? (Bytes.ofNatList bs)) with
@@ -84,8 +86,8 @@ def strField? (num : Nat) (fs : Fields) : Except Error (Option String) :=
     | none => .error .badField
   else .ok none
 
-/-- A strict singular integer: a present field must be a varint, else
-`badField`; a miss is `none`. -/
+/-- A strict singular integer. A present field that is not a varint
+gives `badField`, and a missing field gives `none`. -/
 def varintField? (num : Nat) (fs : Fields) : Except Error (Option Nat) :=
   if hasField num fs then
     match getVarint? num fs with

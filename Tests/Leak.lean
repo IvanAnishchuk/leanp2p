@@ -108,8 +108,8 @@ def tcpDeadline (r : Runner) : IO Unit := Async.run do
   (tc.close : BaseIO Unit)
   r.check "leak: the deadline closes the client" true
 
-/-- A TCP pair whose peer end is dropped with unread bytes, so the
-client meets a reset, and the client is never closed by the test. -/
+/-- A TCP pair whose peer end the test drops with unread bytes, so the
+client meets a reset. The test never closes the client. -/
 def tcpReset (r : Runner) : IO Unit := Async.run do
   r.section "leak: tcp reset" "#102"
   let c ← do

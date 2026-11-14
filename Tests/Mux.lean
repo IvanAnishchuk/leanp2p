@@ -1793,9 +1793,9 @@ private def runCorrections (r : Runner) : Async Unit := do
     let stream ← mustOpen sess
     let writer ← TaskSet.new
     let wrote : Chan (Except Streams.Error Unit) ← Chan.new 1
-    -- The barrier goes in before the write, and the write's own signal
-    -- is taken first. Installed after `entered`, it could catch the
-    -- writer's late signal in place of the reader's (#98).
+    -- The barrier goes in before the write, and the test takes the
+    -- write's own signal first. A barrier installed after `entered`
+    -- could catch the writer's late signal in place of the reader's (#98).
     hooks.acceptedEvent.set (some accepted)
     writer.spawn do
       let result ← stream.write ⟨Array.replicate (testPayloadCap + 1) 7⟩
@@ -1948,10 +1948,10 @@ private def runCorrections (r : Runner) : Async Unit := do
       | .ok extra =>
         extra.reset
         discard <| box.send false
-    -- A byte event for the owner, in case the open has not reached it.
-    -- When the open got there first, the owner has thrown and torn the
-    -- connection down, so this write fails; that is expected (#98's
-    -- loaded runs hit it as an uncaught `connection is closed`).
+    -- A byte event for the owner, in case the open did not reach it yet.
+    -- When the open got there first, the owner threw and closed the
+    -- connection, so this write fails, and the test expects that. Under
+    -- load, #98's runs met it as an uncaught `connection is closed`.
     try pair.peer.write ⟨#[1]⟩ catch _ => pure ()
     match ← box.recv with
     | some true => r.check "an owner invariant wakes the opener" true
@@ -2018,7 +2018,7 @@ private def runCorrections (r : Runner) : Async Unit := do
       | .ok extra =>
         extra.reset
         discard <| box.send false
-    -- As above: the owner may have torn the connection down already.
+    -- As above: the owner may have closed the connection already.
     try pair.peer.write ⟨#[1]⟩ catch _ => pure ()
     discard <| box.recv
     opener.joinAll
@@ -2062,9 +2062,9 @@ private def runCorrections (r : Runner) : Async Unit := do
     let stream ← mustOpen sess
     let box : Chan Bool ← Chan.new 8
     let workers ← TaskSet.new
-    -- The barrier goes in before the first write, and that write's own
-    -- signal is taken first, so the seven counted below are the seven
-    -- later events (#98).
+    -- The barrier goes in before the first write, and the test takes
+    -- that write's own signal first. So the seven counted below are the
+    -- seven later events (#98).
     hooks.acceptedEvent.set (some accepted)
     workers.spawn do
       let result ← stream.write ⟨#[9]⟩
@@ -2114,8 +2114,8 @@ private def runBudgetFairness (r : Runner) : Async Unit := do
     let frame :=
       Header.encodeB { kind := .data, streamId := id, length := 1 } ++ ⟨#[7]⟩
     blob := blob ++ frame
-  -- The barrier goes in before the blob, and the blob's own signal is
-  -- taken first (#98).
+  -- The barrier goes in before the blob, and the test takes the blob's
+  -- own signal first (#98).
   hooks.acceptedEvent.set (some accepted)
   pair.peer.write blob
   discard <| entered.recv
@@ -2151,8 +2151,8 @@ private def runInverseFairness (r : Runner) : Async Unit := do
     let frame :=
       Header.encodeB { kind := .data, streamId := id, length := 1 } ++ ⟨#[7]⟩
     blob := blob ++ frame
-  -- The barrier goes in before the blob, and the blob's own signal is
-  -- taken first (#98).
+  -- The barrier goes in before the blob, and the test takes the blob's
+  -- own signal first (#98).
   hooks.acceptedEvent.set (some accepted)
   pair.peer.write blob
   discard <| entered.recv
@@ -2219,8 +2219,8 @@ private def runDeferredPressure (r : Runner) (n : Nat) (fault : Bool) : Async Un
     let frame :=
       Header.encodeB { kind := .data, streamId := id, length := 1 } ++ ⟨#[7]⟩
     blob := blob ++ frame
-  -- The barrier goes in before the blob, and the blob's own signal is
-  -- taken first, as in `runRetained` (#98).
+  -- The barrier goes in before the blob, and the test takes the blob's
+  -- own signal first, as in `runRetained` (#98).
   hooks.acceptedEvent.set (some accepted)
   pair.peer.write blob
   discard <| entered.recv
@@ -2264,8 +2264,9 @@ private def runDeferredPressure (r : Runner) (n : Nat) (fault : Bool) : Async Un
       && extra == none
       && secondRelease == some (parserFrameBudget * 3)
       && answersClosed
-  -- The count is read after the session's join, as in `runRetained`
-  -- (#98): a frame the session's writer sends late is counted too.
+  -- The test reads the count after the session's join, as in
+  -- `runRetained` (#98). So the count includes a frame that the session's
+  -- writer sends late.
   if fault then
     let first ← joinText sess
     let second ← joinText sess
@@ -2323,10 +2324,10 @@ private def runRetained (r : Runner) (n : Nat) (trailing fault : Bool) : Async U
       Header.encodeB { kind := .data, streamId := id, length := 1 } ++ ⟨#[7]⟩
     blob := blob ++ frame
   if trailing then blob := blob ++ ⟨#[0, 0, 0, 0]⟩
-  -- The barrier goes in before the blob, and the blob's own signal is
-  -- taken here. Installed after `entered`, it caught the reader's late
-  -- signal for the blob, so the test took that for the write's and let
-  -- the owner run before the terminal was posted (#98).
+  -- The barrier goes in before the blob, and the test takes the blob's
+  -- own signal here. A barrier installed after `entered` could catch the
+  -- reader's late signal for the blob. The test would take that for the
+  -- write's, and let the owner run before the post of the terminal (#98).
   hooks.acceptedEvent.set (some accepted)
   pair.peer.write blob
   discard <| entered.recv
@@ -2343,10 +2344,10 @@ private def runRetained (r : Runner) (n : Nat) (trailing fault : Bool) : Async U
   discard <| release.send ()
   writer.joinAll
   -- The data frames leave through the session's own writer task, which
-  -- `writer` does not hold. So the count is read after the session's
-  -- join, when every frame the session will write is out (#98: a read
-  -- before the join could see 0). The name carries the count, so a
-  -- failure says which side broke.
+  -- `writer` does not hold. So the test reads the count after the
+  -- session's join, when the session sent every frame it will write.
+  -- A read before the join could see 0 (#98). The name carries the
+  -- count, so a failure says which side broke.
   let chunkCheck (what : String) : Async Unit := do
     let chunks ← (phase.get : BaseIO Nat)
     r.check s!"no chunk follows a deferred {what} (chunks: {chunks})" (chunks == 1)

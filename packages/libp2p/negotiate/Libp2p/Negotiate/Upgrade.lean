@@ -155,11 +155,11 @@ def initiatorStart (ids : List Core.ProtocolId) :
 /-- The responder's start: validate the offered list, then send the header
 at once. The spec lets either side send first, and the responder that waits
 for the dialer's header stalls a dialer that also waits. The state starts in
-`headerPending` with `headerSent`: "If either side receives anything other
+`headerPending` with `headerSent`. "If either side receives anything other
 than the multistream protocol id as the first message, they abort"
-(connections spec, "Protocol Negotiation"), and the header is already on the
-wire, so the peer's header moves the state on and writes nothing
-(etheorem/leanp2p#97). -/
+(connections spec, "Protocol Negotiation"). Our header is already on the
+wire, so the peer's header takes the state to `negotiating` and writes
+nothing (etheorem/leanp2p#97). -/
 def responderStart (ids : List Core.ProtocolId) :
     Except Error (State × List (List Nat)) :=
   if ids.any (fun q => !fitsText q.toString) then .error .negotiationFailed

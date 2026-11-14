@@ -89,8 +89,8 @@ structure Failure where
 /-- A change in the session that serves a peer. Every committed session
 raises `connected` before its serve task starts. Its serve task raises
 `disconnected` when the session ends while it still holds the peer's
-slot. A session the dedup displaced raises no `disconnected`, since the
-peer stays connected through its successor (`Libp2p.Host.Dedup`), so a
+slot. A session that the dedup displaced raises no `disconnected`: the
+peer stays connected through its successor (`Libp2p.Host.Dedup`). So a
 peer can see two `connected` in a row.
 
 Both carry the session number. The two events of different sessions
@@ -107,8 +107,8 @@ inductive ConnEvent where
 
 /-- A liveness probe of the live sessions (root §9, delta 2: "a
 keepalive or identity probe"), for a muxer with no keepalive of its
-own, such as mplex. Every `intervalMs` the host runs `run` against each
-connected peer under a `timeoutMs` deadline; a probe that answers
+own, such as mplex. Every `intervalMs`, the host runs `run` against each
+connected peer under a `timeoutMs` deadline. A probe that answers
 `false` or misses the deadline ends that peer's session (`closePeer`).
 The caller builds `run` from a protocol above the host, such as the
 libp2p ping (`Libp2p.Protocols.Ping`), which the host cannot import. -/
@@ -155,7 +155,7 @@ structure Config where
   onFailure : Failure → BaseIO Unit := fun _ => pure ()
   /-- The bounds of the peerstore (root §9, delta 3). -/
   peerstoreLimits : Limits := {}
-  /-- The liveness probe; `none` runs none (`Host.startProbe`). -/
+  /-- The liveness probe, or `none` for no probe (`Host.startProbe`). -/
   probe : Option Probe := none
 
 /-- A session the host serves: the upgraded connection, the peer's
@@ -185,8 +185,8 @@ structure Host where
   /-- The peerstore (§3.8). -/
   peerstore : OnceRef Peerstore
   /-- The certified records: the newest signed peer record of each peer,
-  with its `seq` (RFC 0003, "Peer Store APIs"). The same peer cap as
-  the peerstore bounds it. -/
+  with its `seq` (RFC 0003, "Peer Store APIs"). The peer cap of the
+  peerstore also bounds it. -/
   records : OnceRef (Std.HashMap PeerId (Nat × ByteArray))
   /-- The next session number, and the next pending key. -/
   counter : OnceRef Nat
@@ -255,7 +255,7 @@ def setHandler (h : Host) (handler : StreamHandler) : BaseIO Unit :=
   h.handlers.update (Handlers.set handler)
 
 /-- Add addresses of `peer` to the peerstore, each once. `ttlMs` gives
-them an expiry on the host clock; discovered addresses take one, and
+them an expiry on the host clock. Discovered addresses take one, and
 dialed addresses take none. -/
 def addAddrs (h : Host) (peer : PeerId) (addrs : List Multiaddr) (ttlMs : Option Nat := none) :
     BaseIO Unit := do
@@ -267,7 +267,7 @@ def addAddrs (h : Host) (peer : PeerId) (addrs : List Multiaddr) (ttlMs : Option
 def addrsOf (h : Host) (peer : PeerId) : BaseIO (List Multiaddr) := do
   return Peerstore.addrsOf (← h.peerstore.get) peer (← h.config.clock.nowMs)
 
-/-- Drop the expired addresses. The host runs no timer for it; the
+/-- Drop the expired addresses. The host runs no timer for it. The
 owner calls it, as Lighthouse's peer manager runs its own heartbeat. -/
 def prunePeerstore (h : Host) : BaseIO Unit := do
   let now ← h.config.clock.nowMs
@@ -279,23 +279,27 @@ RFC 0003, "Peer Store APIs": a receiving peer "MUST keep track of the
 latest `seq` value received for each peer and reject incoming
 `RoutingState` messages unless they contain a greater `seq` value". It
 "SHOULD retain the original signed envelope", so the store keeps the
-bytes and hands them on unchanged, as gossipsub's peer exchange does. -/
+bytes. Gossipsub's peer exchange hands them on unchanged. -/
 
-/-- The table after a verified record of `peer` with `seq` arrives: kept
-when it is newer than the stored one, refused for a new peer past
-`cap`. The answer says whether the table took it. -/
+/-- The table after a verified record of `peer` with `seq` arrives. The
+table keeps the record when it is newer than the stored one, and
+refuses it for a new peer past `cap`. The answer says whether the table
+took it. -/
 def putRecord (peer : PeerId) (seq : Nat) (bytes : ByteArray) (cap : Nat)
     (t : Std.HashMap PeerId (Nat × ByteArray)) : Std.HashMap PeerId (Nat × ByteArray) × Bool :=
   match t.get? peer with
   | some (old, _) => if old < seq then (t.insert peer (seq, bytes), true) else (t, false)
   | none => if cap ≤ t.size then (t, false) else (t.insert peer (seq, bytes), true)
 
-/-- Consume a signed peer record: verify it (`PeerRecord.open?`), check
-the peer when the caller expects one, keep it when it is the newest of
-its peer, and add its addresses with `ttlMs`. The answer is the peer and
-whether the store took the record; an older record leaves both the
-record and the addresses as they were, as go-libp2p's
-`ConsumePeerRecord` does. -/
+/-- Consume a signed peer record:
+1. Verify it (`PeerRecord.open?`).
+2. Check the peer, when the caller expects one.
+3. Keep the record when it is the newest of its peer.
+4. Add its addresses with `ttlMs`.
+
+The answer is the peer, and whether the store took the record. An older
+record leaves both the record and the addresses as they were, as
+go-libp2p's `ConsumePeerRecord` does. -/
 def consumeRecord (h : Host) (bytes : ByteArray) (expected : Option PeerId := none)
     (ttlMs : Option Nat := none) : BaseIO (Except Identity.Error (PeerId × Bool)) := do
   match PeerRecord.open? bytes with
@@ -314,7 +318,7 @@ def recordOf (h : Host) (peer : PeerId) : BaseIO (Option ByteArray) := do
   return ((← h.records.get).get? peer).map (·.2)
 
 /-- Sign our own peer record over `addrs` with `seq`. The caller picks
-`seq` and raises it with each new record, as RFC 0003 asks; go-libp2p
+`seq` and raises it with each new record, as RFC 0003 asks. go-libp2p
 uses the Unix time in nanoseconds. -/
 def signRecord (h : Host) (addrs : List Multiaddr) (seq : Nat) :
     IO (Except Identity.Error ByteArray) := do
@@ -331,9 +335,10 @@ def peers (h : Host) : BaseIO (List PeerId) := do
   return (SessionTable.liveEntries (← h.sessions.get)).map (·.1)
 
 /-- Register `f` to hear every later `ConnEvent`. It runs on the task
-that commits or ends a session, so it must not park; a consumer posts
-to its own bounded queue. A peer already connected raises no event for
-the new notifiee: read `peers` after the registration to learn them. -/
+that commits or ends a session, so it must not park. A consumer posts
+to its own bounded queue. A peer that is already connected raises no
+event for the new notifiee. Read `peers` after the registration to
+learn them. -/
 def addNotifiee (h : Host) (f : ConnEvent → BaseIO Unit) : BaseIO Unit :=
   h.notifiees.update (· ++ [f])
 
@@ -341,11 +346,11 @@ def addNotifiee (h : Host) (f : ConnEvent → BaseIO Unit) : BaseIO Unit :=
 private def notify (h : Host) (e : ConnEvent) : BaseIO Unit := do
   for f in ← h.notifiees.get do f e
 
-/-- End the live session of `peer`, as the dedup ends a displaced one:
-close its muxer session, and its serve task marks it dead, joins it, and
-raises `disconnected`. `false` when no live session serves the peer.
-The consensus Goodbye comes first, on a stream the client writes (phase0
-`p2p-interface.md`, "Goodbye"). -/
+/-- End the live session of `peer`, as the dedup ends a displaced one.
+The call closes the muxer session. Then the serve task marks the session
+dead, joins it, and raises `disconnected`. The answer is `false` when no
+live session serves the peer. The consensus Goodbye comes first, on a
+stream that the client writes (phase0 `p2p-interface.md`, "Goodbye"). -/
 def closePeer (h : Host) (peer : PeerId) : BaseIO Bool := do
   match SessionTable.live? (← h.sessions.get) peer with
   | none => return false
@@ -526,8 +531,8 @@ private def register (h : Host) (role : Role) (u : Upgraded) (remoteAddr : Multi
     -- joins it.
     if let some old := displaced then
       discard old.session.upgraded.session.close.toBaseIO
-    -- Before the serve task starts, so its `disconnected` comes after.
-    -- A gate that refuses the task still runs it (`Gate.spawn`).
+    -- Notify before the serve task starts, so its `disconnected` comes
+    -- after. A gate that refuses the task still runs it (`Gate.spawn`).
     h.notify (.connected u.remotePeer id role remoteAddr)
     let wake : BaseIO Unit := discard u.session.close.toBaseIO
     if !(← h.sessionTasks.spawn (h.serveSession u.remotePeer entry) wake) then
@@ -741,7 +746,7 @@ def startListening (h : Host) (addr : Multiaddr) : Async (Except Error Multiaddr
 /-! ## The liveness probe -/
 
 /-- One round of the probe: every connected peer, one after the other.
-A probe that fails or misses its deadline ends the session; the
+A probe that fails or misses its deadline ends the session. The
 deadline's expiry closes the session at once, which wakes the probe's
 parked read. -/
 private def probeRound (h : Host) (p : Probe) : Async Unit := do

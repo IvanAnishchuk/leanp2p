@@ -5,23 +5,23 @@
  * Lean v4.34 binds every UDP socket with `UV_UDP_REUSEADDR`
  * (src/runtime/uv/udp.cpp, line 106), and `Std.Async.UDP` has no bind
  * without it. On Linux, SO_REUSEADDR lets a port-0 bind take a port that
- * another socket already holds, and the kernel then gives each datagram
- * to one of the two. One node then receives another node's packets, and
- * a socket's wake datagram can reach the wrong socket. So the shim opens
- * and binds the socket itself, with no reuse option, and hands the
+ * another socket already holds. The kernel then gives each datagram to
+ * one of the two. One node receives another node's packets, and a
+ * socket's wake datagram can reach the wrong socket. So the shim opens
+ * and binds the socket itself, with no reuse option. Then it hands the
  * descriptor to the libuv handle inside Lean's socket object. Both UDP
  * users call it: `Streams.Udp` (discv5) and `net/quic`'s endpoint.
  *
- * Three facts of the toolchain hold this up. A toolchain bump re-checks
- * each one before it lifts the guard below:
- * - the first field of `lean_uv_udp_socket_object` is the `uv_udp_t`
- *   pointer (src/runtime/uv/udp.h, line 26);
+ * The shim depends on three facts of the toolchain. A toolchain bump
+ * checks each one again before it removes the guard below:
+ * - The first field of `lean_uv_udp_socket_object` is the `uv_udp_t`
+ *   pointer (src/runtime/uv/udp.h, line 26).
  * - `lean_uv_udp_new` makes the handle with `uv_udp_init`, which opens
- *   no descriptor (src/runtime/uv/udp.cpp, line 79), so `uv_udp_open`
- *   takes ours;
+ *   no descriptor (src/runtime/uv/udp.cpp, line 79). So `uv_udp_open`
+ *   takes ours.
  * - libuv's `uv_udp_open` sets the reuse option on the descriptor it
- *   takes (libuv v1.48.0, src/unix/udp.c, line 1040, `uv__set_reuse`),
- *   so the shim clears that option again after the call.
+ *   takes (libuv v1.48.0, src/unix/udp.c, line 1040, `uv__set_reuse`).
+ *   So the shim clears that option again after the call.
  */
 #include <lean/lean.h>
 #include <errno.h>
@@ -71,9 +71,9 @@ static int addr_from_bytes(b_lean_obj_arg b, struct sockaddr_storage *ss, sockle
 /* Bind the Lean socket `sock` (`Std.Internal.UV.UDP.Socket`) to the
  * address bytes `addr`, with no address reuse. The caller calls it once,
  * on a socket fresh from `Std.Async.UDP.Socket.mk`, before any receive
- * or send: libuv's loop thread then never touches the handle, so the
- * call needs no loop lock. A port another socket holds fails with
- * EADDRINUSE. */
+ * or send. libuv's loop thread does not touch the handle before then, so
+ * the call needs no loop lock. A bind to a port that another socket
+ * holds fails with EADDRINUSE. */
 LEAN_EXPORT lean_obj_res leanp2p_udp_bind(b_lean_obj_arg sock, b_lean_obj_arg addr) {
     struct sockaddr_storage ss;
     socklen_t len;
@@ -93,7 +93,7 @@ LEAN_EXPORT lean_obj_res leanp2p_udp_bind(b_lean_obj_arg sock, b_lean_obj_arg ad
         return errno_error(-rv);
     }
     /* The handle owns the descriptor now, and the runtime's finalizer
-     * closes it. libuv set the reuse option; clear it, so no later bind
+     * closes it. libuv set the reuse option. Clear it, so no later bind
      * can share the port. */
     int off = 0;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &off, sizeof off) != 0) return errno_error(errno);

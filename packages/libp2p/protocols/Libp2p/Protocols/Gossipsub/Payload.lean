@@ -17,10 +17,10 @@ place: the message id's bytes, in the `data` field.
   which it lifts out, stores under its id, and replaces with the
   handle. The id comes from a `ByteArray` id function, so the payload
   never becomes a list.
-* `joinOutbound` encodes an RPC of handles with the model encoder, which
-  is now small, and appends each real payload as raw bytes. Protobuf
-  takes fields in any order, so the `data` field goes last in its
-  message.
+* `joinOutbound` encodes an RPC of handles with the model encoder. With
+  handles in place of payloads, that RPC is small. Then `joinOutbound`
+  appends each real payload as raw bytes. Protobuf takes fields in any
+  order, so the `data` field goes last in its message.
 
 `Tests/Gossipsub/Payload.lean` pins both against the model codec
 (CLAUDE.md, "Proofs and tests", rule 2): the model decode of the split
@@ -95,7 +95,7 @@ private def splitMessage (b : ByteArray) (idOf : String → ByteArray → Messag
   | none, _ => return some (b, none)
 
 /-- Split a raw RPC: the RPC with handles for payloads, and the
-payloads by id. `none` on a malformed RPC; the caller then hands the
+payloads by id, or `none` on a malformed RPC. The caller then hands the
 core the original bytes, and the core's decoder reports the error. -/
 def splitInbound (b : ByteArray) (idOf : String → ByteArray → MessageId) :
     Option (ByteArray × List (MessageId × ByteArray)) := Id.run do
@@ -119,8 +119,8 @@ def splitInbound (b : ByteArray) (idOf : String → ByteArray → MessageId) :
   return some (out, payloads.reverse)
 
 /-- Encode an RPC whose messages carry handles, with each real payload
-from `lookup`. A message whose payload is gone is left out. The answer
-is the RPC bytes, without the frame's length prefix. -/
+from `lookup`. The encoder leaves out a message whose payload is gone.
+The answer is the RPC bytes, without the frame's length prefix. -/
 def joinOutbound (r : Rpc.RPC) (lookup : MessageId → Option ByteArray) : ByteArray := Id.run do
   let mut out := Bytes.ofNatList (Pb.encodeMessage { r with publish := [] })
   for m in r.publish do

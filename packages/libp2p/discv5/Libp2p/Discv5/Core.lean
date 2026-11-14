@@ -13,8 +13,8 @@ The pure state machine of a discv5 node (devp2p `discv5-theory.md`,
 "Sessions" and "Handshake Steps"): sessions, the WHOAREYOU handshake in
 both roles, the answers to PING, FINDNODE, and TALKREQ, and the node
 table. The shell (`Libp2p.Discv5.Node`) owns the socket, the clock, and
-the randomness, and hands each event the random bytes it may need, so
-the core makes no choice of its own and a test replays it.
+the randomness. It hands each event the random bytes the event may
+need. So the core makes no choice of its own, and a test replays it.
 
 PONG's `recipient-ip` and `recipient-port` are votes for the node's
 external endpoint, one per voter, each good for `voteTtl` on the
@@ -23,14 +23,14 @@ endpoint the record does not hold, the core re-signs the record with
 that endpoint and the next `seq`.
 
 A session belongs to one endpoint. A packet from another endpoint, or
-one that does not open, gets a WHOAREYOU; a challenge still pending for
-that endpoint goes out again unchanged. Only answers to requests we sent
-count: the core keeps each request by id until its answer ends or the
-shell posts `forget`, and keeps only the NODES records at the distances
-asked.
+one that does not open, gets a WHOAREYOU. The core sends a challenge
+that is still pending for that endpoint again, unchanged. Only answers
+to requests we sent count. The core keeps each request by id until its
+answer ends or the shell posts `forget`. It keeps only the NODES records
+at the distances that the request asked.
 
-A TALKREQ goes up to the application as a `talk` action; the
-application's TALKRESP comes back as `Event.respond`.
+A TALKREQ reaches the application as a `talk` action. The application's
+TALKRESP returns to the core as `Event.respond`.
 -/
 
 set_option autoImplicit false
@@ -72,7 +72,7 @@ structure Challenge where
   challengeData : ByteArray
   endpoint : Endpoint
   packet : ByteArray
-  /-- The core's tick when it was sent, for the bound. -/
+  /-- The core's tick when the core sent it, for the bound. -/
   at_ : Nat := 0
 
 /-- One PONG's view of our external endpoint: who said it, what it said,
@@ -116,12 +116,12 @@ inductive Event where
   | packet (src : Endpoint) (bytes : ByteArray) (rand : ByteArray)
   /-- Send `m` to the node of `dest` at `endpoint`. -/
   | request (dest : Enr) (endpoint : Endpoint) (m : Message) (rand : ByteArray)
-  /-- The shell gave up on a request: drop its state. Time stays out of
+  /-- The shell abandoned a request: drop its state. Time stays out of
   the core, so the shell's deadline ends a request this way. -/
   | forget (requestId : List Nat)
   /-- Send the answer `m` to the node `dest` in its session: the
-  application's TALKRESP to a `talk` action. With no session, nothing
-  goes out. -/
+  application's TALKRESP to a `talk` action. With no session, the core
+  sends nothing. -/
   | respond (dest : ByteArray) (m : Message) (rand : ByteArray)
   /-- The shell's clock moved to `now` (milliseconds): votes older than
   `voteTtl` stop counting. -/
@@ -152,14 +152,14 @@ private def slice (b : ByteArray) (from_ len : Nat) : ByteArray := b.extract fro
 
 private def nonceKey (n : ByteArray) : List UInt8 := n.toList
 
-/-- The sessions the core keeps; past it, the least recently used goes
-(discv5-theory.md, "Session Cache": "a limited number of sessions in an
-in-memory LRU cache"). -/
+/-- The sessions the core keeps. Past this number, the least recently
+used goes (discv5-theory.md, "Session Cache": "a limited number of
+sessions in an in-memory LRU cache"). -/
 def maxSessions : Nat := 1000
 
-/-- The challenges the core keeps; past it, the oldest goes. The spec
-keeps a challenge "for a short duration"; a bound keeps spoofed packets
-from growing the map. -/
+/-- The challenges the core keeps. Past this number, the oldest goes.
+The spec keeps a challenge "for a short duration". A bound stops
+spoofed packets from growing the map. -/
 def maxChallenges : Nat := 1000
 
 /-- The key of the least recent entry of a map, by `age`. -/
@@ -192,7 +192,8 @@ private def messagePacket (localId destId : ByteArray) (key : Crypto.Key16) (iv 
 
 /-- Send `m` to `destId`: in its session when there is one, else as a
 message packet with random content, which draws the WHOAREYOU of step 2
-(discv5-theory.md, "Step 1"). A request is remembered by its nonce. -/
+(discv5-theory.md, "Step 1"). The core remembers a request by its
+nonce. -/
 private def sendTo (s : State) (destId destPub : ByteArray) (ep : Endpoint) (m : Message)
     (rand : ByteArray) : State × List Action :=
   let iv := slice rand 0 16
@@ -202,7 +203,7 @@ private def sendTo (s : State) (destId destPub : ByteArray) (ep : Endpoint) (m :
         sent := s.sent.insert (nonceKey nonce) { destId, destPub, endpoint := ep, message := m }
         pending := s.pending.insert m.requestId { destId, message := m } }
     else s
-  -- A session belongs to one endpoint; a node at another endpoint gets a
+  -- A session belongs to one endpoint. A node at another endpoint gets a
   -- new handshake.
   match (s.sessions.get? (idNat destId)).filter (·.endpoint == ep) with
   | some ses =>
@@ -234,7 +235,7 @@ private def nodesAnswers (s : State) (rid : List Nat) (ds : List Nat) : List Mes
 def maxVotes : Nat := 32
 
 /-- The voters that must agree before the record changes its endpoint.
-The spec leaves the number open; the sigp discv5 crate's
+The spec leaves the number open. The number is the sigp discv5 crate's
 `enr_peer_update_min`, which Lighthouse also sets to 10. -/
 def voteQuorum : Nat := 10
 
@@ -262,8 +263,8 @@ private def recordEndpoint (r : Enr) (v6 : Bool) : Option Endpoint := do
   return { ip, port }
 
 /-- Re-sign the record when `voteQuorum` voters, in time, name an
-endpoint it does not hold. The other pairs stay; `seq` grows by one. A
-record that does not sign stays as it was. -/
+endpoint it does not hold. The other pairs stay, and `seq` grows by
+one. A record that does not sign stays as it was. -/
 def refreshRecord (s : State) : State :=
   match topVote (liveVotes s.votes s.now) with
   | none => s
@@ -297,7 +298,7 @@ def finish (s : State) (rid : List Nat) : State :=
     sent := s.sent.filter fun _ v => v.message.requestId != rid }
 
 /-- Send answers to `srcId` in its session, each under the next count of
-the session's nonce. With no session, nothing goes out. -/
+the session's nonce. With no session, the core sends nothing. -/
 private def replyTo (s : State) (srcId : ByteArray) (ms : List Message) (rand : ByteArray) :
     State × List Action :=
   match s.sessions.get? (idNat srcId) with
@@ -316,7 +317,7 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
   match m with
   | .ping rid _ => reply s [.pong rid s.localEnr.seq src.ip src.port]
   | .findNode rid ds => reply s (nodesAnswers s rid ds)
-  -- The application answers a TALKREQ (`Event.respond`); the shell
+  -- The application answers a TALKREQ (`Event.respond`). The shell
   -- answers an unknown protocol with an empty TALKRESP.
   | .talkReq rid proto req => (s, [.talk srcId rid proto req])
   | .pong rid _ ip port =>
@@ -341,8 +342,8 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
       let rs := rs.filter fun e => ds.contains (logDistance e.nodeId srcId)
       let t := rs.foldl (fun t e => t.insert { id := e.nodeId, record := e }) s.table
       let got := p.got + 1
-      -- The last packet of the answer ends the request; `total` is
-      -- capped, so a peer cannot keep it open.
+      -- The last packet of the answer ends the request. The core caps
+      -- `total`, so a peer cannot keep the request open.
       let s := if got ≥ min (max total 1) maxNodesPackets then finish s rid
         else { s with pending := s.pending.insert rid { p with got } }
       ({ s with table := t }, [.response srcId (.nodes rid total rs)])
@@ -354,8 +355,9 @@ private def onMessage (s : State) (srcId : ByteArray) (src : Endpoint) (m : Mess
 challenge (discv5-theory.md, "Step 2"). -/
 private def challenge (s : State) (srcId : ByteArray) (src : Endpoint) (nonce rand : ByteArray) :
     State × List Action :=
-  -- A challenge still pending for this node and endpoint goes out again
-  -- unchanged, so the peer can finish the handshake it started.
+  -- The core sends a challenge that is still pending for this node and
+  -- endpoint again, unchanged, so the peer can finish the handshake it
+  -- started.
   match (s.challenges.get? (idNat srcId)).filter (·.endpoint == src) with
   | some ch => (s, [.send src ch.packet])
   | none =>
@@ -447,8 +449,8 @@ private def stepAt (s : State) : Event → State × List Action
       match u.header.flag with
       | .message =>
         let srcId := u.header.authdata
-        -- The session must belong to the endpoint the packet came from;
-        -- a packet from another endpoint gets a challenge (geth `v5test`,
+        -- The session must belong to the endpoint the packet came from.
+        -- A packet from another endpoint gets a challenge (geth `v5test`,
         -- `PingMultiIP`).
         let opened := do
           let ses ← (s.sessions.get? (idNat srcId)).filter (·.endpoint == src)
@@ -456,9 +458,9 @@ private def stepAt (s : State) : Event → State × List Action
         match opened with
         | none => challenge s srcId src u.header.nonce rand
         | some pt =>
-          -- A message that opens but does not decode, such as a request
-          -- id over 8 bytes, is dropped with no answer.
-          -- The session was used now.
+          -- The core drops a message that opens but does not decode, such
+          -- as a request id over 8 bytes, with no answer.
+          -- The session counts as used now.
           let s := match s.sessions.get? (idNat srcId) with
             | some ses => putSession s srcId ses
             | none => s

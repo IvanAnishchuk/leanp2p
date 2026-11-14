@@ -11,25 +11,28 @@ import Libp2p.Discv5.Core
 The IO shell over `Libp2p.Discv5.Core`: the UDP socket, the randomness,
 the waits, and the lookup (devp2p `discv5-theory.md`, "Lookup").
 
-* The core state sits in one `OnceRef`. Each event runs the pure step
-  under `updateGet` (PRINCIPLES 3.3), and the shell then performs the
-  actions: datagrams go out, responses go to their waiters.
+* The core state is in one `OnceRef`. Each event runs the pure step
+  under `updateGet` (PRINCIPLES 3.3). Then the shell performs the
+  actions: it sends the datagrams, and hands the responses to their
+  waiters.
 * A reader task feeds each datagram to the core. `stop` closes the
   socket, which wakes the reader, and joins it.
 * A request waits for its responses by request id, under a deadline.
-  NODES may come in several packets; `findNode` collects them until
+  NODES may come in several packets. `findNode` collects them until
   their `total` or the deadline.
-* `lookup` walks toward a target: each round asks up to `alpha` (3) of
-  the closest unqueried nodes at once for the log distances around the
-  target, merges what they return, and stops when the `k` closest it
-  knows have all been asked.
-* The revalidation task pings the table entry checked longest ago once
-  every `revalidateMs`, drops a node that does not answer, pulls a
-  newer record on a higher `seq`, and runs a refresh lookup every
-  `refreshEvery` rounds. It also posts the clock the vote expiry reads.
+* `lookup` walks toward a target. Each round asks up to `alpha` (3) of
+  the closest unqueried nodes at once, for the log distances around the
+  target, and merges what they return. The lookup stops when it asked
+  each of the `k` closest nodes it knows.
+* The revalidation task runs one round every `revalidateMs`. A round
+  pings the table entry with the oldest check, and drops a node that
+  does not answer. On a higher `seq`, it pulls the newer record. Every
+  `refreshEvery` rounds, the task runs a refresh lookup. It also posts
+  the clock that the vote expiry reads.
 * Unsolicited packets pass a rate limit (`limitStep`): 10 per second in
   all and 9 per second from one IP, with loopback exempt.
-* A TALKREQ goes to `onTalk`, and its answer goes back as the TALKRESP.
+* A TALKREQ goes to `onTalk`, and the node sends its answer as the
+  TALKRESP.
 * `findPeers` is the consensus client's interface (phase0
   `p2p-interface.md`, "Integration into libp2p stacks"): a lookup toward
   a random target, filtered by the client's predicate over records, such
@@ -62,7 +65,7 @@ structure Node where
   private waiters : OnceRef (List (List Nat × Chan Message))
   private nextId : OnceRef Nat
   private tasks : TaskSet
-  /-- Closed by `stop`: the revalidation task parks on it between rounds. -/
+  /-- `stop` closes it. The revalidation task parks on it between rounds. -/
   private stopping : Chan Unit
   /-- The last liveness check of each table entry, by node id, in
   milliseconds of the monotonic clock. -/
@@ -70,8 +73,9 @@ structure Node where
   /-- The pause between two liveness checks. -/
   revalidateMs : Nat
   /-- The application's TALKREQ handler: the sender's node id, the
-  protocol, and the request; it answers the response bytes. An unknown
-  protocol answers `[]`, an empty TALKRESP, as discv5-wire.md requires.
+  protocol, and the request. It answers the response bytes. For an
+  unknown protocol it answers `[]`, an empty TALKRESP, as discv5-wire.md
+  requires.
   It runs on the reader task, so it must not park. -/
   private onTalk : ByteArray → List Nat → List Nat → BaseIO (List Nat)
   /-- The unsolicited packets seen this second: the second, the total,
@@ -93,7 +97,7 @@ private def perform (n : Node) (acts : List Action) : Async Unit := do
     -- `feed` answers a TALKREQ after the step's other actions.
     | .talk .. => pure ()
 
-/-- `n` random bytes; a DRBG failure is an IO error. -/
+/-- `n` random bytes. A DRBG failure is an IO error. -/
 private def random (n : Nat) : IO ByteArray := do
   match ← (Crypto.randomBytes n).run with
   | .ok b => return b
@@ -107,8 +111,8 @@ private def stepAndPerform (n : Node) (mk : ByteArray → Event) : Async (List A
   n.perform acts
   return acts
 
-/-- Run one event through the core and perform its actions, then answer
-each TALKREQ it handed up: `onTalk` gives the response bytes, and the
+/-- Run one event through the core and perform its actions. Then answer
+each TALKREQ of the step: `onTalk` gives the response bytes, and the
 core sends the TALKRESP in the session. -/
 private def feed (n : Node) (mk : ByteArray → Event) : Async Unit := do
   for a in ← n.stepAndPerform mk do
@@ -118,7 +122,7 @@ private def feed (n : Node) (mk : ByteArray → Event) : Async Unit := do
 
 /-- The unsolicited packets a second may bring, in total and from one IP:
 Lighthouse's `filter_rate_limiter` (`total_n_every(10)`,
-`ip_n_every(9)`). Client policy; the spec sets none. -/
+`ip_n_every(9)`). They are client policy, and the spec sets none. -/
 def unsolicitedTotal : Nat := 10
 def unsolicitedPerIp : Nat := 9
 
@@ -189,8 +193,9 @@ private def admit (n : Node) (src : Endpoint) : IO Bool := do
   let sec := (← IO.monoMsNow) / 1000
   n.limiter.updateGet (limitStep sec src.ip)
 
-/-- The reader: each admitted datagram goes to the core. `partial`, as
-the IO read loops are; `stop` ends it by closing the socket. -/
+/-- The reader: each admitted datagram goes to the core. It is
+`partial`, as the IO read loops are. `stop` ends it by closing the
+socket. -/
 private partial def reader (n : Node) : Async Unit := do
   match ← Streams.Udp.recv n.socket with
   | none => return
@@ -200,7 +205,7 @@ private partial def reader (n : Node) : Async Unit := do
     n.reader
 
 /-- Stop: close the socket, which wakes the reader, and the stop
-channel, which wakes the revalidation task; then join both. -/
+channel, which wakes the revalidation task. Then join both. -/
 def stop (n : Node) : Async Unit := do
   (n.stopping.close : BaseIO Unit)
   Streams.Udp.close n.socket
@@ -222,7 +227,7 @@ def updateEnr (n : Node) (pairs : List Enr.Pair) : BaseIO Bool :=
     | .ok r => (true, { s with localEnr := r })
     | .error _ => (false, s)
 
-/-- Add a record to the table, as a boot record is. -/
+/-- Add a record to the table, as for a boot record. -/
 def addEnr (n : Node) (e : Enr) : BaseIO Unit :=
   n.core.update fun s => { s with table := s.table.insert { id := e.nodeId, record := e } }
 
@@ -234,8 +239,8 @@ def known (n : Node) : BaseIO (List Enr) := do
 def votes (n : Node) : BaseIO (List Endpoint) := do
   return (← n.core.get).votes.map (·.endpoint)
 
-/-- Send `m` (its request id is set here) to `e`, and collect responses
-until `done` holds or `timeoutMs` passes. -/
+/-- Send `m` to `e` with a new request id, and collect responses until
+`done` holds or `timeoutMs` passes. -/
 private def askOnce (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat)
     (done : List Message → Bool) : Async (List Message) := do
   let some ep := endpointOf? e | return []
@@ -256,17 +261,17 @@ private def askOnce (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs :
     | some r => got := got ++ [r]
     | none => break
   (n.waiters.update (·.filter (·.1 != rid)) : BaseIO Unit)
-  -- The core keeps the request until its answer ends; past the deadline
-  -- the shell ends it here.
+  -- The core keeps the request until its answer ends. Past the
+  -- deadline, the shell ends it here.
   n.feed fun _ => .forget rid
   return got
 
 /-- The resends of a request that got no answer: Lighthouse's
-`request_retries(1)`. A UDP datagram can be lost; one loss should not
-fail a liveness check. -/
+`request_retries(1)`. The network can lose a UDP datagram, and one loss
+should not fail a liveness check. -/
 def requestRetries : Nat := 1
 
-/-- Send a request and collect its answers (`askOnce`); with no answer
+/-- Send a request and collect its answers (`askOnce`). With no answer
 at all, send it again under a fresh request id, up to `requestRetries`
 times. -/
 private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat)
@@ -277,7 +282,7 @@ private def ask (n : Node) (e : Enr) (m : List Nat → Message) (timeoutMs : Nat
     got ← n.askOnce e m timeoutMs done
   return got
 
-/-- PING a node; its PONG, if one came within `timeoutMs`. -/
+/-- PING a node: its PONG, if one came within `timeoutMs`. -/
 def ping (n : Node) (e : Enr) (timeoutMs : Nat := 2000) : Async (Option Message) := do
   let seq := (← (n.core.get : BaseIO State)).localEnr.seq
   return (← n.ask e (fun rid => .ping rid seq) timeoutMs (!·.isEmpty)).head?
@@ -339,8 +344,8 @@ def lookup (n : Node) (target : ByteArray) (k : Nat := bucketSize) (rounds : Nat
             n.addEnr e
   return (seen.mergeSort fun a b => dist a ≤ dist b).take k
 
-/-- The client's interface: up to `count` records a lookup toward a
-random target turns up that pass `pred`. -/
+/-- The client's interface: up to `count` records that pass `pred`,
+from a lookup toward a random target and from the table. -/
 def findPeers (n : Node) (pred : Enr → Bool) (count : Nat) : Async (List Enr) := do
   let target ← (random 32 : IO ByteArray)
   let found ← n.lookup target
@@ -353,8 +358,9 @@ def refreshEvery : Nat := 30
 
 /-- One liveness check: PING the table entry checked longest ago. A node
 that does not answer leaves the table, and the newest replacement of its
-bucket takes its place (`Table.remove`). An entry never checked goes
-first, so a node that just contacted us is checked within a round. -/
+bucket takes its place (`Table.remove`). An entry with no check goes
+first, so the task checks a node that just contacted us within a
+round. -/
 private def revalidateOnce (n : Node) : Async Unit := do
   let s ← (n.core.get : BaseIO State)
   let checked ← (n.checked.get : BaseIO (Std.HashMap Nat Nat))
@@ -396,8 +402,8 @@ private partial def revalidator (n : Node) (round : Nat := 0) : Async Unit := do
   n.revalidator (round + 1)
 
 /-- Start a node with `key`, bound to `ip`:`port` (0 for the system's
-pick). Its record is signed after the bind, so `udp` names the real
-port; `extra` adds the client's pairs, such as `eth2` and `tcp`.
+pick). The node signs its record after the bind, so `udp` names the
+real port. `extra` adds the client's pairs, such as `eth2` and `tcp`.
 `revalidateMs` paces the liveness checks of the table. -/
 def start (key : Crypto.Key32) (ip : List Nat) (port : Nat) (extra : List Enr.Pair := [])
     (seq : Nat := 1) (revalidateMs : Nat := 1000)

@@ -2,13 +2,23 @@ import Tests.Support
 import Libp2p.Discv5
 
 /-!
-# discv5 suite: the wire test vectors
+# discv5 suite
 
-Mirrors devp2p `discv5/discv5-wire-test-vectors.md`, pinned in
+The suite checks `libp2p/discv5` in this order:
+- two cores in memory
+- geth's conformance scenarios, replayed against our core
+- three nodes over UDP
+- a lost datagram and the request retry
+- the close of the UDP socket
+- the eclipse limits and the rate limiter
+- TALKREQ, IPv6, and the liveness checks over UDP
+- the wire test vectors
+
+The vectors mirror devp2p `discv5/discv5-wire-test-vectors.md`, pinned in
 `VECTORS.lock` (`vendor/devp2p` at `2c19a28`) and extracted to
-`Tests/vectors/discv5-wire.json`: the four packet encodings, which node
-B unmasks, opens, and decodes, and the four crypto vectors (ECDH, key
-derivation, id signature, AES-GCM). The behavior checks before them use
+`Tests/vectors/discv5-wire.json`. They hold the four packet encodings,
+which node B unmasks, opens, and decodes, and the four crypto vectors
+(ECDH, key derivation, id signature, AES-GCM). The behavior checks use
 the vector keys as fixtures.
 -/
 
@@ -119,7 +129,7 @@ private def memoryChecks (r : Runner) : IO Unit := do
     let a0 := Core.init ka ea
     let b0 := Core.init kb eb
     -- The first PING has no session: B answers WHOAREYOU, A sends the
-    -- handshake, and B's PONG comes back in the new session.
+    -- handshake, and B's PONG returns in the new session.
     let (a1, out) := Core.step a0 (.request eb epB (.ping [1] 1) (randFor 0))
     let (a2, b2, got) := settle a1 b0 epA epB (out.map (true, ·)) 20 0
     r.check "discv5 memory: the first PING runs the handshake and gets its PONG"
@@ -141,7 +151,7 @@ private def memoryChecks (r : Runner) : IO Unit := do
         | .nodes [2] 1 [e] => e.nodeId == eb.nodeId
         | _ => false)
     r.check "discv5 memory: A's table holds B after NODES" (a4.table.entries.any (·.id == eb.nodeId))
-    -- Endpoint votes: below the quorum the record stays; at the quorum
+    -- Endpoint votes: below the quorum, the record stays. At the quorum,
     -- it names the voted endpoint under the next seq.
     let outside : Endpoint := { ip := [203, 0, 113, 7], port := 30303 }
     let vote (k : Nat) : Vote := { voter := k, endpoint := outside, at_ := 0 }
@@ -163,13 +173,13 @@ private def memoryChecks (r : Runner) : IO Unit := do
       ((Core.refreshRecord { a0 with votes := quorum, now := Core.voteTtl + 1 }).localEnr.seq == 1)
     let (cleared, _) := Core.step { a0 with votes := quorum } (.clock (Core.voteTtl + 1))
     r.check "discv5 votes: the clock drops expired votes" cleared.votes.isEmpty
-    -- TALKREQ goes up to the application; its answer comes back through
-    -- `Event.respond` and leaves in the session.
+    -- TALKREQ reaches the application. Its answer returns to the core
+    -- through `Event.respond`, and the core sends it in the session.
     let (a5, out) := Core.step a4 (.request eb epB (.talkReq [12] [0x65] [1, 2]) (randFor 120))
     match onlySend out with
     | some p =>
       let (b5, bOut) := Core.step b2 (.packet epA p (randFor 121))
-      r.check "TALKREQ goes up to the application, and nothing answers by itself"
+      r.check "TALKREQ reaches the application, and the core sends no answer of its own"
         (bOut.any (fun a => match a with
           | .talk src [12] [0x65] [1, 2] => src.toList == ea.nodeId.toList
           | _ => false) && (sendsOf bOut).isEmpty)
@@ -187,9 +197,9 @@ private def memoryChecks (r : Runner) : IO Unit := do
 
 /-! ## geth's conformance scenarios
 
-The behaviours geth's discv5 test suite checks against a node
-(`cmd/devp2p/internal/v5test/discv5tests.go`, go-ethereum `0d06140`),
-played here with our own core as the tester. -/
+This section replays the behaviours that geth's discv5 test suite checks
+against a node (`cmd/devp2p/internal/v5test/discv5tests.go`, go-ethereum
+`0d06140`). Our own core plays the tester. -/
 
 private def gethChecks (r : Runner) : IO Unit := do
   let some ka := key32 nodeAKey
@@ -326,8 +336,8 @@ private def gethChecks (r : Runner) : IO Unit := do
             | .response _ (.nodes [9] _ []) => true
             | _ => false)
     | none => r.check "NODES at a wrong distance: B sends one packet" false
-    -- FINDNODE relays only live nodes: C, known to B but never pinged,
-    -- stays out of the answer until it is marked live.
+    -- FINDNODE relays only live nodes. B knows C but never pinged it, so
+    -- C stays out of the answer until B marks it live.
     let dC := logDistance ec.nodeId eb.nodeId
     let bKnows : State := { b2 with table := b2.table.insert { id := ec.nodeId, record := ec } }
     let askC (b : State) (rid : List Nat) (n : Nat) : Bool := Id.run do
@@ -396,15 +406,15 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
   let ea ← (a.localEnr : BaseIO _)
   let eb ← (b.localEnr : BaseIO _)
   let ec ← (c.localEnr : BaseIO _)
-  -- B knows C; A boots from B alone.
+  -- B knows C. A boots from B alone.
   (b.addEnr ec : BaseIO Unit)
   (a.addEnr eb : BaseIO Unit)
   match ← a.ping eb with
   | some (.pong _ _ ip port) =>
     r.check "discv5 udp: A's PING to B gets a PONG naming A's endpoint" (ip == lo && port == a.port)
   | _ => r.check "discv5 udp: A's PING to B gets a PONG" false
-  -- B relays only nodes it has seen answer: before B pings C, a FINDNODE
-  -- at C's distance returns nothing; after, it returns C.
+  -- B relays only nodes that answered it. Before B pings C, a FINDNODE at
+  -- C's distance returns nothing. After the ping, it returns C.
   let d := logDistance eb.nodeId ec.nodeId
   let before ← a.findNode eb [d]
   r.check "discv5 udp: B does not relay C before C answers a PING"
@@ -427,7 +437,7 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
 /-! ## A lost datagram -/
 
 /-- Send a PING from A to B through a relay, and answer whether a PONG
-came back. The relay drops the first `drops` datagrams from A. A knows B
+arrived. The relay drops the first `drops` datagrams from A. A knows B
 by a record that B signs with the relay's port, so every packet passes
 through the relay. The relay forwards every other datagram in both
 directions. -/
@@ -540,8 +550,8 @@ private def policyChecks (r : Runner) : IO Unit := do
   let inc := fill (fun i => [1, i % 250 + 1, 3, 4]) true 80
   r.check "incoming nodes take at most half of each bucket"
     (inc.buckets.toList.all fun b => (b.filter (·.incoming)).length ≤ incomingLimit)
-  -- The rate limiter: 9 a second from one IP, 10 in total; a new second
-  -- starts again.
+  -- The rate limiter: 9 a second from one IP, and 10 in total. A new
+  -- second starts new counts.
   let ipA := [1, 1, 1, 1]
   let ipB := [2, 2, 2, 2]
   let run (steps : List (Nat × List Nat)) : List Bool := Id.run do
@@ -553,10 +563,10 @@ private def policyChecks (r : Runner) : IO Unit := do
       out := out ++ [ok]
     return out
   let fromA := run ((List.range 10).map fun _ => (5, ipA))
-  r.check "the tenth unsolicited packet of a second from one IP is dropped"
+  r.check "the limiter drops the tenth unsolicited packet of a second from one IP"
     ((fromA.take 9).all id && fromA.getLast? == some false)
   let mixed := run ((List.range 9).map (fun _ => (5, ipA)) ++ [(5, ipB), (5, ipB)])
-  r.check "the eleventh unsolicited packet of a second is dropped"
+  r.check "the limiter drops the eleventh unsolicited packet of a second"
     (mixed.getLast? == some false && mixed[9]? == some true)
   r.check "a new second admits again"
     ((run ((List.range 9).map (fun _ => (5, ipA)) ++ [(6, ipA)])).getLast? == some true)
@@ -626,8 +636,8 @@ private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
   z.stop
   (x.addEnr ey : BaseIO Unit)
   (x.addEnr ez : BaseIO Unit)
-  -- Z's check times out after one second, and once more on the retry;
-  -- give it six.
+  -- Z's check times out after one second, and once more on the retry.
+  -- Give it six.
   let mut dropped := false
   for _ in [0:120] do
     Conc.select #[← (Conc.Park.sleep 50 () : BaseIO (Conc.Park Unit))]
@@ -638,7 +648,7 @@ private def livenessChecks (r : Runner) : IO Unit := Conc.Async.run do
   r.check "liveness: a node that does not answer leaves the table" dropped
   r.check "liveness: a node that answers stays"
     ((← (x.known : BaseIO (List Libp2p.Identity.Enr))).any (·.nodeId == ey.nodeId))
-  -- Y re-signs its record, as a client does when its subnets change; X's
+  -- Y re-signs its record, as a client does when its subnets change. X's
   -- next check sees the higher seq in the PONG and pulls the record.
   r.check "liveness: Y re-signs its record"
     (← (y.updateEnr [⟨eth2Key, .bytes [9, 9, 9, 9]⟩] : BaseIO Bool))
@@ -661,7 +671,7 @@ def serve : IO Unit := Conc.Async.run do
   let some kb := key32 nodeBKey | throw (IO.userError "discv5 serve: key")
   let port := ((← IO.getEnv "LEANP2P_DISCV5_PORT").bind (·.toNat?)).getD 0
   let ms := ((← IO.getEnv "LEANP2P_DISCV5_MS").bind (·.toNat?)).getD 60000
-  -- `echo` answers with the request; any other protocol gets an empty
+  -- `echo` answers with the request. Any other protocol gets an empty
   -- TALKRESP, the default.
   let echo (_ : ByteArray) (proto req : List Nat) : BaseIO (List Nat) :=
     pure (if proto == [0x65, 0x63, 0x68, 0x6f] then req else [])
@@ -674,8 +684,8 @@ def serve : IO Unit := Conc.Async.run do
 
 /-- Query an outside node (`scripts/discv5-rust-interop.sh`): the ENR in
 `LEANP2P_DISCV5_TARGET` gets a PING, a FINDNODE at distance 0, and a
-TALKREQ `echo` of `[1, 2, 3]`. One line per answer; exit code 0 when all
-three came back right. The geth driver also runs it
+TALKREQ `echo` of `[1, 2, 3]`. The query prints one line per answer, and
+exits 0 when all three answers are correct. The geth driver also runs it
 (`scripts/discv5-geth-interop.sh`). -/
 def client : IO UInt32 := Conc.Async.run do
   let some kb := key32 nodeBKey | throw (IO.userError "discv5 client: key")
@@ -715,10 +725,11 @@ private def seqBytes (n : Nat) : ByteArray :=
   ⟨(Array.range 8).map fun i => (n / 256 ^ (7 - i) % 256).toUInt8⟩
 
 /-- One packet of the vectors, decoded as node B. Each flag has its own
-checks: a message packet opens with the vector's read key; WHOAREYOU
-carries the challenge data; a handshake lets node B derive the read key
-from its own key and the ephemeral key in the packet, and a record in
-it names node A. -/
+checks:
+- A message packet opens with the vector's read key.
+- WHOAREYOU carries the challenge data.
+- A handshake lets node B derive the read key from its own key and the
+  ephemeral key in the packet, and a record in it names node A. -/
 private def packetChecks (r : Runner) (bKey : Crypto.Key32) (p : Json) : IO Unit := do
   let file := "discv5-wire.json"
   let name ← jStr file p "name"

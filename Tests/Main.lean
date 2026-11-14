@@ -104,9 +104,9 @@ def main : IO UInt32 := do
   | some "leak9" => Tests.Leak.tcpParkedRead r; return ← r.summary
   | some "leak10" => Tests.Leak.tcpWriteAfterClose r; return ← r.summary
   | some "yamux" => Tests.Yamux.run r; return ← r.summary
-  -- One discv5 node for an outside tester; no checks run.
+  -- One discv5 node for an outside tester. No checks run.
   | some "discv5serve" => Tests.Discv5.serve; return 0
-  -- One discv5 query against an outside node; the exit code is its answer.
+  -- One discv5 query against an outside node. The exit code is its answer.
   | some "discv5client" => return ← Tests.Discv5.client
   | some "streams" => Tests.Streams.run r; return ← r.summary
   | some "record" => Tests.Record.run r; return ← r.summary

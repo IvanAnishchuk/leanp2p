@@ -186,27 +186,33 @@ in the codec group wrapping upstream `google/snappy`.
 
 ## Test milestones (peer exchange and floodsub)
 
-The spike adds both on `experiment/client`. The core half runs in
-`Tests/Gossipsub/Px.lean` (`LEANP2P_SUITE=px`), the theorems sit at the
-end of `Gossipsub/Core.lean`, and `scripts/pubsub-interop.sh` runs the
-node half against go-libp2p-pubsub v0.19.0.
+The spike on `experiment/client` holds both. The core half runs in
+`Tests/Gossipsub/Px.lean` (`LEANP2P_SUITE=px`). The theorems are at the
+end of `Gossipsub/Core.lean`. `scripts/pubsub-interop.sh` runs the node
+half against go-libp2p-pubsub v0.19.0.
 
-- Theorems: `pxPeersOff` (no PX with `doPX` off), `pxPeersLength` (at
-  most `prunePeers`), `pxPeersNegative` (none to a target below 0),
-  `pxAcceptGate` (no connect below `acceptPXThreshold`), and
-  `planTopicAddedNotFlood` (a heartbeat grafts no floodsub peer).
-- The send side: a GRAFT into a full mesh draws a prune that names the
-  other peers of the topic, with no record in the core; `doPX` off, the
-  cap, a negative peer, and an unsubscribe each have a check.
-- The accept side: a score at the threshold, one below it, a lifted score, an unknown
-  topic, an undecodable peer id, a known peer, and the cap.
-- Floodsub: our publish and our forward reach a floodsub peer, a
-  heartbeat never grafts it, a `protocol` event takes a mesh peer out,
-  and no prune names it.
-- Interop: a go floodsub-only node and ours exchange a message each way;
-  go prunes our GRAFT with peer exchange, and we connect to a peer we
-  only know from its signed record; we prune go's GRAFT with peer
-  exchange, and go connects to a peer it only knows from our records.
+- Theorems:
+  - `pxPeersOff`: no PX with `doPX` off.
+  - `pxPeersLength`: at most `prunePeers` peers.
+  - `pxPeersNegative`: no PX to a target below 0.
+  - `pxAcceptGate`: no connect below `acceptPXThreshold`.
+  - `planTopicAddedNotFlood`: a heartbeat grafts no floodsub peer.
+- The send side: a GRAFT into a full mesh gets a prune that names the
+  other peers of the topic, with no record in the core. Each of these
+  has a check: `doPX` off, the cap, a negative peer, and an
+  unsubscribe.
+- The accept side, one check each: a score at the threshold, a score
+  below it, a lifted score, an unknown topic, a peer id that does not
+  decode, a known peer, and the cap.
+- Floodsub: our publish and our forward reach a floodsub peer. A
+  heartbeat never grafts it. A `protocol` event removes a mesh peer
+  from the mesh, and no prune names a floodsub peer.
+- Interop:
+  - A go floodsub-only node and ours exchange a message each way.
+  - go prunes our GRAFT with peer exchange. We connect to a peer that
+    we know only from its signed record.
+  - We prune go's GRAFT with peer exchange. go connects to a peer that
+    it knows only from our records.
 
 ## Test milestones (partial messages)
 
