@@ -257,7 +257,24 @@ def partialMode (expected : String) (target listen : Option String) : Async UInt
     let data := pm.partialMessage.getD []
     if data.take want.length == want then
       got.set (some ((Bytes.toString? (Bytes.ofNatList data)).getD "?"))
-  let running ← start { params, onPartial } listen false
+  -- Each RPC either way goes to stderr, so a failed run shows the
+  -- subscriptions and the grafts.
+  let traceIn : Peer → List Nat → BaseIO Unit := fun q bytes => do
+    let t ← Clock.system.nowMs
+    match Core.decodeRpc bytes with
+    | .ok rpc =>
+      let g := (rpc.control.map (·.graft.length)).getD 0
+      let pr := (rpc.control.map (·.prune.length)).getD 0
+      discard (IO.eprintln s!"{t} RPC from {q}: {rpc.subscriptions.length} subs, \
+        {rpc.publish.length} msgs, {g} grafts, {pr} prunes, \
+        partial {rpc.partialRpc.isSome}" |>.toBaseIO)
+    | .error _ => discard (IO.eprintln s!"{t} RPC from {q}: {bytes.length} bytes, no decode" |>.toBaseIO)
+  let traceOut : Peer → Rpc.RPC → BaseIO Unit := fun q rpc => do
+    let t ← Clock.system.nowMs
+    let g := (rpc.control.map (·.graft.length)).getD 0
+    let pr := (rpc.control.map (·.prune.length)).getD 0
+    discard (IO.eprintln s!"{t} RPC to {q}: {rpc.subscriptions.length} subs, {g} grafts, {pr} prunes" |>.toBaseIO)
+  let running ← start { params, onPartial, onRpc := traceIn, onSend := traceOut } listen false
   if let some t := target then
     discard <| dial running t
   -- We requested partial messages, so the peer must send us no full
@@ -266,18 +283,28 @@ def partialMode (expected : String) (target listen : Option String) : Async UInt
   -- Each round offers a partial message to each peer that can take one.
   -- It also publishes a full message, which a requester must not get.
   let count : OnceRef Nat ← OnceRef.new 0
+  -- The rounds whose offer reached a peer. go sends its partial data
+  -- before any mesh forms, but ours goes to our mesh peers, and the mesh
+  -- forms at the first GRAFT, about one heartbeat in.
+  let reached : OnceRef Nat ← OnceRef.new 0
   let round : Async Unit := do
     let n ← (count.updateGet fun n => (n + 1, n + 1) : BaseIO Nat)
-    for (q, _) in (← running.node.partialPeers topic).getD [] do
+    let peers := (← running.node.partialPeers topic).getD []
+    -- A failed run shows on stderr whether the peer reached our mesh.
+    IO.eprintln s!"round {n}: partial peers {peers.length}"
+    if !peers.isEmpty then (reached.update (· + 1) : BaseIO Unit)
+    for (q, _) in peers do
       discard (running.node.sendPartial q (partialOf s!"from-lean-partial-{n}" "meta-lean") : BaseIO Bool)
     discard (running.node.publish topic s!"from-lean-full-{n}".toUTF8 : BaseIO Bool)
   let ok ← waitFor 20000 do
     round
     return (← (got.get : BaseIO (Option String))).isSome
-  -- Offer for one more second, so the peer gets our partial messages too.
-  for _ in [0:5] do
+  -- Offer until five rounds reached a mesh peer, so the peer gets our
+  -- partial messages too, within the same 20 s.
+  discard <| waitFor 20000 do
     round
-    sleep 200
+    sleep 100
+    return 5 ≤ (← (reached.get : BaseIO Nat))
   stop running
   let full ← (fulls.get : BaseIO Nat)
   match ← (got.get : BaseIO (Option String)) with

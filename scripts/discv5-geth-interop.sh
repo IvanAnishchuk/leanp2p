@@ -45,7 +45,9 @@ fi
 if [[ ! -x "$tool" ]]; then
   (cd "$src" && GOFLAGS=-p=2 GOMAXPROCS=2 nice -n19 go build -o "$tool" ./cmd/devp2p)
 fi
-[[ -x "$tests" ]] || { echo "discv5-geth-interop: build the tests first" >&2; exit 2; }
+# The test binary is built here, so a run never tests a stale binary.
+( cd "$root" &&
+  LEAN_NUM_THREADS=2 nice -n19 taskset -c 0,1 lake build tests >"$out/lake.out" )
 
 # The node: wait for its ENR line.
 LEANP2P_SUITE=discv5serve LEANP2P_DISCV5_MS="$serve_ms" LEAN_NUM_THREADS=2 \

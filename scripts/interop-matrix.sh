@@ -64,7 +64,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ -x "$lean" ] || { echo "interop-matrix: build the harness first: lake build interop" >&2; exit 2; }
+# The harness is built here unless LEAN_INTEROP names one, so a run never
+# tests a stale binary.
+if [ -z "${LEAN_INTEROP:-}" ]; then
+  ( cd "$root" &&
+    LEAN_NUM_THREADS=2 nice -n19 taskset -c 0,1 lake build interop >"$out/lake.out" )
+fi
+[ -x "$lean" ] || { echo "interop-matrix: no harness at $lean" >&2; exit 2; }
 
 echo "building the go peers (vendor/go-libp2p $(cat "$root/vendor/go-libp2p/.pin"))" >&2
 docker build -q -t "$go_image" -f "$root/vendor/go-libp2p/test-plans/PingDockerfile" \

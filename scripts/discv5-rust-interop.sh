@@ -36,7 +36,9 @@ if [[ ! -x "$helper" ]]; then
   CARGO_BUILD_JOBS=2 nice -n19 cargo build --release \
     --manifest-path "$root/scripts/discv5-rust/Cargo.toml" --target-dir "$out/rust-target"
 fi
-[[ -x "$tests" ]] || { echo "discv5-rust-interop: build the tests first" >&2; exit 2; }
+# The test binary is built here, so a run never tests a stale binary.
+( cd "$root" &&
+  LEAN_NUM_THREADS=2 nice -n19 taskset -c 0,1 lake build tests >"$out/lake.out" )
 
 # Wait for an `ENR <text>` line in $1 while $pid lives.
 wait_enr() {

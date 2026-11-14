@@ -43,7 +43,9 @@ if [[ ! -x "$helper" ]]; then
   CARGO_BUILD_JOBS=2 nice -n19 cargo build --release \
     --manifest-path "$root/scripts/pubsub-rust/Cargo.toml" --target-dir "$out/rust-target"
 fi
-[[ -x "$lean" ]] || { echo "pubsub-rust-interop: build pubsub-interop first" >&2; exit 2; }
+# The Lean driver is built here, so a run never tests a stale binary.
+( cd "$root" &&
+  LEAN_NUM_THREADS=2 nice -n19 taskset -c 0,1 lake build pubsub-interop >"$out/lake.out" )
 
 status=0
 

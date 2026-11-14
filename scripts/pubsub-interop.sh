@@ -61,7 +61,9 @@ check_rev "$root/../p2p/go-libp2p-pubsub" "$pubsub_rev"
 if [[ ! -x "$tool" ]]; then
   (cd "$root/scripts/pubsub-go" && GOFLAGS=-p=2 GOMAXPROCS=2 nice -n19 go build -o "$tool" .)
 fi
-[[ -x "$lean" ]] || { echo "pubsub-interop: build pubsub-interop first" >&2; exit 2; }
+# The Lean driver is built here, so a run never tests a stale binary.
+( cd "$root" &&
+  LEAN_NUM_THREADS=2 nice -n19 taskset -c 0,1 lake build pubsub-interop >"$out/lake.out" )
 
 # Start a go node in the background with its output in $out/$1.out, and
 # wait for its ADDR line. The function sets `addr` and `pid`. It runs in
