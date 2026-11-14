@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pubsub interoperability with go-libp2p-pubsub v0.19.0 over go-libp2p
-# v0.51.0: signed peer records, floodsub, and gossipsub peer exchange.
+# v0.51.0: signed peer records, floodsub, gossipsub peer exchange, and the
+# v1.3 partial messages.
 #
 # The go side (scripts/pubsub-go) builds from the clones beside the repo
 # (../p2p/go-libp2p and ../p2p/go-libp2p-pubsub, which its go.mod
@@ -19,6 +20,11 @@
 # 4. px-send: we run with peer exchange and a mesh bound of two; go nodes
 #    A1 and A2 fill our mesh, then A3 joins. Our prune of A3 names A1 and
 #    A2 with their records, and A3 passes when it connects to one of them.
+# 5. partial requester: a go node that requests partial messages (v1.3)
+#    and we exchange partial data both ways, and neither side gets a full
+#    message from the other.
+# 6. partial supporter: a go node that only supports partial messages
+#    gets our metadata without the data, and we get its data.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -144,6 +150,36 @@ if "$tool" node -seed C -connect "$l" -watch "$(peer_of "$a1")" -watch "$(peer_o
 else
   cat "$out/pxa3.out" "$out/pxa3.err" "$out/lean-pxs.out" "$out/lean-pxs.err"
   failed "px lean-to-go"
+fi
+cleanup
+
+# 5. Partial messages with a go requester: each side gets the other's
+# partial data, and neither gets a full message from the other.
+go_node partr -seed P -partial request -publish from-go-full -publish-partial from-go-partial \
+  -expect-partial from-lean-partial -timeout 30
+if "$lean" partial "$addr" >"$out/lean-partr.out" 2>"$out/lean-partr.err" && wait "$pid" &&
+    ! grep -q '^GOT from-lean-full' "$out/partr.out"; then
+  grep -h -m1 '^PARTIAL .* data=from-lean-partial' "$out/partr.out"
+  cat "$out/lean-partr.out"
+  pass "partial requester"
+else
+  cat "$out/lean-partr.out" "$out/lean-partr.err" "$out/partr.out" "$out/partr.err"
+  failed "partial requester"
+fi
+cleanup
+
+# 6. Partial messages with a go node that only supports them: go gets our
+# metadata and never our data, and we still get go's data.
+go_node parts -seed Q -partial support -publish from-go-full -publish-partial from-go-partial \
+  -expect-meta meta-lean -timeout 30
+if "$lean" partial "$addr" >"$out/lean-parts.out" 2>"$out/lean-parts.err" && wait "$pid" &&
+    ! grep -q '^PARTIAL .* data=from-lean' "$out/parts.out"; then
+  grep -h -m1 '^PARTIAL .* meta=meta-lean' "$out/parts.out"
+  cat "$out/lean-parts.out"
+  pass "partial supporter"
+else
+  cat "$out/lean-parts.out" "$out/lean-parts.err" "$out/parts.out" "$out/parts.err"
+  failed "partial supporter"
 fi
 
 exit "$status"

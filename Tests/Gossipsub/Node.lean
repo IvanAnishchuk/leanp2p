@@ -767,12 +767,42 @@ private def publisherOrder (r : Tests.Runner) : Async Unit := do
   IO.println s!"node.measure.publishers countA={seqA.length} countB={seqB.length} streamsA={oa} streamsB={ob} inversionsA={ia} inversionsB={ib}"
   finish sw [a,b,sink]
 
+/-- The loop's input order (`nextInput`): a control input goes before a
+backlog of RPCs, the backlog keeps its order, and the closed queues
+serve out before the end. -/
+private def inputOrderChecks (r : Tests.Runner) : Async Unit := do
+  let control ← (Chan.new 64 : BaseIO (Chan Nat))
+  let events ← (Chan.new 64 : BaseIO (Chan Nat))
+  -- A full RPC queue, then one control input.
+  for i in [0:64] do
+    discard (events.trySend (100 + i) : BaseIO Bool)
+  discard (control.trySend 1 : BaseIO Bool)
+  r.check "node.input.control-before-a-full-rpc-queue" ((← nextInput control events) == some 1)
+  r.check "node.input.rpcs-in-order"
+    ((← nextInput control events) == some 100 && (← nextInput control events) == some 101)
+  -- A control input that comes amid the backlog still goes next.
+  discard (control.trySend 2 : BaseIO Bool)
+  r.check "node.input.late-control-goes-next" ((← nextInput control events) == some 2)
+  -- Stop closes both queues; the queued inputs still come out.
+  discard (control.trySend 3 : BaseIO Bool)
+  (control.close : BaseIO Unit)
+  (events.close : BaseIO Unit)
+  let mut rest : List Nat := []
+  for _ in [0:70] do
+    match ← nextInput control events with
+    | some i => rest := rest ++ [i]
+    | none => break
+  r.check "node.input.closed-queues-serve-out"
+    (rest == 3 :: (List.range 62).map (102 + ·))
+  r.check "node.input.none-after-both-close" ((← nextInput control events).isNone)
+
 /-- Run the node regressions and print the measured queue and ordering counts. -/
 def run (r : Tests.Runner) : IO Unit := do
   r.section "gossipsub Node" "packages/libp2p/protocols/docs/PLAN.md, unit 3"
   Async.run do
     -- Inbound reset checks use a separate host task owner below.
     switchChecks r
+    inputOrderChecks r
     localChecks r
     scoreChecks r
     systemClockChecks r

@@ -191,6 +191,13 @@ structure Config where
   the loop task, so it must not park. The application answers through
   `Node.sendPartial`, and scores the parts through `Node.judgePartial`. -/
   onPartial : Peer → Rpc.PartialMessage → BaseIO Unit := fun _ _ => pure ()
+  /-- Called at each heartbeat with the gossip targets of a topic that
+  requested partial messages, in place of their IHAVE
+  (`partial-messages.md`, "Partial Message Gossip"). The application
+  offers the groups it holds through `Node.sendPartial`, as go's
+  `OnEmitGossip` does. It runs on the loop task, so it must not park;
+  `Node.sendPartial` only queues. -/
+  onPartialGossip : TopicId → List Peer → BaseIO Unit := fun _ _ => pure ()
   /-- Serve and speak `/floodsub/1.0.0` (pubsub `README.md`): the
   handler takes floodsub streams, and our writer proposes floodsub last.
   go-libp2p-pubsub and Lodestar speak it; rust-libp2p, and so
@@ -502,8 +509,13 @@ private structure Env where
   config : Config
   /-- The subscription table. -/
   subs : Conc.OnceRef Subscriptions
-  /-- The event queue. -/
+  /-- The queue of inbound RPCs and the joins of their streams. A full
+  queue parks the reader, so the back-pressure reaches the peer. -/
   events : Conc.Chan Input
+  /-- The queue of every other input: the alarm's wakes, the
+  application's posts and reads, and the host's notices. The loop serves
+  it first (`nextInput`). -/
+  control : Conc.Chan Input
   /-- The owned alarm task posts wakes on events. -/
   alarm : Conc.Alarm
   /-- The owner of the loop, alarm and writers. -/
@@ -567,7 +579,7 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
         env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
         -- The router took the peer for a gossipsub peer at its join.
         if id == Constants.floodsubId then
-          discard <| env.events.trySend (.event (.protocol q .floodsub))
+          discard <| env.control.trySend (.event (.protocol q .floodsub))
       env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record
         env.config.floodsub peer ob)
       pure ob
@@ -709,6 +721,7 @@ private def perform (env : Env) (gossipAt : Option Millis) (index : Nat)
     | .deliver m => (deliver env.subs m : BaseIO Unit)
     | .validate m id source => env.config.onValidate m id source
     | .partialIn source pm => env.config.onPartial source pm
+    | .partialGossip topic peers => env.config.onPartialGossip topic peers
     | .pxConnect _ infos => pxConnect env infos
     | .sendRpc to rpc0 =>
       let rpc ← fillRecords env rpc0
@@ -844,14 +857,36 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
   return st
 
+/-- The loop's next input: a queued control input first, then whichever
+queue fills first. A burst of inbound RPCs fills `events` and parks its
+readers, and the control inputs still go first: the heartbeat, the
+application's posts, and the host's joins and leaves. `none` once both
+queues are closed and empty; a closed queue serves its queued inputs
+first.
+
+The two queues keep no order between them. A host's leave can pass the
+join a stream handler queued before it; the router then keeps a peer
+that is gone until the next heartbeat, whose `reconcile` runs before the
+mesh plans and drops it. An RPC that passes its peer's leave meets an
+unknown peer, and the core ignores it. -/
+def nextInput {α : Type} (control events : Conc.Chan α) : Conc.Async (Option α) := do
+  if let some i ← (control.tryRecv : BaseIO (Option α)) then return some i
+  -- Park: an input on either queue wakes it, and so does a close.
+  let (fromControl, got) ← Conc.select
+    #[Conc.Park.recv control (true, ·), Conc.Park.recv events (false, ·)]
+  match got with
+  | some i => return some i
+  -- One queue is closed and empty; the other serves out.
+  | none => if fromControl then events.recv else control.recv
+
 /-- Run the core through one receive park. Each action returns its state.
-The closed channel serves queued inputs before it returns none. The tail
-closes the alarm and every cached outbound stream. -/
+The closed queues serve their queued inputs before `nextInput` returns
+none. The tail closes the alarm and every cached outbound stream. -/
 private def loop (env : Env) (st0 : LoopState) : Conc.Async Unit := do
   let mut st := st0
   (env.alarm.set (dueOf st) : BaseIO Unit)
   repeat
-    match ← env.events.recv with
+    match ← nextInput env.control env.events with
     | none => break
     | some (.wake now) => st ← (onWake env st now : BaseIO LoopState)
     | some (.event e) =>
@@ -894,10 +929,11 @@ private def messageOf (topic : TopicId) (payload : ByteArray) : Message :=
     signature := none
     key := none }
 
-/-- Build the state, register the handler, and start the loop. The event
-queue holds 64 events. A full queue parks an inbound handler, which carries
-the back-pressure to the peer, and it refuses a `BaseIO` post of the
-application. -/
+/-- Build the state, register the handler, and start the loop. Each of
+the two queues holds 64 inputs. A full RPC queue parks an inbound
+handler, which carries the back-pressure to the peer. A full control
+queue refuses a `BaseIO` post of the application, and the loop serves
+that queue first, so inbound traffic never fills it. -/
 def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   -- On the payload path a message's `data` is its handle, the id bytes,
   -- so the core's id function reads it back.
@@ -907,6 +943,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let now ← config.clock.nowMs
   let subs : Conc.OnceRef Subscriptions ← Conc.OnceRef.new { next := 0, entries := [] }
   let events : Conc.Chan Input ← Conc.Chan.new 64
+  let control : Conc.Chan Input ← Conc.Chan.new 64
   let versions ← Conc.OnceRef.new ([] : List (Peer × Libp2p.Core.ProtocolId))
   let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
     versions.update fun l => (q, id) :: l.filter (·.1 != q)
@@ -948,9 +985,9 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let pxQueue : Conc.Chan Peer ←
     if h : 0 < config.maxPendingConnections then Conc.Chan.new config.maxPendingConnections h
     else Conc.Chan.new 1
-  tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
+  tasks.spawn <| alarm.run config.clock (fun now => control.send (.wake now))
   let env : Env :=
-    { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
+    { host, config, subs, events, control, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
       versions, payloads, extSent, pxQueue }
   for _ in [0:config.connectors] do
     tasks.spawn (connector env)
@@ -963,7 +1000,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       params := config.params }
   let post : Core.Event → BaseIO Bool := fun e => do
     if ← closing.get then return false
-    events.trySend (.event e)
+    control.trySend (.event e)
   -- The host's sessions reach the router here. `current` holds the
   -- session number of each peer's last `connected`, so a stale
   -- `disconnected` of a replaced session is dropped (`Host.ConnEvent`).
@@ -1027,7 +1064,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       let reply : Conc.Chan (List (Peer × Score)) ← Conc.Chan.new 1
       let k : Core.Params → Core.State → BaseIO Unit := fun p s =>
         discard <| reply.trySend (s.peers.map fun (q, _) => (q, Core.scoreOf p s q))
-      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      if !(← (control.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue, and the loop
       -- serves the queued inspect before it ends.
       reply.recv
@@ -1046,12 +1083,12 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           dropped := ← drops.get
           v12Peers := ((← versions.get).filter (·.2 == Constants.meshsubV12Id)).length
           v13Peers := ((← versions.get).filter (·.2 == Constants.meshsubV13Id)).length }
-      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      if !(← (control.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv
     setTopicParams := fun topic tp => do
       if ← closing.get then return false
-      events.trySend (.setTopicParams topic tp)
+      control.trySend (.setTopicParams topic tp)
     sendPartial := fun peer pm => post (.sendPartial peer pm)
     judgePartial := fun peer topic valid => post (.partialJudged peer topic valid)
     partialPeers := fun topic => do
@@ -1063,13 +1100,14 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           let o := Core.peerPartial s q topic
           if o.sends then some (q, o.requests) else none
         discard <| reply.trySend pairs
-      if !(← (events.trySend (.inspect k) : BaseIO Bool)) then return none
+      if !(← (control.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv
     dropped := drops.get
     stop := do
       let first ← (closing.updateGet (fun was => (!was, true)) : BaseIO Bool)
       if first then
+        (control.close : BaseIO Unit)
         (events.close : BaseIO Unit)
         (pxQueue.close : BaseIO Unit)
         for (_, ob) in ← (outbound.get : BaseIO (List (Peer × Outbound))) do

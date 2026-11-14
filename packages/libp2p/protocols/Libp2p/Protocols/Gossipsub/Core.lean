@@ -29,7 +29,10 @@ The heartbeat emits gossip after it settles the mesh and before it
 shifts the message cache. The recipients are peers of the supplied order
 at or above the gossip threshold that are in neither the mesh nor the
 fanout of the topic. Their count is adaptive: at least `dLazy`, and
-`gossipFactor` percent of the candidates when that is more.
+`gossipFactor` percent of the candidates when that is more. A recipient
+that requested partial messages on the topic gets no IHAVE; the
+application gets one `Action.partialGossip` that names all such
+recipients, and offers them its partial messages.
 
 Floodsub peers (`PubsubProto.floodsub`) are a separate forward set
 (`floodTargets`): they join no mesh, take no gossip, and get every
@@ -338,6 +341,12 @@ inductive Action where
   /-- Hand a partial message from a peer to the application, mesh peer
   or not (`partial-messages.md`, "Application-Library Interface"). -/
   | partialIn (source : Peer) (msg : Rpc.PartialMessage)
+  /-- Offer partial messages on a topic to the gossip targets of the
+  heartbeat that requested them, in place of an IHAVE
+  (`partial-messages.md`, "Partial Message Gossip"). The application
+  knows its groups, so it answers through `sendPartial`, as go's
+  `OnEmitGossip` does. -/
+  | partialGossip (topic : TopicId) (peers : List Peer)
   /-- Connect to the peers a prune from `source` offered
   (`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"). The node
   verifies each signed peer record, stores its addresses, and dials
@@ -477,6 +486,7 @@ def delivers : List Action → List Message
   | .sendRpc _ _ :: as => delivers as
   | .validate _ _ _ :: as => delivers as
   | .partialIn _ _ :: as => delivers as
+  | .partialGossip _ _ :: as => delivers as
   | .pxConnect _ _ :: as => delivers as
 
 /-! ## Outgoing RPC constructors -/
@@ -770,29 +780,36 @@ def settleMesh (p : Params) (s : State) (plans : List TopicPlan) : State :=
           score := s.topics.foldl (fun sc t => Score.prune p.score sc s.now t) e.2.score }
       else e.2)) }
 
-/-- The gossip actions: each topic of the mesh and the fanout sends its
-gossip ids to the peers of the order at or above the gossip threshold,
-up to `dLazy` targets, skipping the peers that already sit in that
-topic's mesh or fanout. The ids come from the cache as it stands, so a
+/-- The gossip targets of a topic: the peers of the order at or above the
+gossip threshold, skipping the peers that already sit in the topic's
+mesh or fanout and the floodsub peers. Adaptive gossip
+(`gossipsub-v1.1.md`, lines 165 to 184) takes at least `dLazy` of them,
+and `gossipFactor` percent of them when that is more. -/
+def gossipTargets (p : Params) (s : State) (order : List Peer) (t : TopicId) : List Peer :=
+  let cands := order.filter (fun q =>
+    decide (p.thresholds.gossipThreshold ≤ scoreOf p s q) &&
+      !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !isFlood s q)
+  cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
+
+/-- The gossip actions of each topic of the mesh and the fanout. A target
+that takes partial messages on the topic gets no IHAVE; the application
+gets one `partialGossip` with all such targets in its place
+(`partial-messages.md`, "Partial Message Gossip"). Each other target
+gets the topic's gossip ids. The partial targets are chosen first, from
+the same draw, as go-libp2p-pubsub's `emitGossip` does, and the offer
+goes out even when the cache holds no id, since partial messages never
+enter the cache. The ids come from the cache as it stands, so a
 heartbeat emits gossip before it shifts the cache. -/
 def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
-  let eligible :=
-    order.filter (fun q => decide (p.thresholds.gossipThreshold ≤ scoreOf p s q))
   let topics := s.mesh.map Prod.fst ++ s.fanout.map Prod.fst
   topics.flatMap fun t =>
+    let targets := gossipTargets p s order t
+    let partials := targets.filter (wantsPartial p s · t)
     let ids := Cache.MessageIndex.gossipIds s.mcache t
-    if ids = [] then []
-    else
-      -- Adaptive gossip (`gossipsub-v1.1.md`, lines 165 to 184): at
-      -- least `dLazy` peers, and `gossipFactor` percent of the
-      -- candidates when that is more.
-      -- A peer that takes partial messages gets no IHAVE on the topic
-      -- (`partial-messages.md`, "Partial Message Gossip").
-      let cands := eligible.filter (fun q =>
-          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !wantsPartial p s q t &&
-            !isFlood s q)
-      let targets := cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
-      targets.map fun q => Action.sendRpc q (ihaveRpc t ids)
+    let offer := if partials = [] then [] else [Action.partialGossip t partials]
+    let ihaves := if ids = [] then []
+      else (targets.filter (!wantsPartial p s · t)).map fun q => Action.sendRpc q (ihaveRpc t ids)
+    ihaves ++ offer
 
 /-- The state at the start of the heartbeat: the decayed scores, the new
 clock, the cleared backoff table, the pruned seen cache, and the shifted
@@ -2306,26 +2323,84 @@ private theorem rpcHasIhave_pruneRpc (t : TopicId) (b : Millis) (px : List Rpc.P
 private theorem rpcHasIhave_graftRpc (t : TopicId) : ¬ rpcHasIhave (graftRpc t) := by
   simp [rpcHasIhave, graftRpc, controlRpc]
 
+/-- A gossip target sits at or above the gossip threshold. -/
+theorem gossipTargets_score (p : Params) (s : State) (order : List Peer) (t : TopicId)
+    (q : Peer) (h : q ∈ gossipTargets p s order t) :
+    p.thresholds.gossipThreshold ≤ scoreOf p s q := by
+  have h' := List.mem_of_mem_take h
+  simp only [List.mem_filter, Bool.and_eq_true, decide_eq_true_eq] at h'
+  exact h'.2.1.1.1
+
+/-- A gossip target sits in neither the mesh nor the fanout of the topic. -/
+theorem gossipTargets_off_mesh (p : Params) (s : State) (order : List Peer) (t : TopicId)
+    (q : Peer) (h : q ∈ gossipTargets p s order t) :
+    memB q (meshOf s t) = false ∧ memB q (fanoutOf s t) = false := by
+  have h' := List.mem_of_mem_take h
+  simp only [List.mem_filter, Bool.and_eq_true, Bool.not_eq_true'] at h'
+  exact ⟨h'.2.1.1.2, h'.2.1.2⟩
+
 /-- A gossip action targets a peer of the order at or above the gossip
 threshold. -/
 theorem mem_gossipActions (p : Params) (s : State) (order : List Peer)
     (to : Peer) (rpc : Rpc.RPC)
     (h : Action.sendRpc to rpc ∈ gossipActions p s order) :
     p.thresholds.gossipThreshold ≤ scoreOf p s to := by
-  simp only [gossipActions, List.mem_flatMap] at h
-  obtain ⟨t, _, ht⟩ := h
-  split at ht
-  · simp at ht
-  · next ids hne =>
-    simp only [List.mem_map] at ht
-    obtain ⟨q, hq, hqr⟩ := ht
-    cases hqr
-    have htake := List.mem_of_mem_take hq
-    rw [List.mem_filter] at htake
-    obtain ⟨hbase, _⟩ := htake
-    rw [List.mem_filter] at hbase
-    obtain ⟨_, hscore⟩ := hbase
-    exact of_decide_eq_true hscore
+  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  obtain ⟨t, _, ht | ht⟩ := h
+  · split at ht
+    · simp at ht
+    · simp only [List.mem_map, List.mem_filter] at ht
+      obtain ⟨q, ⟨hq, _⟩, hqr⟩ := ht
+      cases hqr
+      exact gossipTargets_score p s order t _ hq
+  · split at ht <;> simp at ht
+
+/-- The partial-gossip offer of a heartbeat names only gossip targets that
+requested partial messages on the topic, so it never reaches a mesh or
+fanout peer, a peer below the gossip threshold, or a peer that takes full
+messages (`partial-messages.md`, "Partial Message Gossip"). -/
+theorem mem_partialGossip (p : Params) (s : State) (order : List Peer)
+    (t : TopicId) (peers : List Peer) (q : Peer)
+    (h : Action.partialGossip t peers ∈ gossipActions p s order) (hq : q ∈ peers) :
+    q ∈ gossipTargets p s order t ∧ wantsPartial p s q t = true := by
+  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  obtain ⟨t', _, ht | ht⟩ := h
+  · split at ht
+    · simp at ht
+    · simp only [List.mem_map] at ht
+      obtain ⟨_, -, hqr⟩ := ht
+      cases hqr
+  · split at ht
+    · simp at ht
+    · simp only [List.mem_singleton, Action.partialGossip.injEq] at ht
+      obtain ⟨rfl, rfl⟩ := ht
+      simpa [List.mem_filter] using hq
+
+private theorem ihaveRpc_topic {t t' : TopicId} {ids ids' : List MessageId}
+    (h : ihaveRpc t' ids' = ihaveRpc t ids) : t' = t := by
+  cases t
+  cases t'
+  simp [ihaveRpc, controlRpc] at h
+  simp [h]
+
+/-- No IHAVE of a heartbeat reaches a peer that takes partial messages on
+the topic (`partial-messages.md`, "Partial Message Gossip"). -/
+theorem gossipActions_no_ihave_partial (p : Params) (s : State) (order : List Peer)
+    (to : Peer) (t : TopicId) (ids : List MessageId)
+    (h : Action.sendRpc to (ihaveRpc t ids) ∈ gossipActions p s order) :
+    wantsPartial p s to t = false := by
+  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  obtain ⟨t', _, ht | ht⟩ := h
+  · split at ht
+    · simp at ht
+    · simp only [List.mem_map, List.mem_filter] at ht
+      obtain ⟨q, ⟨_, hw⟩, hqr⟩ := ht
+      simp only [Action.sendRpc.injEq] at hqr
+      obtain ⟨rfl, hr⟩ := hqr
+      have ht' : t' = t := ihaveRpc_topic hr
+      subst ht'
+      simpa using hw
+  · split at ht <;> simp at ht
 
 /-- The gossip state keeps the settled scores and replaces the cache, so
 the score of a peer is the score after the heartbeat. -/
@@ -2595,13 +2670,14 @@ private theorem negativeActions_not_deliver (p : Params) (s : State) (now : Mill
 private theorem gossipActions_not_deliver (p : Params) (s : State) (order : List Peer)
     (m : Message) : Action.deliver m ∉ gossipActions p s order := by
   intro h
-  simp only [gossipActions, List.mem_flatMap] at h
-  obtain ⟨t, -, ht⟩ := h
-  split at ht
-  · simp at ht
-  · simp only [List.mem_map] at ht
-    obtain ⟨q, -, hq⟩ := ht
-    cases hq
+  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  obtain ⟨t, -, ht | ht⟩ := h
+  · split at ht
+    · simp at ht
+    · simp only [List.mem_map] at ht
+      obtain ⟨q, -, hq⟩ := ht
+      cases hq
+  · split at ht <;> simp at ht
 
 private theorem heartbeatActions_not_deliver (p : Params) (s : State) (now : Millis)
     (order : List Peer) (m : Message) :
@@ -2874,14 +2950,15 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
       obtain ⟨pl, -, q, -, hqeq⟩ := hmem
       cases hqeq
       exact absurd hgraft (rpcGrafts_pruneRpc _ _ _ _)
-  · simp only [gossipActions, List.mem_flatMap] at hmem
-    obtain ⟨t, -, ht⟩ := hmem
-    split at ht
-    · simp at ht
-    · simp only [List.mem_map] at ht
-      obtain ⟨q, -, hqeq⟩ := ht
-      cases hqeq
-      exact absurd hgraft (rpcGrafts_ihaveRpc _ _ _)
+  · simp only [gossipActions, List.mem_flatMap, List.mem_append] at hmem
+    obtain ⟨t, -, ht | ht⟩ := hmem
+    · split at ht
+      · simp at ht
+      · simp only [List.mem_map] at ht
+        obtain ⟨q, -, hqeq⟩ := ht
+        cases hqeq
+        exact absurd hgraft (rpcGrafts_ihaveRpc _ _ _)
+    · split at ht <;> simp at ht
 
 /-! ## The peer exchange and floodsub theorems -/
 

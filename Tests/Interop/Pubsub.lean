@@ -35,6 +35,16 @@ peer record.
   join; the last one's GRAFT finds the mesh full and gets our prune,
   and that go node passes when it connects to a peer it only learned
   from our records.
+* `pubsub-interop partial ADDR`: request partial messages (gossipsub
+  v1.3) on the topic, dial a go node that runs the extension, and each
+  200 ms offer it a partial message of group `g` and publish a full
+  message. The check passes once go's partial data reaches us, and only
+  if no full message from go arrived: go must honour our request. The
+  script checks the go side: a go requester gets our data and none of our
+  full messages, and a go supporter gets our metadata without the data.
+* `pubsub-interop partial-listen PORT`: the same check with a
+  rust-libp2p node, which dials us (`scripts/pubsub-rust-interop.sh`).
+  We pass once its data `from-rust-partial` arrives.
 
 Each mode exits 0 on success. The seeds are one character, 32 times, as
 the go side builds them.
@@ -217,13 +227,65 @@ def pxSendMode (port : String) (secs : Nat) : Async UInt32 := do
   stop running
   return 0
 
+/-- A partial message of group `g` on the interop topic. -/
+def partialOf (data parts : String) : Rpc.PartialMessage :=
+  { topicId := some (Bytes.toNatList topic.name.toUTF8), groupId := some (Bytes.toNatList "g".toUTF8),
+    partialMessage := some (Bytes.toNatList data.toUTF8),
+    partsMetadata := some (Bytes.toNatList parts.toUTF8) }
+
+/-- The partial-messages check against a peer whose partial data starts
+with `expected`. We dial `target`, or listen on `listen` for the peer. -/
+def partialMode (expected : String) (target listen : Option String) : Async UInt32 := do
+  let base := Core.defaults
+  let params : Core.Params :=
+    { base with partialTopics := [(topic, { requests := true, supports := true })] }
+  let got : OnceRef (Option String) ← OnceRef.new none
+  let fulls : OnceRef Nat ← OnceRef.new 0
+  let want := Bytes.toNatList expected.toUTF8
+  let onPartial : Peer → Rpc.PartialMessage → BaseIO Unit := fun _ pm => do
+    let data := pm.partialMessage.getD []
+    if data.take want.length == want then
+      got.set (some ((Bytes.toString? (Bytes.ofNatList data)).getD "?"))
+  let running ← start { params, onPartial } listen false
+  if let some t := target then
+    discard <| dial running t
+  -- We requested partial messages, so the peer must send us no full
+  -- message.
+  discard (running.node.subscribe topic fun _ => fulls.update (· + 1) : BaseIO Bool)
+  -- Each round offers a partial message to each peer that can take one,
+  -- and publishes a full message, which a requester must not get.
+  let count : OnceRef Nat ← OnceRef.new 0
+  let round : Async Unit := do
+    let n ← (count.updateGet fun n => (n + 1, n + 1) : BaseIO Nat)
+    for (q, _) in (← running.node.partialPeers topic).getD [] do
+      discard (running.node.sendPartial q (partialOf s!"from-lean-partial-{n}" "meta-lean") : BaseIO Bool)
+    discard (running.node.publish topic s!"from-lean-full-{n}".toUTF8 : BaseIO Bool)
+  let ok ← waitFor 20000 do
+    round
+    return (← (got.get : BaseIO (Option String))).isSome
+  -- Keep offering a moment, so the peer sees ours too.
+  for _ in [0:5] do
+    round
+    sleep 200
+  stop running
+  let full ← (fulls.get : BaseIO Nat)
+  match ← (got.get : BaseIO (Option String)) with
+  | some d => IO.println s!"LEAN-PARTIAL {d}"
+  | none => IO.println "LEAN-PARTIAL-TIMEOUT"
+  IO.println s!"LEAN-FULL {full}"
+  return if ok && full == 0 then 0 else 1
+
 def main (args : List String) : IO UInt32 := do
   let run : Async UInt32 := match args with
     | "record" :: rest => recordMode rest
     | ["floodsub", target] => floodsubMode target
     | ["px-accept", target] => pxAcceptMode target
     | ["px-send", port, secs] => pxSendMode port (secs.toNat?.getD 30)
-    | _ => fail "modes: record, floodsub ADDR, px-accept ADDR, px-send PORT SECS"
+    | ["partial", target] => partialMode "from-go-partial" (some target) none
+    | ["partial-listen", port] =>
+      partialMode "from-rust-partial" none (some s!"/ip4/127.0.0.1/tcp/{port}")
+    | _ => fail
+      "modes: record, floodsub ADDR, px-accept ADDR, px-send PORT SECS, partial ADDR, partial-listen PORT"
   try
     run.run
   catch e =>

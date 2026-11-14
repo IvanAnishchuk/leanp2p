@@ -254,6 +254,29 @@ def run (r : Runner) : IO Unit := do
     ((sentTo pa acts).all (!hasIhave ·))
   r.check "core: gossip reaches the other non-mesh peer"
     ((sentTo pc acts).any hasIhave)
+  -- In place of the IHAVE, the application offers its partial messages
+  -- to the requesting gossip target, and only to it.
+  let offers := acts.filterMap fun a => match a with
+    | .partialGossip t ps => some (t, ps)
+    | _ => none
+  r.check "core: the heartbeat offers partial messages to the requester"
+    (offers == [(ta, [pa])])
+  -- Partial messages never enter the cache, so the offer goes out with
+  -- no full message to gossip.
+  let (_, quiet) := runAll s1 [.tick params.heartbeatInterval [pa, pb, pc]]
+  r.check "core: the offer goes out with an empty message cache"
+    (quiet.any (· == .partialGossip ta [pa]) && quiet.all fun a => match a with
+      | .sendRpc _ r => !hasIhave r
+      | _ => true)
+  -- A topic where we cannot send partial messages makes no offer.
+  let fullOnly : Params := { params with partialTopics := [] }
+  let offFull := match Core.run fullOnly s1 [.tick params.heartbeatInterval [pa, pb, pc]] with
+    | .ok (_, a) => a
+    | .error _ => []
+  r.check "core: a full-message topic makes no offer"
+    (offFull.all fun a => match a with
+      | .partialGossip _ _ => false
+      | _ => true)
 
   -- The scoring hooks of the Fulu partial columns.
   let j1 := stateOf (step params s1 (.partialJudged pa ta true))

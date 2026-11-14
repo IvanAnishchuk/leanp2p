@@ -18,6 +18,14 @@
 // 0 when a message with the -expect prefix arrives or a -watch peer
 // connects, and 1 at -timeout. The message id is the data, as in the
 // consensus layer, so each -publish message carries a count.
+//
+// With -partial request or -partial support, the node runs the v1.3
+// partial-messages extension on its topic. It prints `PARTIAL <from>
+// data=<data> meta=<metadata>` for each partial message a peer sends,
+// and with -publish-partial it offers one partial message of group `g`
+// every 200 ms. It exits 0 once a partial message arrives whose data has
+// the -expect-partial prefix, or whose metadata has the -expect-meta
+// prefix.
 package main
 
 import (
@@ -26,12 +34,15 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"iter"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -133,6 +144,10 @@ func nodeMode(args []string) {
 	publish := fs.String("publish", "", "publish this text and a count every 200 ms")
 	expect := fs.String("expect", "", "exit 0 once a message with this prefix arrives")
 	timeout := fs.Int("timeout", 30, "seconds before exit 1")
+	partial := fs.String("partial", "", "request or support partial messages on the topic")
+	publishPartial := fs.String("publish-partial", "", "offer a partial message with this text and a count every 200 ms")
+	expectPartial := fs.String("expect-partial", "", "exit 0 once partial data with this prefix arrives")
+	expectMeta := fs.String("expect-meta", "", "exit 0 once partial metadata with this prefix arrives")
 	var connect, watch list
 	fs.Var(&connect, "connect", "dial this multiaddr (repeatable)")
 	fs.Var(&watch, "watch", "exit 0 once this peer id connects (repeatable)")
@@ -176,9 +191,46 @@ func nodeMode(args []string) {
 		pubsub.WithNoAuthor(),
 		pubsub.WithMessageIdFn(func(m *pb.Message) string { return string(m.Data) }),
 	}
+	// The partial-messages extension: it prints each partial message, and
+	// the application state per peer is empty, since each offer carries
+	// the whole text.
+	var topicOpts []pubsub.TopicOpt
+	switch *partial {
+	case "":
+	case "request":
+		topicOpts = append(topicOpts, pubsub.RequestPartialMessages())
+	case "support":
+		topicOpts = append(topicOpts, pubsub.SupportsPartialMessages())
+	default:
+		die("partial %s", *partial)
+	}
+	if *partial != "" {
+		ext := &partialmessages.PartialMessagesExtension[struct{}]{
+			Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+			OnIncomingRPC: func(from peer.ID, _ map[peer.ID]struct{}, rpc *pb.PartialMessagesExtension) error {
+				data, meta := string(rpc.GetPartialMessage()), string(rpc.GetPartsMetadata())
+				fmt.Printf("PARTIAL %s data=%s meta=%s\n", from, data, meta)
+				if (*expectPartial != "" && strings.HasPrefix(data, *expectPartial)) ||
+					(*expectMeta != "" && strings.HasPrefix(meta, *expectMeta)) {
+					// The router's loop calls this, so it must not block.
+					select {
+					case done <- "partial":
+					default:
+					}
+				}
+				return nil
+			},
+			OnEmitGossip: func(string, []byte, []peer.ID, map[peer.ID]struct{}) {},
+		}
+		common = append(common, pubsub.WithPartialMessagesExtension(ext))
+	}
+
 	var ps *pubsub.PubSub
 	switch *router {
 	case "floodsub":
+		if *partial != "" {
+			die("partial messages need gossipsub")
+		}
 		ps, err = pubsub.NewFloodSub(ctx, h, common...)
 	case "gossipsub":
 		params := pubsub.DefaultGossipSubParams()
@@ -197,7 +249,7 @@ func nodeMode(args []string) {
 	if err != nil {
 		die("pubsub: %v", err)
 	}
-	t, err := ps.Join(*topic)
+	t, err := ps.Join(*topic, topicOpts...)
 	if err != nil {
 		die("join: %v", err)
 	}
@@ -263,7 +315,43 @@ func nodeMode(args []string) {
 		}()
 	}
 
-	if *expect == "" && len(watched) == 0 {
+	if *publishPartial != "" {
+		go func() {
+			tick := time.NewTicker(200 * time.Millisecond)
+			defer tick.Stop()
+			meta := []byte("meta-" + *publishPartial)
+			count := 0
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					count++
+					data := []byte(fmt.Sprintf("%s-%d", *publishPartial, count))
+					// The data goes only to a peer that requested partial
+					// messages; the metadata goes to each peer.
+					actions := func(states map[peer.ID]struct{}, requests func(peer.ID) bool) iter.Seq2[peer.ID, partialmessages.PublishAction] {
+						return func(yield func(peer.ID, partialmessages.PublishAction) bool) {
+							for p := range states {
+								a := partialmessages.PublishAction{EncodedPartsMetadata: meta}
+								if requests(p) {
+									a.EncodedPartialMessage = data
+								}
+								if !yield(p, a) {
+									return
+								}
+							}
+						}
+					}
+					if err := pubsub.PublishPartial(ps, *topic, []byte("g"), actions); err != nil {
+						fmt.Fprintf(os.Stderr, "go: publish partial: %v\n", err)
+					}
+				}
+			}
+		}()
+	}
+
+	if *expect == "" && *expectPartial == "" && *expectMeta == "" && len(watched) == 0 {
 		// A helper node: serve until the timeout.
 		<-ctx.Done()
 		return
@@ -272,7 +360,7 @@ func nodeMode(args []string) {
 	case why := <-done:
 		fmt.Printf("DONE %s\n", why)
 		// Let the other side see our last messages.
-		time.Sleep(time.Second)
+		time.Sleep(2 * time.Second)
 	case <-ctx.Done():
 		fmt.Println("TIMEOUT")
 		os.Exit(1)

@@ -1,0 +1,17 @@
+[package]
+name = "pubsub-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "pubsub interop helper: rust-libp2p gossipsub with partial messages against the leanp2p node"
+
+# rust-libp2p from the local clone (../p2p/rust-libp2p at c449090, which
+# scripts/pubsub-rust-interop.sh checks), with gossipsub's v1.3 partial
+# messages turned on.
+[dependencies]
+libp2p = { path = "../../../p2p/rust-libp2p/libp2p", features = [
+  "ed25519", "gossipsub", "gossipsub-partial-messages", "macros", "noise", "tcp", "tokio", "yamux",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[workspace]
