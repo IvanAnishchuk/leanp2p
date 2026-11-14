@@ -378,6 +378,17 @@ private theorem stepsOnEntry (s : State) (p : Entry → Bool) (f : Entry → Str
   · exact Steps.refl s
   · next e he => exact stepsPut (List.mem_of_find?_eq_some he) _
 
+private theorem stepsDrainOpens (s : State) (acts : Array Action) :
+    Steps s (drainOpens s acts).1 :=
+  stepsOpenPending _ _ _
+
+private theorem stepsOnKey (s : State) (k : StreamKey) (f : Entry → StreamState × Array Action)
+    (missing : Array Action) : Steps s (onKey s k f missing).1 := by
+  unfold onKey
+  split
+  · exact (stepsOnEntry _ _ _ _).trans (stepsDrainOpens _ _)
+  · exact stepsOnEntry _ _ _ _
+
 private theorem stepsOnGoAway (s : State) : Steps s (onGoAway s).1 := by
   unfold onGoAway
   split
@@ -551,7 +562,8 @@ theorem stepsStep {s s' : State} {ev : Event} {acts : List Action}
       obtain ⟨s1, a1⟩ := r
       simp only [hb, Except.map, Except.ok.injEq, Prod.mk.injEq] at hr
       obtain ⟨rfl, -⟩ := hr
-      exact (stepsHeard s p).trans ((stepsRecvBytes _ hb).trans (stepsSchedule s1 a1))
+      exact (stepsHeard s p).trans ((stepsRecvBytes _ hb).trans
+        ((stepsDrainOpens s1 a1).trans (stepsSchedule _ _)))
   | eof =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
@@ -567,19 +579,19 @@ theorem stepsStep {s s' : State} {ev : Event} {acts : List Action}
   | write k tag p =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact stepsOnEntry _ _ _ _
+    exact stepsOnKey _ _ _ _
   | consumed k n =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact stepsOnEntry _ _ _ _
+    exact stepsOnKey _ _ _ _
   | close k =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact stepsOnEntry _ _ _ _
+    exact stepsOnKey _ _ _ _
   | reset k =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact stepsOnEntry _ _ _ _
+    exact stepsOnKey _ _ _ _
   | ping tag =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
@@ -727,7 +739,7 @@ theorem stepStale {s : State} {k : StreamKey} {n tag : Nat} {p : Bytes.Blob}
     rw [List.find?_eq_none]
     intro e he
     simp [State.byKey, hk e he]
-  simp [step, onEntry, hnone]
+  simp [step, onKey, onEntry, hnone]
 
 /-! ## No byte is dropped -/
 
@@ -884,6 +896,14 @@ private theorem rxOkOnEntry {s : State} {p : Entry → Bool} {f : Entry → Stre
   split
   · exact h
   · next e he => exact rxOkPut (List.mem_of_find?_eq_some he) (hf e) h
+
+private theorem rxOkOnKey {s : State} {k : StreamKey} {f : Entry → StreamState × Array Action}
+    {missing : Array Action} (hf : ∀ e rem, Charged rem e.state → Charged rem (f e).1)
+    (h : RxOk s) : RxOk (onKey s k f missing).1 := by
+  unfold onKey drainOpens
+  split
+  · exact rxOkOpenPending _ _ _ (rxOkOnEntry hf h)
+  · exact rxOkOnEntry hf h
 
 /-! ### The entry operations keep the charge -/
 
@@ -1227,7 +1247,8 @@ theorem rxOkStep {s s' : State} {ev : Event} {acts : List Action} (hs : Inv s) (
         unfold heard; split
         · exact h0
         · exact rxOkOfFields rfl rfl rfl rfl h0
-      exact rxOkSchedule a1 (rxOkRecvBytes _ ((stepsHeard s p).inv hs) hh hb)
+      exact rxOkSchedule _
+        (rxOkOpenPending _ _ _ (rxOkRecvBytes _ ((stepsHeard s p).inv hs) hh hb))
   | tick t =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
@@ -1251,19 +1272,19 @@ theorem rxOkStep {s s' : State} {ev : Event} {acts : List Action} (hs : Inv s) (
   | write k tag p =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact rxOkOnEntry (fun e rem hc => chargedWrite e tag p rem hc) h0
+    exact rxOkOnKey (fun e rem hc => chargedWrite e tag p rem hc) h0
   | consumed k n =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact rxOkOnEntry (fun e rem hc => chargedConsume e n rem hc) h0
+    exact rxOkOnKey (fun e rem hc => chargedConsume e n rem hc) h0
   | close k =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact rxOkOnEntry (fun e rem hc => chargedCloseLocal e rem hc) h0
+    exact rxOkOnKey (fun e rem hc => chargedCloseLocal e rem hc) h0
   | reset k =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr
-    exact rxOkOnEntry (fun e rem _ => chargedResetLocal e rem) h0
+    exact rxOkOnKey (fun e rem _ => chargedResetLocal e rem) h0
   | ping tag =>
     simp only [step, Except.ok.injEq, Prod.mk.injEq] at hr
     obtain ⟨rfl, -⟩ := hr

@@ -962,6 +962,24 @@ def recvBytes (fuel : Nat) (s : State) (b : ByteArray) (pos : Nat) (acts : Array
 
 /-! ## The step -/
 
+/-- Open the waiting requests our ACK backlog now has room for. A stream
+of ours that retires before its ACK frees a place, as go-yamux's
+`closeStream` gives the place back (`vendor/go-yamux/session.go`, line
+911). The peer's RST, its FIN after ours, and our reset each retire one.
+With no room or no waiting request, nothing changes. -/
+def drainOpens (s : State) (acts : Array Action) : State × Array Action :=
+  openPending s s.pendingOpens acts
+
+/-- An application event on the stream of key `k`: the entry operation,
+then the waiting opens, when the key names a live stream. A stale key
+changes nothing (`stepStale`). -/
+def onKey (s : State) (k : StreamKey) (f : Entry → StreamState × Array Action)
+    (missing : Array Action) : State × Array Action :=
+  if (s.streams.find? (State.byKey k)).isSome then
+    let (s, a) := onEntry s (State.byKey k) f missing
+    drainOpens s a
+  else onEntry s (State.byKey k) f missing
+
 /-- The bytes of one read arrived at the latest tick: the shell ticks
 right before each read (module doc, "Time"). Bytes from the peer
 restart the keepalive interval. -/
@@ -974,15 +992,16 @@ our ping can move a deadline, so only those three ask for a new tick
 def step (s : State) : Event → Except ProtocolError (State × List Action)
   | .bytes p =>
     (recvBytes (p.bytes.size + 1) (heard s p) p.bytes 0 #[]).map fun (s, a) =>
+      let (s, a) := drainOpens s a
       let (s, a) := schedule s a; (s, a.toList)
   | .eof => .ok (s, [.shutdown])
   | .tick t => let (s, a) := onTick s t; let (s, a) := schedule s a; .ok (s, a.toList)
   | .openStream tag => let (s, a) := onOpen s tag; .ok (s, a.toList)
   | .write k tag p =>
-    let (s, a) := onEntry s (State.byKey k) (·.write tag p) #[.refused tag .closed]; .ok (s, a.toList)
-  | .consumed k n => let (s, a) := onEntry s (State.byKey k) (·.consume n) #[]; .ok (s, a.toList)
-  | .close k => let (s, a) := onEntry s (State.byKey k) Entry.closeLocal #[]; .ok (s, a.toList)
-  | .reset k => let (s, a) := onEntry s (State.byKey k) Entry.resetLocal #[]; .ok (s, a.toList)
+    let (s, a) := onKey s k (·.write tag p) #[.refused tag .closed]; .ok (s, a.toList)
+  | .consumed k n => let (s, a) := onKey s k (·.consume n) #[]; .ok (s, a.toList)
+  | .close k => let (s, a) := onKey s k Entry.closeLocal #[]; .ok (s, a.toList)
+  | .reset k => let (s, a) := onKey s k Entry.resetLocal #[]; .ok (s, a.toList)
   | .ping tag => let (s, a) := onPing s tag; let (s, a) := schedule s a; .ok (s, a.toList)
   | .goAway => let (s, a) := onGoAway s; .ok (s, a.toList)
 

@@ -344,6 +344,16 @@ private def coreFlowChecks (r : Runner) : IO Unit := do
     (match feed client (opens ++ [bytesEvent (wf ackFlags 1)]) with
       | .ok (_, a) => a.contains (.opened backlogCap ⟨2 * backlogCap + 1, backlogCap⟩)
       | _ => false)
+  -- A stream that ends before its ACK frees its place too, as go-yamux's
+  -- `closeStream` gives it back: the peer's RST, or our own reset.
+  r.check "core: the peer's RST of an unacked stream lets the waiting open through"
+    (match feed client (opens ++ [bytesEvent (wf rstFlags 1)]) with
+      | .ok (_, a) => a.contains (.opened backlogCap ⟨2 * backlogCap + 1, backlogCap⟩)
+      | _ => false)
+  r.check "core: our reset of an unacked stream lets the waiting open through"
+    (match feed client (opens ++ [.reset ⟨1, 0⟩]) with
+      | .ok (_, a) => a.contains (.opened backlogCap ⟨2 * backlogCap + 1, backlogCap⟩)
+      | _ => false)
 
 private def coreCloseChecks (r : Runner) : IO Unit := do
   -- Half-close: our FIN ends our direction only, and the response after
