@@ -145,7 +145,9 @@ def run (a : Args) : IO UInt32 := do
   let counts ← (OnceRef.new ({} : Counts) : BaseIO _)
   let probed ← (OnceRef.new ([] : List PeerId) : BaseIO _)
   let tasks ← (TaskSet.new : BaseIO TaskSet)
-  let deadline := (← IO.monoMsNow) + a.seconds * 1000
+  let start ← IO.monoMsNow
+  let deadline := start + a.seconds * 1000
+  let mut nextReport := start + 10000
   while (← IO.monoMsNow) < deadline do
     IO.sleep 200
     for e in ← (events.updateGet fun q => (q, #[]) : BaseIO (Array Event)) do
@@ -172,6 +174,16 @@ def run (a : Args) : IO UInt32 := do
       | .goodbye p r =>
         IO.println s!"goodbye {short p}: reason {r}"
         counts.update fun c => { c with goodbyes := c.goodbyes + 1 }
+      | .metaData p md =>
+        IO.println s!"metadata refresh {short p}: seq {md.seqNumber}, cgc {md.custodyGroupCount}"
+      | .unresponsive p => IO.println s!"no ping answer {short p}"
+    -- Every 10 s, the gossip so far, so a stall shows as a flat count.
+    let now ← IO.monoMsNow
+    if now ≥ nextReport then
+      nextReport := now + 10000
+      let c ← counts.get
+      IO.println s!"t+{(now - start) / 1000}s: peers {(← s.peers).length}, blocks {c.blocks}, \
+        aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}"
   Async.run tasks.joinAll
   Async.run s.stop
   let c ← counts.get
