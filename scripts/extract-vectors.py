@@ -1308,6 +1308,55 @@ def extract_enr_text() -> None:
     })
 
 
+def extract_discv5() -> None:
+    """The discv5 wire test vectors: the four packets node B decodes, with
+    the inputs each one lists, and the four crypto vectors. A packet block
+    opens with a line ending in `):`, lists its inputs as `# name = 0x..`
+    comments, and ends with its hex lines; a crypto section opens with
+    `### Title` and lists `name = 0x..` or `name: 0x..` lines."""
+    d = "vendor/devp2p"
+    path = "discv5/discv5-wire-test-vectors.md"
+    src = read(d, path)
+    keys = dict(re.findall(r"^\s+(node-[ab]-key) = 0x([0-9a-f]+)$", src, re.M))
+    packets = []
+    crypto = {}
+    section = None
+    for line in src.splitlines():
+        s = line.strip()
+        if s.endswith("):") and "packet" in s:
+            name = s[:-1]
+            flag = int(re.search(r"flag (\d)", s).group(1))
+            section = {"name": name, "flag": flag, "inputs": {}, "packetHex": ""}
+            packets.append(section)
+        elif s.startswith("### "):
+            section = {}
+            crypto[s[4:]] = section
+        elif section is None:
+            continue
+        elif "packetHex" in section and s.startswith("#"):
+            m = re.match(r"#\s*([\w.-]+) = 0x([0-9a-f]+)$", s)
+            if m:
+                section["inputs"][m.group(1)] = m.group(2)
+            else:
+                m = re.match(r"#\s*([\w.-]+) = (\d+)$", s)
+                if m:
+                    section["inputs"][m.group(1)] = int(m.group(2))
+        elif "packetHex" in section and re.fullmatch(r"[0-9a-f]+", s):
+            section["packetHex"] += s
+        elif "packetHex" not in section:
+            m = re.match(r"([\w-]+)\s*[:=]\s*0x([0-9a-f]+)$", s)
+            if m:
+                section[m.group(1)] = m.group(2)
+    assert len(packets) == 4, f"expected 4 packets, got {len(packets)}"
+    assert set(crypto) == {"ECDH", "Key Derivation", "ID Nonce Signing", "Encryption/Decryption"}
+    write_json("discv5-wire.json", {
+        "_provenance": prov(d, path, "Packet Encodings, Cryptographic Primitives"),
+        "keys": {"nodeA": keys["node-a-key"], "nodeB": keys["node-b-key"]},
+        "packets": packets,
+        "crypto": crypto,
+    })
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     extract_go_multiaddr()
@@ -1328,6 +1377,7 @@ def main() -> None:
     extract_rlp()
     extract_enr()
     extract_enr_text()
+    extract_discv5()
     print("done", file=sys.stderr)
 
 

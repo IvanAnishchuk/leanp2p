@@ -235,3 +235,13 @@ commit = "50ed45c251a9894bbae0c2ce8ee2a4916e2b4571"
 branch = "unstable"
 paths = ["/packages/reqresp/src/encodingStrategies/sszSnappy/decode.ts", "/LICENSE"]
 used-for = "the req/resp decisions: the reader that takes the size bounds of the type (W6.3)"
+
+[[vendor]]
+dir = "vendor/devp2p"
+repo = "https://github.com/ethereum/devp2p"
+commit = "2c19a28b25c29487773ad6b07243e290fa8d65ec"
+branch = "master"
+# The repository carries no license file, so the entry vendors the test
+# vector data alone, which the discv5 suite reads, and no spec prose.
+paths = ["/discv5/discv5-wire-test-vectors.md"]
+used-for = "discv5-wire-test-vectors.md: the packet and crypto vectors of discv5-wire.md, extracted to discv5-wire.json (libp2p/discv5)"

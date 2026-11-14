@@ -41,7 +41,8 @@ fork-digest match on `eth2` and a subnet match on `attnets` or
   PONG, the distance filter, the live-only relay, the NODES packet cap,
   and the session cache bound.
 - The policies: the /24 limits, the incoming limit, and the rate
-  limiter.
+  limiter, each with a theorem in `Table.lean` or `Node.lean` and a
+  check in the suite.
 - Real sockets: two nodes over UDP, over IPv6, the TALK handler, and
   the liveness checks, with a record pull on a higher `seq`.
 

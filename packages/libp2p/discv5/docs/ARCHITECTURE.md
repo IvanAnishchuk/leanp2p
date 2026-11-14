@@ -78,7 +78,13 @@ All declarations live in the `Libp2p.Discv5` namespace.
    global IPv4 addresses holds at most 2 places in a bucket and 10 in
    the table, and nodes that contacted us take at most 8 places of a
    bucket. Unsolicited packets pass at 10 per second in all and 9 per
-   second from one IP; loopback is exempt.
+   second from one IP; loopback is exempt. Theorems state each limit:
+   `Table.insertOverSubnet` with `overSubnetBucket` and
+   `overSubnetTable` (a new node past a /24 limit leaves the table
+   unchanged), `insertNoRoom` with `overIncomingFull` (a full bucket, or
+   one at the incoming limit, takes no new node into its entries), and
+   `limitStepTotal`, `limitStepPerIp`, and `limitStepRefused` for the
+   rate limiter's counts.
 7. **The codec round-trips.** `Message.decodeEncode` proves
    `decodeModel? (encodeModel m) = some m` for every well-formed message
    a node builds itself, and `decodeEncodeBytes` carries it to the

@@ -133,6 +133,47 @@ def limitStep (sec : Nat) (ip : List Nat) (st : Nat × Nat × Std.HashMap (List 
   if total ≥ unsolicitedTotal || mine ≥ unsolicitedPerIp then (false, (sec, total, perIp))
   else (true, (sec, total + 1, perIp.insert ip (mine + 1)))
 
+/-- The total of a second never passes `unsolicitedTotal`. -/
+theorem limitStepTotal (sec : Nat) (ip : List Nat) (st : Nat × Nat × Std.HashMap (List Nat) Nat)
+    (h : st.2.1 ≤ unsolicitedTotal) : (limitStep sec ip st).2.2.1 ≤ unsolicitedTotal := by
+  obtain ⟨at_, total, perIp⟩ := st
+  simp only [limitStep]
+  by_cases hs : (at_ == sec) = true
+  · simp only [hs, ite_true]
+    split <;> simp_all <;> omega
+  · simp only [hs]
+    split <;> simp_all [unsolicitedTotal, unsolicitedPerIp]
+
+/-- One IP's count of a second never passes `unsolicitedPerIp`. -/
+theorem limitStepPerIp (sec : Nat) (ip : List Nat) (st : Nat × Nat × Std.HashMap (List Nat) Nat)
+    (h : (st.2.2.get? ip).getD 0 ≤ unsolicitedPerIp) :
+    ((limitStep sec ip st).2.2.2.get? ip).getD 0 ≤ unsolicitedPerIp := by
+  obtain ⟨at_, total, perIp⟩ := st
+  simp only [limitStep]
+  by_cases hs : (at_ == sec) = true
+  · simp only [hs, ite_true]
+    split
+    · exact h
+    · rename_i hc
+      simp only [Bool.or_eq_true, decide_eq_true_eq, not_or] at hc
+      simp only [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_insert_self,
+        Option.getD_some] at hc ⊢
+      omega
+  · simp only [hs]
+    split <;> simp_all [unsolicitedTotal, unsolicitedPerIp]
+
+/-- A refused packet changes no count of its second. -/
+theorem limitStepRefused (sec : Nat) (ip : List Nat) (total : Nat)
+    (perIp : Std.HashMap (List Nat) Nat)
+    (h : (limitStep sec ip (sec, total, perIp)).1 = false) :
+    (limitStep sec ip (sec, total, perIp)).2 = (sec, total, perIp) := by
+  simp only [limitStep, beq_self_eq_true, ite_true] at h ⊢
+  by_cases hc : (decide (total ≥ unsolicitedTotal) ||
+      decide ((perIp.get? ip).getD 0 ≥ unsolicitedPerIp)) = true
+  · simp only [hc, ite_true]
+  · simp only [hc] at h
+    simp at h
+
 /-- A loopback address, exempt from the rate limit so a local network
 works. -/
 private def isLoopback (ip : List Nat) : Bool :=

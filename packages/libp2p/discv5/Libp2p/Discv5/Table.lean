@@ -93,6 +93,23 @@ def bucketOf (t : Table) (id : ByteArray) : Option Nat :=
   | 0 => none
   | d + 1 => some d
 
+/-- Every entry. -/
+def entries (t : Table) : List Entry := t.buckets.toList.flatten
+
+/-- A new node in bucket `i` is past a subnet limit: its /24 of a global
+IPv4 address already holds `subnetBucketLimit` places in the bucket, or
+`subnetTableLimit` in the table. -/
+def overSubnet (t : Table) (i : Nat) (e : Entry) : Bool :=
+  match subnet24? e.record with
+  | some n =>
+    (t.buckets[i]!.filter (fun x => subnet24? x.record == some n)).length ≥ subnetBucketLimit ||
+      (t.entries.filter (fun x => subnet24? x.record == some n)).length ≥ subnetTableLimit
+  | none => false
+
+/-- A new incoming node in bucket `i` is past the incoming limit. -/
+def overIncoming (t : Table) (i : Nat) (e : Entry) : Bool :=
+  e.incoming && (t.buckets[i]!.filter (·.incoming)).length ≥ incomingLimit
+
 /-- Insert or refresh a record. A known node moves to the front with the
 newer record; a new node joins the front of a bucket with room, or else
 the replacement cache. -/
@@ -108,14 +125,8 @@ def insert (t : Table) (e : Entry) : Table :=
       { t with buckets := t.buckets.set! i (e :: b.filter (·.id != e.id)) }
     else
       -- A new node: past a subnet limit it is refused outright.
-      let sameNet (x : Entry) : Bool := subnet24? x.record == subnet24? e.record
-      let overNet := match subnet24? e.record with
-        | some _ => (b.filter sameNet).length ≥ subnetBucketLimit ||
-            ((t.buckets.toList.flatten).filter sameNet).length ≥ subnetTableLimit
-        | none => false
-      let overIncoming := e.incoming && (b.filter (·.incoming)).length ≥ incomingLimit
-      if overNet then t
-      else if b.length < bucketSize && !overIncoming then
+      if t.overSubnet i e then t
+      else if b.length < bucketSize && !t.overIncoming i e then
         { t with buckets := t.buckets.set! i (e :: b) }
       else
         let r := (e :: t.replacements[i]!.filter (·.id != e.id)).take replacementSize
@@ -144,9 +155,6 @@ the caller adds. -/
 def atDistance (t : Table) (d : Nat) : List Enr :=
   if d = 0 || d > 256 then [] else ((t.buckets[d - 1]!).filter (·.live)).map (·.record)
 
-/-- Every entry. -/
-def entries (t : Table) : List Entry := t.buckets.toList.flatten
-
 /-- The `n` known nodes closest to `target` by XOR distance. -/
 def closest (t : Table) (target : ByteArray) (n : Nat) : List Entry :=
   let tn := idNat target
@@ -154,6 +162,60 @@ def closest (t : Table) (target : ByteArray) (n : Nat) : List Entry :=
 
 /-- The number of nodes in the buckets. -/
 def size (t : Table) : Nat := t.entries.length
+
+/-! ## The eclipse limits
+
+Each limit is a property of `insert` for a node the table does not hold
+yet; a known node only refreshes its record. -/
+
+/-- A new node past a subnet limit is refused: the table does not change. -/
+theorem insertOverSubnet (t : Table) (e : Entry) (i : Nat)
+    (hb : t.bucketOf e.id = some i) (hnew : t.buckets[i]!.find? (·.id == e.id) = none)
+    (hover : t.overSubnet i e = true) : t.insert e = t := by
+  simp [insert, hb, hnew, hover]
+
+/-- A /24 that holds `subnetBucketLimit` places in the bucket is past the
+limit. -/
+theorem overSubnetBucket (t : Table) (e : Entry) (i : Nat) (n : List Nat)
+    (hn : subnet24? e.record = some n)
+    (hfull : subnetBucketLimit ≤
+      (t.buckets[i]!.filter (fun x => subnet24? x.record == some n)).length) :
+    t.overSubnet i e = true := by
+  simp [overSubnet, hn, hfull]
+
+/-- A /24 that holds `subnetTableLimit` places in the table is past the
+limit. -/
+theorem overSubnetTable (t : Table) (e : Entry) (i : Nat) (n : List Nat)
+    (hn : subnet24? e.record = some n)
+    (hfull : subnetTableLimit ≤ (t.entries.filter (fun x => subnet24? x.record == some n)).length) :
+    t.overSubnet i e = true := by
+  simp only [overSubnet, hn, Bool.or_eq_true, decide_eq_true_eq]
+  exact Or.inr hfull
+
+/-- A new node in a full bucket, or a new incoming node past the incoming
+limit, never enters the bucket: the buckets do not change, and the node
+can only wait in the replacement cache. So no bucket grows past
+`bucketSize`, and incoming nodes hold at most `incomingLimit` places of a
+bucket they did not fill before. -/
+theorem insertNoRoom (t : Table) (e : Entry) (i : Nat)
+    (hb : t.bucketOf e.id = some i) (hnew : t.buckets[i]!.find? (·.id == e.id) = none)
+    (hfull : bucketSize ≤ t.buckets[i]!.length ∨ t.overIncoming i e = true) :
+    (t.insert e).buckets = t.buckets := by
+  simp only [insert, hb, hnew]
+  by_cases hs : t.overSubnet i e = true
+  · simp [hs]
+  · have hroom : ¬ ((decide (t.buckets[i]!.length < bucketSize) && !t.overIncoming i e) = true) := by
+      rcases hfull with h | h
+      · simp [Nat.not_lt.2 h]
+      · simp [h]
+    simp [hs, hroom]
+
+/-- An incoming node past `incomingLimit` incoming places is past the
+incoming limit. -/
+theorem overIncomingFull (t : Table) (e : Entry) (i : Nat) (hin : e.incoming = true)
+    (hfull : incomingLimit ≤ (t.buckets[i]!.filter (·.incoming)).length) :
+    t.overIncoming i e = true := by
+  simp [overIncoming, hin, hfull]
 
 end Table
 
