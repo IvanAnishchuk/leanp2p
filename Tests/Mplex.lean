@@ -586,6 +586,28 @@ private def runLeftover (r : Runner) : Async Unit := do
   pair.peer.close
   discard <| joinAnswer sess
 
+/-- The reader delivers a message in chunks of at most `inboxChunk`
+bytes, so a stream holds at most `inboxCap × inboxChunk` unread bytes. -/
+private def runChunks (r : Runner) : Async Unit := do
+  let pair ← ends
+  let chunk := Libp2p.Mux.Mplex.Session.inboxChunk
+  let size := 2 * chunk + 100
+  let big : ByteArray := ⟨Array.replicate size 5⟩
+  let sess ← openSession .responder pair.dialer
+    -- The close makes a read past the data answer the end, so a
+    -- missing split fails the check instead of parking.
+    (msg .newStream 0 ++ msg .messageInitiator 0 big ++ msg .closeInitiator 0)
+  let st ← mustAccept sess
+  let c1 ← st.read
+  let c2 ← st.read
+  let c3 ← st.read
+  let sizes := [c1, c2, c3].map fun | .ok (some c) => c.size | _ => 0
+  r.check "the reader splits a message into chunks of inboxChunk bytes"
+    (sizes == [chunk, chunk, 100])
+  sess.close
+  pair.peer.close
+  discard <| joinAnswer sess
+
 /-- The lifecycle of the session (§3.1). -/
 private def runLifecycle (r : Runner) : Async Unit := do
   -- The peer's end ends every stream, and the session joins cleanly.
@@ -671,6 +693,7 @@ private def checks (r : Runner) : Async Unit := do
   runHostile r
   runOutbound r
   runLeftover r
+  runChunks r
   runLifecycle r
   for split in [false, true] do
     runEcho r split

@@ -121,10 +121,14 @@ the writer. A session that ends reads `Streams.Error.closed` on every
 stream whose peer direction was open. `join` answers
 `Core.Error.protocol` with an `mplex:` detail for a protocol error.
 
-Three bounds hold each peer's input: `inboxCap` messages per stream,
+Three bounds hold each peer's input: `inboxCap` chunks per stream,
 `acceptCap` streams waiting for `accept`, and `liveStreamCap` live
-streams. A full inbox blocks the reader until the application reads,
-resets the stream, or closes the session. The spec allows that
+streams. The reader splits each message into chunks of at most
+`inboxChunk` (4096) bytes. One session then holds at most 32 MiB of
+unread data, plus the one message the reader holds. A chunk of a whole
+message would allow 8 GiB. A full inbox blocks the reader until the
+application reads, resets the stream, or closes the session. The spec
+allows that
 answer ("Implementation notes"), and TCP then slows the peer. An
 inbound open over `liveStreamCap` gets a reset.
 
@@ -138,6 +142,9 @@ inbound open over `liveStreamCap` gets a reset.
   seven flags.
 - go-mplex sets no cap on live streams. This session holds
   `liveStreamCap`.
+- go-mplex delivers chunks of 4096 bytes (`BufferSize`) through an
+  inbox of one chunk. This session uses the same chunk size and an
+  inbox of `inboxCap` chunks.
 - go-mplex ends the session on a NewStream for a live stream
   (`ErrInvalidState`). This session does the same.
 

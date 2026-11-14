@@ -60,9 +60,17 @@ open Libp2p.Mux.Mplex.Wire
 open Libp2p.Mux.Mplex.State
 open Conc hiding Error
 
-/-- The chunks one stream inbox holds. A chunk is one message, at most
-`mplexMessageCap` bytes. -/
+/-- The chunks one stream inbox holds. -/
 def inboxCap : Nat := 8
+
+/-- The largest chunk the reader delivers to an inbox: 4096 bytes, the
+`BufferSize` of go-mplex. The reader splits a message into chunks of
+this size. One stream then holds at most `inboxCap × inboxChunk` = 32 KiB
+of unread data, and one session at most `liveStreamCap` times that
+(32 MiB). The reader holds one message more, at most `mplexMessageCap`
+bytes. A chunk of a whole message would allow 1 MiB per slot, and 8 GiB
+per session. -/
+def inboxChunk : Nat := 4096
 
 /-- The inbound streams that wait for `accept`. go-mplex uses 16. -/
 def acceptCap : Nat := 16
@@ -257,9 +265,13 @@ private def dispatch (rt : Runtime) (f : Frame) : Async (Except Core.Error Unit)
     if f.payload.isEmpty then return .ok ()
     let t ← (rt.table.get : BaseIO (Table Port))
     if let some port := t.dataPort? key then
-      -- Park: a read wakes it. A reset or the session close closes the
-      -- inbox, and the send then fails at once.
-      discard <| port.inbox.send f.payload
+      let count := (f.payload.size + inboxChunk - 1) / inboxChunk
+      for i in [0:count] do
+        -- Park: a read wakes it. A reset or the session close closes
+        -- the inbox, and the send then fails at once. The rest of the
+        -- message then has no reader.
+        let chunk := f.payload.extract (i * inboxChunk) ((i + 1) * inboxChunk)
+        if let .error _ ← port.inbox.send chunk then break
     return .ok ()
   | .close key =>
     if let some port ← (rt.table.updateGet (Table.closeRemote key) : BaseIO (Option Port)) then
