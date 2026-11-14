@@ -166,15 +166,17 @@ packages/
     tls/                       TLS 1.3 over a Connection (libssl shim)
     quic/                      QUIC over UDP (ngtcp2 shim, pinned upstream)
   libp2p/
-    identity/                  keys, peer ids
+    identity/                  keys, peer ids, ENR, signed peer records
     core/                      ProtocolId, Core.Error, the libp2p seam types
+    discv5/                    Node Discovery v5 over UDP
     security/                  Noise XX and libp2p TLS as SecurityProtocol values
     mux/                       Muxer values: yamux, mplex
     negotiate/                 multistream-select, upgrader
     quic/                      QUIC as a SecuredTransport value
     host/                      host, peerstore, dedup, deadlines
-    protocols/                 identify, ping
-  cli/                         demo node, ping node, interop harness
+    protocols/                 identify, ping, req/resp, gossipsub
+    eth2/                      the consensus networking and its service
+  cli/                         demo node, ping node, interop harness, eth2-probe
 docs/                          ARCHITECTURE.md, PLAN.md (repo-wide)
 scripts/                       vector extraction and capture (W0.3)
 ```
@@ -284,9 +286,12 @@ In scope for v1 (P0 in ARCHITECTURE.md §8): tcp transport, the QUIC
 transport (`quic-v1`), Noise XX, yamux, mplex, the libp2p TLS handshake
 and its X.509 extension, multistream-select, identity (keys, peer id),
 identify, host and upgrader, req/resp (`ssz_snappy`), gossipsub v1.1,
-and the ENR codec. Deferred to seams only: WebTransport, kad-dht, mDNS,
-relay and circuit, hole punching, WebSockets, WebRTC, pnet, peer
-records.
+the ENR codec, discv5, and the consensus profile (`libp2p/eth2`: the
+fork digest, the topics, the message id, the ENR fields, and the
+req/resp methods). Deferred to seams only: WebTransport, kad-dht, mDNS,
+relay and circuit, hole punching, WebSockets, WebRTC, pnet. The spike
+built peer records, gossipsub v1.2 and v1.3, peer exchange, and
+floodsub, which ARCHITECTURE.md §8 lists as optional.
 
 ## Don'ts
 

@@ -1058,7 +1058,7 @@ interface seams exist, and no implementation work is scheduled.
 | host/upgrade/peerstore, dedup, deadlines | everything above composes through them | done (TTLs/limits deferred) |
 | ENR ↔ multiaddr/peer-id mapping | discovery integration | done (W6.1) |
 | **discv5** (Node Discovery v5.1) | "The discovery domain: discv5" (phase0 `p2p-interface.md`): every consensus client finds its peers through it; it runs beside libp2p over UDP | spike on `experiment/client`: `libp2p/discv5`, conformant to geth's `v5test` and the sigp crate (the package docs) |
-| **the consensus profile** | the fork digest (with Fulu's blob schedule), the topics and the message id, the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the methods Status v2, Goodbye, Ping, MetaData v3, BlocksByRange and ByRoot v2, and DataColumnSidecarsByRange and ByRoot v1 (phase0 to fulu `p2p-interface.md`) | spike on `experiment/client`: `libp2p/eth2`, its digest checked against a Lighthouse record (the package docs) |
+| **the consensus profile** | the fork digest (with Fulu's blob schedule), the topics and the message id, the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the methods Status v2, Goodbye, Ping, MetaData v3, BlocksByRange and ByRoot v2, BlocksByHead v1, and DataColumnSidecarsByRange and ByRoot v1 (phase0 to fulu `p2p-interface.md`) | spike on `experiment/client`: `libp2p/eth2`, its digest checked against a Lighthouse record (the package docs) |
 
 **Optional (the spec allows them; build them when cheap):**
 
