@@ -19,10 +19,17 @@ the waits, and the lookup (devp2p `discv5-theory.md`, "Lookup").
 * A request waits for its responses by request id, under a deadline.
   NODES may come in several packets; `findNode` collects them until
   their `total` or the deadline.
-* `lookup` walks toward a target: it asks the closest unqueried nodes
-  for the log distances around the target, merges what they return,
-  and stops when the `k` closest it knows have all been asked. The spike
-  asks one node at a time; the spec's `α` runs them concurrently.
+* `lookup` walks toward a target: each round asks up to `alpha` (3) of
+  the closest unqueried nodes at once for the log distances around the
+  target, merges what they return, and stops when the `k` closest it
+  knows have all been asked.
+* The revalidation task pings the table entry checked longest ago once
+  every `revalidateMs`, drops a node that does not answer, pulls a
+  newer record on a higher `seq`, and runs a refresh lookup every
+  `refreshEvery` rounds. It also posts the clock the vote expiry reads.
+* Unsolicited packets pass a rate limit (`limitStep`): 10 per second in
+  all and 9 per second from one IP, with loopback exempt.
+* A TALKREQ goes to `onTalk`, and its answer goes back as the TALKRESP.
 * `findPeers` is the consensus client's interface (phase0
   `p2p-interface.md`, "Integration into libp2p stacks"): a lookup toward
   a random target, filtered by the client's predicate over records, such

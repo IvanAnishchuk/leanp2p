@@ -60,8 +60,9 @@ packages/
     tls/                       TLS 1.3 over a Connection (libssl shim)
     quic/                      QUIC over UDP (ngtcp2 shim)
   libp2p/                      the protocol stack
-    identity/                  keys, peer ids
+    identity/                  keys, peer ids, ENR, signed peer records
     core/                      ProtocolId, Core.Error, the libp2p seam types
+    discv5/                    Node Discovery v5 over UDP, the consensus discovery
     security/                  Noise XX and libp2p TLS as SecurityProtocol values
     mux/                       Muxer values: yamux (over net/yamux), mplex
     negotiate/                 multistream-select, upgrader
@@ -83,7 +84,8 @@ them:
   `identity → core → {security, mux} → {negotiate, quic} → host →
   protocols`. Implementations import `core`. `negotiate` and `host`
   import `core` and no implementation (§3.1); `cli/` hands the host the
-  `quic` value.
+  `quic` value. `discv5` imports `identity` only and sits at the rank
+  of `core`: it speaks no libp2p, and the client joins it to the host.
 - No package left of `libp2p` mentions libp2p, so other projects can
   use these packages.
 
@@ -620,12 +622,14 @@ capacity, `Std.Async.Selectable`, and `Std.Async.Selector.sleep`.
 `conc` wraps them so that no other package imports `Std.Sync` or
 `Std.Async`. Two transports are the exceptions: `Std.Async.TCP` in
 `net/streams` (§9, delta 7), and `Std.Async.UDP` in `net/quic` (the
-quic ARCHITECTURE, "Decisions"). Each binding stays inside its
-package: `Streams/Tcp.lean`, and in `net/quic` the modules
-`Quic/Loop.lean` (the receive and the send), `Quic/Endpoint.lean` (the
-socket's creation), and `QuicNative.lean`. The `Std` bind of a UDP
-socket always sets SO_REUSEADDR, which lets two sockets share a port,
-so the QUIC shim binds the socket itself (the quic ARCHITECTURE,
+quic ARCHITECTURE, "Decisions"). The spike on `experiment/client` adds
+a third binding, `Std.Async.UDP` in `net/streams` for discv5's datagram
+socket. Each binding stays inside its package: `Streams/Tcp.lean` and
+`Streams/Udp.lean`, and in `net/quic` the modules `Quic/Loop.lean` (the
+receive and the send) and `Quic/Endpoint.lean` (the socket's creation).
+The `Std` bind of a UDP socket always sets SO_REUSEADDR, which lets two
+sockets share a port, so every UDP socket binds through the streams
+shim instead (`StreamsShim.udpBind`; the quic ARCHITECTURE,
 "Decisions", the exclusive bind). When the toolchain API moves, the
 wrapper and those modules are the ones to change.
 
@@ -1046,7 +1050,8 @@ interface seams exist, and no implementation work is scheduled.
 | **req/resp framework** (`/eth2/beacon_chain/req/.../ssz_snappy`) | Status, BlocksByRange/ByRoot, BlobSidecarsByRange/ByRoot, Metadata, Ping, Goodbye; SSZ with **snappy** framing over libp2p streams | **new work** (snappy is a new dependency, bound FFI first per the §4 dependency strategy; the framing format and its CRC-32C are pure Lean over the block binding; SSZ encoding is pure Lean) |
 | **gossipsub v1.1** | blocks, aggregates, slashings, exits, blob sidecars | **new work** (the largest component) |
 | host/upgrade/peerstore, dedup, deadlines | everything above composes through them | done (TTLs/limits deferred) |
-| ENR ↔ multiaddr/peer-id mapping | discovery integration (discv5 sits outside libp2p and outside this scope) | multiaddr side done; ENR codec new (simple RLP) |
+| ENR ↔ multiaddr/peer-id mapping | discovery integration | done (W6.1) |
+| **discv5** (Node Discovery v5.1) | "The discovery domain: discv5" (phase0 `p2p-interface.md`): every consensus client finds its peers through it; it runs beside libp2p over UDP | spike on `experiment/client`: `libp2p/discv5`, conformant to geth's `v5test` and the sigp crate (the package docs) |
 
 **Optional (the spec allows them; build them when cheap):**
 
@@ -1058,6 +1063,10 @@ interface seams exist, and no implementation work is scheduled.
   spike already built it.
 - Hole punching (DCUtR, AUTONAT) and circuit relay. Some clients
   support them as experiments, and consensus works without them.
+- Gossipsub peer exchange and floodsub. The specs make both optional,
+  and discv5 does the discovery. Teku sends peer exchange, and go and
+  Lodestar speak floodsub, so the spike built both (`libp2p/protocols`
+  docs), each off by default.
 
 **Not needed for consensus (defer, keep the seams only):**
 
@@ -1065,7 +1074,9 @@ interface seams exist, and no implementation work is scheduled.
   secp256k1. RSA comes from the go-libp2p defaults, and the eth2 spec
   does not use it.
 - **Peer records and signed envelopes (RFC 0002, RFC 0003).** Consensus
-  does not use them. The spike work is done.
+  does not require them; identify and gossipsub's peer exchange carry
+  them. The spike on `experiment/client` built them in
+  `libp2p/identity` (`Record.lean`).
 - **kad-dht, peer routing, content routing.** Consensus has no DHT.
 - **rendezvous, fetch, mDNS.** discv5 does the discovery.
 - **WebSockets, WebRTC, pnet (private networks), libp2p-HTTP.**
