@@ -89,7 +89,9 @@ updateGet (root ARCHITECTURE §4.1). Only the first stop caller joins.
   uses separate long-lived inbound and outbound streams (pubsub/README.md,
   lines 78 to 83). Go reads messages in a loop (comm.go, lines 75 to 120).
   Rust keeps one inbound substream (protocols/gossipsub/src/handler.rs,
-  lines 78 to 82). Both peers write many RPCs on one stream. The handler
+  lines 78 to 82). Both peers write many RPCs on one stream. The node
+  keeps one inbound stream per peer too: a new one resets the old one,
+  as go's `handleNewStream` does (`InboundTable`). The handler
   preserves frame order and checks each length before appending body bytes.
   A bad prefix, an over-cap frame or EOF inside a frame is a protocol error.
   A zero-length frame is legal (Rpc.lean, line 867). Go skips it; this handler
@@ -461,13 +463,24 @@ private def readFrames (events : Conc.Chan Input) (cap : Nat)
           header := ByteArray.emptyWithCapacity Varint.maxBytes
   return .ok ()
 
+/-- The live inbound stream of each peer, each with its number, and the
+next number. -/
+abbrev InboundTable := Nat × List (Peer × Nat × Streams.Stream)
+
 /-- Serve every RPC of a peer's stream in arrival order. Frame errors reset
 both directions. A clean EOF closes our write direction. The host owns and
-joins this handler task. -/
+joins this handler task.
+
+With `inbound`, a peer has one inbound stream, as go and rust keep: a
+new stream replaces the old one, and the old one ends with a reset (go
+`comm.go`, lines 77 to 85). Each table change is one `updateGet`, and a
+stream leaves the table only under its own number, so a late end of the
+old handler cannot remove the new stream. -/
 def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
     (id : Libp2p.Core.ProtocolId := Constants.meshsubId)
     (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit := fun _ _ => pure ())
-    (split : ByteArray → BaseIO (Option ByteArray) := fun b => pure (some b)) :
+    (split : ByteArray → BaseIO (Option ByteArray) := fun b => pure (some b))
+    (inbound : Option (Conc.OnceRef InboundTable) := none) :
     Libp2p.Core.StreamHandler where
   id := id
   handle ctx stream := ExceptT.mk do
@@ -484,7 +497,20 @@ def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
       if let .error _ ← events.send (.event (.protocol peer .floodsub)) then
         stream.close
         return .ok ()
-    let answer ← readFrames events cap split peer stream
+    let mine : Option Nat ← match inbound with
+      | none => pure none
+      | some table => do
+        let (n, prev) ← (table.updateGet fun (next, t) =>
+          ((next, (t.lookup peer).map (·.2)),
+           (next + 1, (peer, next, stream) :: t.filter (·.1 != peer))) :
+          BaseIO (Nat × Option Streams.Stream))
+        if let some old := prev then old.reset
+        pure (some n)
+    let leave : BaseIO Unit := match inbound, mine with
+      | some table, some n => table.update fun (next, t) =>
+          (next, t.filter fun (q, i, _) => !(q == peer && i == n))
+      | _, _ => pure ()
+    let answer ← try readFrames events cap split peer stream finally leave
     match answer with
     | .ok () => stream.close
     | .error _ => stream.reset
@@ -1013,12 +1039,16 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           ps.foldl (fun m (id, d) => if m.contains id then m else m.insert id (d, t)) m
         return some small
   -- The node serves every version. The handler's id tells the peer's
-  -- choice.
-  host.setHandler (handler events config.maxRpcSize Constants.meshsubV13Id record split)
-  host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record split)
-  host.setHandler (handler events config.maxRpcSize Constants.meshsubId record split)
+  -- choice. One table across the versions keeps one inbound stream per
+  -- peer, whatever version each stream chose.
+  let inbound ← Conc.OnceRef.new ((0, []) : InboundTable)
+  let serveAs (id : Libp2p.Core.ProtocolId) :=
+    handler events config.maxRpcSize id record split (some inbound)
+  host.setHandler (serveAs Constants.meshsubV13Id)
+  host.setHandler (serveAs Constants.meshsubV12Id)
+  host.setHandler (serveAs Constants.meshsubId)
   if config.floodsub then
-    host.setHandler (handler events config.maxRpcSize Constants.floodsubId record split)
+    host.setHandler (serveAs Constants.floodsubId)
   let tasks ← Conc.TaskSet.new
   let alarm ← Conc.Alarm.new
   let outbound ← Conc.OnceRef.new ([] : List (Peer × Outbound))

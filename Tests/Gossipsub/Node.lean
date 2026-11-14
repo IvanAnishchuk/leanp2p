@@ -379,6 +379,51 @@ private def frameBoundaryChecks (r : Tests.Runner) : Async Unit := do
       ((match result with | .error (.protocol _) => true | _ => false) &&
         (← (reset.get : BaseIO Bool)))
 
+/-- One inbound stream per peer: a second stream of the same peer resets
+the first, as go's `handleNewStream` does, and the second stays in the
+table until its own end. -/
+private def inboundReplaceChecks (r : Tests.Runner) : Async Unit := do
+  let events ← (Chan.new 16 : BaseIO (Chan Input))
+  let table ← (OnceRef.new ((0, []) : InboundTable) : BaseIO (OnceRef InboundTable))
+  let h := handler events (inbound := some table)
+  let mkStream (pipe : Pipe) (reset : OnceRef Bool) : Streams.Stream := {
+    read := return .ok (← pipe.read)
+    write := fun _ => pure (.ok ())
+    close := pure ()
+    reset := do
+      (reset.set true : BaseIO Unit)
+      (pipe.close : BaseIO Unit) }
+  let p1 ← (Pipe.new 4 : BaseIO Pipe)
+  let p2 ← (Pipe.new 4 : BaseIO Pipe)
+  let r1 ← (OnceRef.new false : BaseIO (OnceRef Bool))
+  let r2 ← (OnceRef.new false : BaseIO (OnceRef Bool))
+  let ctx : Libp2p.Core.StreamContext := { remotePeer := pa, remoteAddr := Multiformats.Multiaddr.empty }
+  let owner ← (TaskSet.new : BaseIO TaskSet)
+  owner.spawn do discard <| (h.handle ctx (mkStream p1 r1)).run
+  -- The first stream is in the table once the handler has posted its join.
+  discard <| receive events
+  owner.spawn do discard <| (h.handle ctx (mkStream p2 r2)).run
+  discard <| receive events
+  -- The handler registers its stream after the join post, so the check
+  -- waits for the table, with a bound.
+  let second : BaseIO Bool := do
+    let (_, t) ← table.get
+    return (← r1.get) && t.map (·.2.1) == [1]
+  let mut replaced := false
+  for _ in [0:200] do
+    if ← (second : BaseIO Bool) then
+      replaced := true
+      break
+    select #[← (Park.sleep 10 () : BaseIO (Park Unit))]
+  let tableHolds (n : Nat) : BaseIO Bool := do
+    return (← table.get).2.length == n
+  r.check "node.inbound.a-second-stream-resets-the-first"
+    (replaced && !(← (r2.get : BaseIO Bool)))
+  r.check "node.inbound.the-table-holds-the-second-stream" (← tableHolds 1)
+  (p2.close : BaseIO Unit)
+  owner.joinAll
+  r.check "node.inbound.the-end-of-the-second-empties-the-table" (← tableHolds 0)
+
 /-- A failed outbound write retires only its writer. The existing inbound
 stream can still publish, and a later send opens a new outbound writer. -/
 private def outboundFailureChecks (r : Tests.Runner) : Async Unit := do
@@ -810,6 +855,7 @@ def run (r : Tests.Runner) : IO Unit := do
     systemClockChecks r
     inboundChecks r
     frameBoundaryChecks r
+    inboundReplaceChecks r
     outboundFailureChecks r
     readerCopyChecks r
     pairChecks r
