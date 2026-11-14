@@ -28,9 +28,16 @@ group is §7, row 10). The spike has no req/resp or gossipsub code.
 | `Libp2p/Protocols/ReqResp/Limiter.lean` | `MAX_CONCURRENT_REQUESTS`: the pure table rule with its bound theorem, and the per-peer `Limiter` over `OnceRef` |
 | `Libp2p/Protocols/ReqResp/Exchange.lean` | the shell over the core: the requester `request` and `requestPeer`, the responder `serve`, the handler value the registry stores, and the deadlines |
 | `Libp2p/Protocols/StreamError.lean` | `mapStreamError`, the one map from a stream error into `Core.Error` that the req/resp handler uses |
-| `Libp2p/Protocols/Gossipsub/Rpc.lean` | the RPC message with its `ProtoMessage` instance (§3.2) |
-| `Libp2p/Protocols/Gossipsub/Core.lean` | `State`, `Event`, `Action`, `ProtocolError`, and the total `step` that holds mesh, scoring, and heartbeat (§3.3) |
-| `Libp2p/Protocols/Gossipsub/Node.lean` | the loop task over the core, and the publish and subscribe surface at the seam level |
+| `Libp2p/Protocols/Gossipsub/Types.lean` | the shared value types: `TopicId`, `MessageId`, `Message`, the thresholds, and `Peer` |
+| `Libp2p/Protocols/Gossipsub/Rpc.lean` | the RPC message of v1.1 to v1.3 with its `ProtoMessage` instances and table theorems (§3.2), and the length-delimited frame step |
+| `Libp2p/Protocols/Gossipsub/Score.lean` | the peer score of `gossipsub-v1.1.md`: the parameters, the counters, decay, and the score function |
+| `Libp2p/Protocols/Gossipsub/Cache.lean` | the message cache, the seen cache, the backoff table, and the IWANT promises |
+| `Libp2p/Protocols/Gossipsub/Sign.lean` | the signing policies and the message id functions |
+| `Libp2p/Protocols/Gossipsub/Core.lean` | `State`, `Event`, `Action`, `ProtocolError`, and the total `step` that holds mesh, scoring, heartbeat, peer exchange, and the floodsub forward set (§3.3) |
+| `Libp2p/Protocols/Gossipsub/Payload.lean` | the `ByteArray` payload path: a payload stays a `ByteArray`, and the core sees its id |
+| `Libp2p/Protocols/Gossipsub/HostSeam.lean` | the host operations the node calls, and their adapter over a `Host` |
+| `Libp2p/Protocols/Gossipsub/Node.lean` | the loop task over the core, the writer and connector tasks, and the publish and subscribe surface at the seam level |
+| `Libp2p/Protocols/Gossipsub/Interop*.lean` | the gossipsub-interop participant: its script parser, schedule, and record writer (`cli/` runs it) |
 
 All declarations live in the `Libp2p.Protocols` namespace tree, and the
 root module re-exports the public submodules. The Gossipsub module lines
@@ -40,7 +47,9 @@ the unit fixes the split.
 The spike's `Crypto/Messages.lean` maps here (§10, row 17). The identify
 table lands in `Identify.lean`. The `NoiseHandshakePayload` table went
 to `libp2p/security` beside the handshake it serves. The `Envelope` and
-`PeerRecord` tables stay deferred (§8; §10, row 17). One protocol per
+`PeerRecord` tables went to `libp2p/identity` (`Record.lean`), next to
+the keys that sign them; identify carries the record, and gossipsub's
+peer exchange hands it on. One protocol per
 module line keeps the responsibility split of PRINCIPLES 1.2; this
 package holds four protocols, and no module holds two. §4.9 names
 identify, ping, req/resp, and gossipsub, and the module list follows
@@ -94,9 +103,14 @@ back.
   (`vendor/go-libp2p/p2p/protocol/identify/id.go`, the `loop` and
   `sendPushes` functions). This package sends one record per
   call and starts no timer. A received push updates the peerstore
-  through the host (`Host.addAddrs`). The push stores the addresses. The
-  peerstore surface of the host doc holds addresses only, so a push's
-  protocols list has no store yet. Go's push handler stores both. A
+  through the host (`Identify.store`): the listen addresses, and the
+  signed peer record when it verifies and names the pushing peer
+  (`Host.consumeRecord`). `Identify.request` runs the client on a new
+  stream to a connected peer and stores the answer the same way, as
+  go-libp2p's identify service does for each new connection. The
+  responder takes our own signed record (`Host.signRecord`) and writes
+  it in field 8. The peerstore holds no protocols list yet, so a push's
+  protocols have no store. Go's push handler stores both. A
   push frame must carry the public key. The spec says to ignore missing
   fields; this handler rejects the push: `push` runs `validate`, so a
   push with no `publicKey` field fails with `.missingKey`. A stream
@@ -127,7 +141,13 @@ back.
 - **Gossipsub.** `publish` hands a topic and payload bytes to the node,
   and `subscribe` registers a delivery callback. Both sit at the seam
   over the loop; the mesh decisions live in the core, and no caller
-  sees them.
+  sees them. The node speaks `/meshsub/1.3.0`, `1.2.0`, and `1.1.0`,
+  and `/floodsub/1.0.0` when `Config.floodsub` is on. Peer exchange
+  (`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange") is
+  `Params.doPX` on the send side, off by default as in go and rust, and
+  always on the accept side past `acceptPXThreshold`; the dials run on
+  `Config.connectors` tasks behind a queue of
+  `Config.maxPendingConnections`.
 
 The client sides live in this package because §2 bans protocol logic in
 `cli/`. `Identify.client` replaces the spike's `Identify.request`
@@ -282,6 +302,30 @@ Both spike programs call `Ping.ping`.
   forbids the request and a wait would park on another request's
   deadline. The slot goes back on every path. The responder's side of
   the rule, "MAY penalise", is scoring, and stays with the client.
+- **Peer exchange accepts strictly above `acceptPXThreshold`.** The
+  spec accepts PX "if the originating peer's score exceeds this
+  threshold". go-libp2p-pubsub and rust-libp2p ignore PX only below
+  it, so they accept at the threshold. The spec wins (PRINCIPLES 2.1):
+  with the default threshold 0, a peer at score 0 gets its PX ignored,
+  and a node that wants PX from a bootstrapper lifts its score, as the
+  spec's bootstrapper setup does through the application score. The
+  pubsub interop runs that setup.
+- **The core names PX peers; the shell adds their records.** The core
+  stays free of signatures: `pxPeers` names the peers by id, and the
+  node's send path adds the record the host holds, as go's `makePrune`
+  reads its certified address book. On the way in, the node checks each
+  record through the host before it dials. go shuffles the candidates
+  in both directions; the core takes them in state order, so a
+  transcript replays.
+- **Floodsub peers are a forward set, not a router.** The node serves
+  floodsub streams with the same reader and the same RPC message, and
+  the core marks such a peer (`Event.protocol`). The core keeps it out
+  of every mesh, fanout, gossip, and peer exchange, and sends it every
+  message of its topics at or above the publish threshold, as
+  go-libp2p-pubsub's gossipsub router treats a peer without the mesh
+  feature. The consensus spec does not use floodsub; go and Lodestar
+  speak it by default, rust-libp2p and Lighthouse do not, and the node
+  leaves it off by default.
 - **The suite runs between two hosts over the sim.** `Tests/HostPair.lean`
   builds two real hosts on the test values of root §3.1: the sim
   transport, the fixed-key Noise value, and a test clock, with yamux. The

@@ -11,6 +11,7 @@ import Tests.Gossipsub.BigMessage
 import Tests.Gossipsub.HostNode
 import Tests.Gossipsub.Payload
 import Tests.Gossipsub.Partial
+import Tests.Gossipsub.Px
 import Tests.Leak
 import Tests.Vectors
 import Tests.Concurrency
@@ -33,6 +34,7 @@ import Tests.Facade
 import Tests.CryptoCross
 import Tests.Yamux
 import Tests.Identity
+import Tests.Record
 import Tests.Core
 import Tests.Noise
 import Tests.Tls
@@ -107,6 +109,8 @@ def main : IO UInt32 := do
   -- One discv5 query against an outside node; the exit code is its answer.
   | some "discv5client" => return ← Tests.Discv5.client
   | some "streams" => Tests.Streams.run r; return ← r.summary
+  | some "record" => Tests.Record.run r; return ← r.summary
+  | some "px" => Tests.Gossipsub.Px.run r; return ← r.summary
   | _ => pure ()
   if (← IO.getEnv "LEANP2P_SUITE") == some "mux" then
     Tests.Mux.run r
@@ -128,6 +132,7 @@ def main : IO UInt32 := do
   Tests.Gossipsub.Rpc.run r
   Tests.Gossipsub.Payload.run r
   Tests.Gossipsub.Partial.run r
+  Tests.Gossipsub.Px.run r
   Tests.Gossipsub.Node.run r
   Tests.Gossipsub.HostNode.run r
   Tests.Gossipsub.HostNode.runPartial r
@@ -153,6 +158,7 @@ def main : IO UInt32 := do
   Tests.CryptoCross.run r
   Tests.Yamux.run r
   Tests.Identity.run r
+  Tests.Record.run r
   Tests.Core.run r
   Tests.Noise.run r
   Tests.TlsSuite.run r

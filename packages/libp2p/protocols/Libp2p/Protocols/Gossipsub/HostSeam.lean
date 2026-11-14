@@ -26,6 +26,18 @@ them at start, and before each heartbeat it reconciles the router with
   /-- Dial a peer through the host's peerstore, for the explicit peers
   the router must keep connected. `true` once a session is live. -/
   dial : Libp2p.Identity.PeerId → Conc.Async Bool := fun _ => pure false
+  /-- The signed peer record the host holds for a peer, as it arrived
+  (`Host.recordOf`; identify fills the store). A prune's peer exchange
+  carries it. -/
+  recordOf : Libp2p.Identity.PeerId → BaseIO (Option ByteArray) := fun _ => pure none
+  /-- Consume a signed peer record a peer exchange offered for `peer`:
+  `true` when it verifies and names `peer` (`Host.consumeRecord`). Its
+  addresses enter the peerstore with a short lifetime. -/
+  consumeRecord : Libp2p.Identity.PeerId → ByteArray → BaseIO Bool := fun _ _ => pure false
+
+/-- The lifetime of the addresses a peer exchange brings: go-libp2p's
+`peerstore.TempAddrTTL`, two minutes. -/
+def pxAddrTtlMs : Nat := 120000
 
 /-- Adapt a host to the node operations. -/
 def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
@@ -38,5 +50,10 @@ def HostSeam.ofHost (host : Libp2p.Host.Host) : HostSeam where
   addNotifiee := host.addNotifiee
   peers := some host.peers
   dial := fun peer => do return (← host.dialPeer peer) matches .ok _
+  recordOf := host.recordOf
+  consumeRecord := fun peer bytes => do
+    -- An older record than the stored one still verified: the peer is
+    -- real, and the stored addresses serve the dial.
+    return (← host.consumeRecord bytes (some peer) (some pxAddrTtlMs)) matches .ok _
 
 end Libp2p.Protocols.Gossipsub

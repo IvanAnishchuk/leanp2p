@@ -31,12 +31,16 @@ at or above the gossip threshold that are in neither the mesh nor the
 fanout of the topic. Their count is adaptive: at least `dLazy`, and
 `gossipFactor` percent of the candidates when that is more.
 
+Floodsub peers (`PubsubProto.floodsub`) are a separate forward set
+(`floodTargets`): they join no mesh, take no gossip, and get every
+message of their topics, as go-libp2p-pubsub's `rpcs` treats a peer
+without the mesh feature. Peer exchange runs both ways: a prune of an
+oversubscribed mesh, of a full mesh's GRAFT, and of an unsubscribe names
+other peers when `doPX` is on (`pxPeers`), and a received prune's peers
+become `Action.pxConnect` past `acceptPXThreshold` (`pxAccept`).
+
 Gaps that remain:
 
-- `PubsubProto` is stored and no path reads it, so floodsub peers are
-  not a separate forward set.
-- `ControlPrune.peers` decodes and `handlePrune` ignores it, so peer
-  exchange is absent. `acceptPXThreshold` is never read.
 - `validationOk` uses `strictNoSign`, with no per-topic policy.
   `defaults.msgId` is the payload, because that policy leaves `from`
   and `seqno` absent and the spec's default id would be empty for every
@@ -203,6 +207,14 @@ structure Params where
   `partial-messages.md`). A topic not listed takes full messages only.
   Any entry that can send makes the node announce the extension. -/
   partialTopics : List (TopicId × PartialOpts) := []
+  /-- Peer exchange on prune (`gossipsub-v1.1.md`, "Peer Exchange"): a
+  prune we send names up to `prunePeers` other peers of the topic. go and
+  rust turn it off by default, and so does this router. Teku turns it
+  on. The acceptance side always runs, gated by `acceptPXThreshold`. -/
+  doPX : Bool := false
+  /-- The most peers one prune names, and the most peers we take from one
+  received prune. go's `PrunePeers` and rust's `prune_peers` are 16. -/
+  prunePeers : Nat := 16
 
 /-- The parameter bound the mesh theorems consume: the target degree is
 at most the high water mark. -/
@@ -307,6 +319,11 @@ inductive Event where
   valid data counts as a first delivery, bad data as an invalid one
   (Fulu `partial-columns/p2p-interface.md`, the scoring hooks). -/
   | partialJudged (peer : Peer) (topic : TopicId) (valid : Bool)
+  /-- The pubsub protocol a known peer negotiated. The host announces a
+  connection before any stream negotiates, so a join records `meshsub`,
+  and this event corrects it. A peer that turns out to speak floodsub
+  leaves every mesh and fanout. -/
+  | protocol (peer : Peer) (proto : PubsubProto)
   deriving Repr
 
 /-- The outgoing actions. -/
@@ -321,6 +338,12 @@ inductive Action where
   /-- Hand a partial message from a peer to the application, mesh peer
   or not (`partial-messages.md`, "Application-Library Interface"). -/
   | partialIn (source : Peer) (msg : Rpc.PartialMessage)
+  /-- Connect to the peers a prune from `source` offered
+  (`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"). The node
+  verifies each signed peer record, stores its addresses, and dials
+  under its own bound on pending dials, as go-libp2p-pubsub's
+  `pxConnect` and `connector` do. -/
+  | pxConnect (source : Peer) (peers : List Rpc.PeerInfo)
   deriving DecidableEq, BEq, Repr
 
 /-- The one error constructor: an RPC that does not decode. -/
@@ -414,6 +437,12 @@ def scoreOf (p : Params) (s : State) (q : Peer) : Score :=
   | some pd => Score.score p.score pd.score s.now
   | none => 0
 
+/-- The peer speaks floodsub (`/floodsub/1.0.0`). Such a peer joins no
+mesh and gets no gossip; it gets every message of its topics, as
+go-libp2p-pubsub's `rpcs` sends to peers without the mesh feature. -/
+def isFlood (s : State) (q : Peer) : Bool :=
+  ((peerOf s q).map (fun pd => pd.proto == .floodsub)).getD false
+
 /-- The next heartbeat is due: the interval has passed since the last one. -/
 def heartbeatDue (p : Params) (s : State) (now : Millis) : Prop :=
   s.lastHeartbeat + p.heartbeatInterval ≤ now
@@ -448,6 +477,7 @@ def delivers : List Action → List Message
   | .sendRpc _ _ :: as => delivers as
   | .validate _ _ _ :: as => delivers as
   | .partialIn _ _ :: as => delivers as
+  | .pxConnect _ _ :: as => delivers as
 
 /-! ## Outgoing RPC constructors -/
 
@@ -513,11 +543,12 @@ def helloRpc (topics : List TopicId) (p : Option Params := none) : Rpc.RPC :=
 def graftRpc (t : TopicId) : Rpc.RPC :=
   controlRpc { ihave := [], iwant := [], graft := [{ topicId := t.name }], prune := [] }
 
-/-- A prune of the topic with the backoff period in seconds. -/
-def pruneRpc (t : TopicId) (backoff : Millis) : Rpc.RPC :=
+/-- A prune of the topic with the backoff period in seconds, and the
+peers of the peer exchange (`pxPeers`). -/
+def pruneRpc (t : TopicId) (backoff : Millis) (px : List Rpc.PeerInfo := []) : Rpc.RPC :=
   controlRpc
     { ihave := [], iwant := [], graft := [],
-      prune := [{ topicId := t.name, peers := [], backoff := some (backoff / 1000) }] }
+      prune := [{ topicId := t.name, peers := px, backoff := some (backoff / 1000) }] }
 
 /-- An IHAVE of the topic with the message ids. -/
 def ihaveRpc (t : TopicId) (ids : List MessageId) : Rpc.RPC :=
@@ -545,11 +576,21 @@ the sender. -/
 def inboundTargets (s : State) (sender : Peer) (topic : TopicId) : List Peer :=
   (meshOf s topic ++ explicitTargets s topic).filter (fun q => decide (q ≠ sender))
 
-/-- One publish RPC per accepted message, to each mesh peer other than
-the sender. The targets are read from the pre-state mesh. -/
-def forwardPubs (s : State) (sender : Peer) (ms : List Message) : List Action :=
+/-- The floodsub peers that announced the topic, at or above the publish
+threshold: go-libp2p-pubsub's `rpcs` sends every message to them, from
+us or forwarded ("floodsub peers", `gossipsub.go`). -/
+def floodTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
+  (s.peers.filter fun e => e.2.proto == .floodsub && memB topic e.2.subs &&
+    decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1)).map Prod.fst
+
+/-- One publish RPC per accepted message, to each mesh peer, explicit
+peer, and floodsub peer other than the sender. The targets are read from
+the pre-state. -/
+def forwardPubs (p : Params) (s : State) (sender : Peer) (ms : List Message) : List Action :=
   ms.flatMap fun m =>
-    (inboundTargets s sender m.topic).map fun q => Action.sendRpc q (publishRpc m)
+    let mesh := inboundTargets s sender m.topic
+    let flood := (floodTargets p s m.topic).filter (fun q => decide (q ≠ sender) && !memB q mesh)
+    (mesh ++ flood).map fun q => Action.sendRpc q (publishRpc m)
 
 /-! ## The decode boundary -/
 
@@ -626,6 +667,22 @@ structure TopicPlan where
 def announced (s : State) (topic : TopicId) : List Peer :=
   (s.peers.filter (fun e => memB topic e.2.subs)).map Prod.fst
 
+/-- The peer exchange of a prune to `target` on `topic`
+(`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"): up to
+`prunePeers` other gossipsub peers of the topic, each at or above score
+0, when `doPX` is on. A target below score 0 gets none: "no PX
+information is emitted towards those peers". Each entry carries the
+peer id only; the node adds the signed peer record the host holds, as
+go-libp2p-pubsub's `makePrune` reads it from the certified address
+book. go shuffles the candidates; this core takes them in state order,
+so a transcript replays. -/
+def pxPeers (p : Params) (s : State) (target : Peer) (topic : TopicId) : List Rpc.PeerInfo :=
+  if p.doPX && decide (0 ≤ scoreOf p s target) then
+    ((announced s topic).filter (fun q =>
+        decide (q ≠ target) && decide (0 ≤ scoreOf p s q) && !isFlood s q)).take p.prunePeers
+      |>.map fun q => { peerId := some (Bytes.toNatList q.toBytes), signedPeerRecord := none }
+  else []
+
 /-- The peers a heartbeat grafts: `need` candidates, then, when the mesh
 is still `outNeed` short of outbound peers, outbound candidates only up
 to that quota ("the router selects outbound peers from the candidates
@@ -676,7 +733,7 @@ def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
   let need := if kept0.length < p.mesh.dLow then p.mesh.d - kept0.length else 0
   let cands := order.filter (fun q =>
     !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
-      (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit)
+      (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit && !isFlood s q)
   let added := pickAdded cands isOut need (p.dOut - (kept0.filter isOut).length)
   { topic := topic, kept := (kept0 ++ added).take p.mesh.dHigh, pruned := over, added := added }
 
@@ -694,10 +751,11 @@ def applyPlanScores (p : Params) (s : State) (plans : List TopicPlan) : State :=
         else if memB q pl.added then Score.graft sc s.now pl.topic
         else sc) pd.score })
 
-/-- The actions of the plans: a prune to each pruned peer, then a graft
-to each added peer. -/
-def planActions (p : Params) (pl : TopicPlan) : List Action :=
-  pl.pruned.map (fun q => Action.sendRpc q (pruneRpc pl.topic p.pruneBackoff)) ++
+/-- The actions of the plans: a prune to each pruned peer, with the peer
+exchange of an oversubscribed mesh (`pxPeers` over `s`), then a graft to
+each added peer. -/
+def planActions (p : Params) (s : State) (pl : TopicPlan) : List Action :=
+  pl.pruned.map (fun q => Action.sendRpc q (pruneRpc pl.topic p.pruneBackoff (pxPeers p s q pl.topic))) ++
     pl.added.map (fun q => Action.sendRpc q (graftRpc pl.topic))
 
 /-- Write the planned meshes and drop the peers below score 0 from every
@@ -731,7 +789,8 @@ def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
       -- A peer that takes partial messages gets no IHAVE on the topic
       -- (`partial-messages.md`, "Partial Message Gossip").
       let cands := eligible.filter (fun q =>
-          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !wantsPartial p s q t)
+          !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !wantsPartial p s q t &&
+            !isFlood s q)
       let targets := cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
       targets.map fun q => Action.sendRpc q (ihaveRpc t ids)
 
@@ -763,7 +822,7 @@ def heartbeatNext (p : Params) (s : State) (now : Millis) (order : List Peer) : 
 /-- The plan actions of the heartbeat. -/
 def planActionsOf (p : Params) (s : State) (now : Millis) (order : List Peer) :
     List Action :=
-  (heartbeatPlans p s now order).flatMap (planActions p)
+  (heartbeatPlans p s now order).flatMap (planActions p (freshState p s now))
 
 /-- The negative prune actions of the heartbeat. -/
 def negativeActions (p : Params) (s : State) (now : Millis) (order : List Peer) :
@@ -892,7 +951,7 @@ def handlePubs (p : Params) (s : State) (sender : Peer) (ms : List Message) :
       let sc' := Score.firstDelivery p.score sc m.topic
       if memB sender (meshOf s m.topic) then Score.meshDelivery p.score sc' m.topic else sc')) s2
   (recordDeliveries p true sender s3 valid, r.accepted.map (fun m => Action.deliver m) ++
-    dropForPartial p s (forwardPubs s sender r.accepted))
+    dropForPartial p s (forwardPubs p s sender r.accepted))
 
 /-- An IDONTWANT of the ids. -/
 def idontwantRpc (ids : List MessageId) : Rpc.RPC :=
@@ -985,7 +1044,7 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
         else st) s3
       -- The forward skips the IDONTWANT peers; the seen cache stops a
       -- second forward, so the pairs of this id go.
-      (forgetDontWant s4 id, dropDontWant p s (dropForPartial p s (forwardPubs s src [m])))
+      (forgetDontWant s4 id, dropDontWant p s (dropForPartial p s (forwardPubs p s src [m])))
     | .reject =>
       -- Every sender of an invalid message takes P₄, as go's
       -- `markInvalidMessageDelivery` does for each peer of the record.
@@ -1019,7 +1078,7 @@ def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List 
     if decide (p.thresholds.opportunisticGraftThreshold ≤ median) then (st, acts) else
     let cands := ((announced st t).filter fun q =>
       !memB q ps && !(Cache.Backoff.active st.backoff q t now) && !memB q st.explicit &&
-        decide (median < scoreOf p st q)).take p.opportunisticGraftPeers
+        !isFlood st q && decide (median < scoreOf p st q)).take p.opportunisticGraftPeers
     let st := cands.foldl (fun st q =>
       updateScoreOf (setTopicMesh st t (q :: meshOf st t)) q (fun sc => Score.graft sc now t)) st
     (st, acts ++ cands.map (fun q => Action.sendRpc q (graftRpc t)))) (s, [])
@@ -1109,7 +1168,9 @@ def handleGraft (p : Params) (s : State) (sender : Peer) (g : Rpc.ControlGraft) 
     else if Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = true then
       (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)])
     else if p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length then
-      (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)])
+      -- The mesh is oversubscribed, the case PX exists for.
+      (s, [Action.sendRpc sender
+        (pruneRpc ⟨g.topicId⟩ p.pruneBackoff (pxPeers p s sender ⟨g.topicId⟩))])
     -- "It is an error to GRAFT on an explicit peer, and such an attempt
     -- should be logged and rejected with a PRUNE."
     else if memB sender s.explicit then
@@ -1186,11 +1247,37 @@ def controlActions (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMess
     (mapHandlers (fun st b => handlePrune p st sender b) c.prune
       (controlGrafts p s sender c)).2
 
-/-- Handle the control envelope: ihave, iwant, graft, then prune. -/
+/-- The peer exchange a prune offers, as the connect actions. A prune
+counts when we joined its topic, as go and rust skip a prune of an
+unknown topic. The sender's score must exceed `acceptPXThreshold`, the
+spec's word ("only accept it ... if the originating peer's score exceeds
+this threshold"); go and rust accept at the threshold too, so a peer
+scoring exactly the threshold differs. From each prune the action keeps
+up to `prunePeers` entries whose peer id decodes and names a peer we do
+not know; go truncates after a shuffle, this core in wire order. The
+score is read from the state before the prunes, as go's
+`handlePrune` reads it. -/
+def pxAccept (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) : List Action :=
+  if decide (p.thresholds.acceptPXThreshold < scoreOf p s sender) then
+    c.prune.filterMap fun q =>
+      let fresh := (q.peers.filter fun info =>
+        match info.peerId with
+        | some b =>
+          match Libp2p.Identity.PeerId.ofBytes? (Bytes.ofNatList b) with
+          | .ok pid => (peerOf s pid).isNone
+          | .error _ => false
+        | none => false).take p.prunePeers
+      if memB (⟨q.topicId⟩ : TopicId) s.topics && !fresh.isEmpty then
+        some (Action.pxConnect sender fresh)
+      else none
+  else []
+
+/-- Handle the control envelope: ihave, iwant, graft, then prune, and
+the peer exchange of the prunes (`pxAccept`). -/
 def handleControl (p : Params) (s : State) (sender : Peer) :
     Option Rpc.ControlMessage → State × List Action
   | none => (s, [])
-  | some c => (controlPrunes p s sender c, controlActions p s sender c)
+  | some c => (controlPrunes p s sender c, controlActions p s sender c ++ pxAccept p s sender c)
 
 /-- Note the sender's Extensions message. It belongs in the first RPC,
 once; a later one costs a P₇ penalty (`gossipsub-v1.3.md`, "Peer Scoring
@@ -1264,10 +1351,10 @@ def rpcStep (p : Params) (s : State) (sender : Peer) (bytes : List Nat) :
         | .error e => .error e
         | .ok rpc => .ok (handleRpc p s sender rpc)
 
-/-- The fanout candidates: peers that announce the topic, at or above
-score 0. -/
+/-- The fanout candidates: gossipsub peers that announce the topic, at or
+above score 0. -/
 def fanoutCandidates (p : Params) (s : State) (topic : TopicId) : List Peer :=
-  (announced s topic).filter (fun q => decide (0 ≤ scoreOf p s q))
+  (announced s topic).filter (fun q => decide (0 ≤ scoreOf p s q) && !isFlood s q)
 
 /-- Extend the fanout of the topic to `d`, and set its last publish
 time. -/
@@ -1282,13 +1369,16 @@ def extendFanout (p : Params) (s : State) (topic : TopicId) : State :=
         { peers := (fanoutCandidates p s topic).take p.mesh.d, lastPublished := s.now }
 
 /-- The forward targets of a publish: the mesh when we subscribe to the
-topic, the fanout otherwise. -/
+topic, the fanout otherwise, and the floodsub peers of the topic
+(`floodTargets`). -/
 def publishTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
   if p.floodPublish then
     -- Every peer that announced the topic, at or above the publish threshold.
     (s.peers.filter (fun e => memB topic e.2.subs &&
       decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1))).map Prod.fst
-  else if memB topic s.topics then meshOf s topic else fanoutOf s topic
+  else
+    let gossip := if memB topic s.topics then meshOf s topic else fanoutOf s topic
+    gossip ++ (floodTargets p s topic).filter (fun q => !memB q gossip)
 
 /-- The application publishes a message: validate, cache, record the id
 as seen, extend the fanout when we do not subscribe, and forward to the
@@ -1316,7 +1406,7 @@ def subscribe (p : Params) (s : State) (topic : TopicId) : State × List Action 
   let need := if ps1.length < p.mesh.d then p.mesh.d - ps1.length else 0
   let cands := (announced s1 topic).filter (fun q =>
     !memB q ps1 && decide (0 ≤ scoreOf p s1 q) &&
-      !(Cache.Backoff.active s1.backoff q topic s1.now))
+      !(Cache.Backoff.active s1.backoff q topic s1.now) && !isFlood s1 q)
   let added := cands.take need
   let s2 := setTopicMesh s1 topic ((ps1 ++ added).take p.mesh.dHigh)
   let s3 : State :=
@@ -1335,7 +1425,22 @@ def unsubscribe (p : Params) (s : State) (topic : TopicId) : State × List Actio
     (fun st q =>
       { st with backoff := Cache.Backoff.add st.backoff q topic p.unsubscribeBackoff s.now })
     s3
-  (s4, ps.map (fun q => Action.sendRpc q (pruneRpc topic p.unsubscribeBackoff)))
+  (s4, ps.map (fun q => Action.sendRpc q (pruneRpc topic p.unsubscribeBackoff (pxPeers p s q topic))))
+
+/-- Record the protocol a known peer negotiated. A floodsub peer leaves
+every mesh and fanout, as it can take part in neither. An unknown peer
+changes nothing. -/
+def setProtocol (s : State) (peer : Peer) (proto : PubsubProto) : State :=
+  match peerOf s peer with
+  | none => s
+  | some pd =>
+    let s1 := setPeer s peer { pd with proto }
+    if proto == .floodsub then
+      { s1 with
+        mesh := s1.mesh.map (fun e => (e.1, e.2.filter (fun q => decide (q ≠ peer)))),
+        fanout := s1.fanout.map (fun e =>
+          (e.1, { e.2 with peers := e.2.peers.filter (fun q => decide (q ≠ peer)) })) }
+    else s1
 
 /-! ## The transition and the driver -/
 
@@ -1361,6 +1466,7 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
   | .partialJudged peer topic valid =>
     .ok (updateScoreOf s peer (fun sc =>
       if valid then Score.firstDelivery p.score sc topic else Score.invalidDelivery p.score sc topic), [])
+  | .protocol peer proto => .ok (setProtocol s peer proto, [])
 
 /-- The transcript driver: the events in order. The first error stops
 the run. -/
@@ -1644,7 +1750,8 @@ private theorem handleGraft_overfull (p : Params) (s : State) (sender : Peer)
     (hb : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = false)
     (hd : p.mesh.dHigh ≤ (meshOf s ⟨g.topicId⟩).length) :
     handleGraft p s sender g =
-      (s, [Action.sendRpc sender (pruneRpc ⟨g.topicId⟩ p.pruneBackoff)]) := by
+      (s, [Action.sendRpc sender
+        (pruneRpc ⟨g.topicId⟩ p.pruneBackoff (pxPeers p s sender ⟨g.topicId⟩))]) := by
   simp [handleGraft, hsub, hm, hb, hd]
 
 private theorem handleGraft_explicit (p : Params) (s : State) (sender : Peer)
@@ -1755,7 +1862,7 @@ private theorem handleGraft_prune (p : Params) (s : State) (sender : Peer)
     · have hb' : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now = false := by
         cases h' : Cache.Backoff.active s.backoff sender ⟨g.topicId⟩ s.now <;> simp_all
       rw [handleGraft_overfull p s sender g hsub0 hnot hb' hover]
-      exact ⟨pruneRpc ⟨g.topicId⟩ p.pruneBackoff, by simp,
+      exact ⟨pruneRpc ⟨g.topicId⟩ p.pruneBackoff (pxPeers p s sender ⟨g.topicId⟩), by simp,
         by simp [pruneRpc, controlRpc, rpcPrunes]⟩
 
 /-! ## The prune and control handler lemmas -/
@@ -2189,8 +2296,8 @@ theorem meshOf_heartbeatNext (p : Params) (s : State) (now : Millis)
 
 /-! ## The score gate theorems -/
 
-private theorem rpcHasIhave_pruneRpc (t : TopicId) (b : Millis) :
-    ¬ rpcHasIhave (pruneRpc t b) := by
+private theorem rpcHasIhave_pruneRpc (t : TopicId) (b : Millis) (px : List Rpc.PeerInfo) :
+    ¬ rpcHasIhave (pruneRpc t b px) := by
   simp [rpcHasIhave, pruneRpc, controlRpc]
 
 private theorem rpcHasIhave_graftRpc (t : TopicId) : ¬ rpcHasIhave (graftRpc t) := by
@@ -2273,13 +2380,13 @@ theorem tickGossipGated (p : Params) (s s' : State) (acts : List Action)
       simp only [planActions, List.mem_append, List.mem_map] at hpl
       rcases hpl with ⟨q, _, hq⟩ | ⟨q, _, hq⟩
       · cases hq
-        exact absurd hih (rpcHasIhave_pruneRpc _ _)
+        exact absurd hih (rpcHasIhave_pruneRpc _ _ _)
       · cases hq
         exact absurd hih (rpcHasIhave_graftRpc _)
     · simp only [negativeActions, List.mem_flatMap, List.mem_map] at hmem
       obtain ⟨pl, _, q, _, hq⟩ := hmem
       cases hq
-      exact absurd hih (rpcHasIhave_pruneRpc _ _)
+      exact absurd hih (rpcHasIhave_pruneRpc _ _ _)
   · rw [← scoreOf_gossipState]
     exact mem_gossipActions p (gossipState p s now order) order to rpc hmem
 
@@ -2305,23 +2412,28 @@ theorem accept_gate (c0 : Cache.SeenIndex) (now : Millis) (idf : Sign.MsgIdFn)
         | true => exact absurd (by rw [hc]; rfl) hskip
       · exact ih (idf m :: done) (c.add (idf m) now) m' hm'
 
-private theorem forwardPubs_not_deliver (s : State) (sender : Peer) (ms : List Message)
-    (m : Message) : Action.deliver m ∉ forwardPubs s sender ms := by
+private theorem forwardPubs_not_deliver (p : Params) (s : State) (sender : Peer)
+    (ms : List Message) (m : Message) : Action.deliver m ∉ forwardPubs p s sender ms := by
   intro h
   simp only [forwardPubs, List.mem_flatMap, List.mem_map] at h
   obtain ⟨_, _, q, _, hq⟩ := h
   cases hq
 
-/-- An inbound forward never goes back to the sender. -/
-theorem forwardPubs_excludes_sender (s : State) (sender : Peer) (ms : List Message)
-    (rpc : Rpc.RPC) : Action.sendRpc sender rpc ∉ forwardPubs s sender ms := by
+/-- An inbound forward never goes back to the sender: neither the mesh
+and explicit targets nor the floodsub targets name it. -/
+theorem forwardPubs_excludes_sender (p : Params) (s : State) (sender : Peer)
+    (ms : List Message) (rpc : Rpc.RPC) :
+    Action.sendRpc sender rpc ∉ forwardPubs p s sender ms := by
   intro h
   simp only [forwardPubs, List.mem_flatMap, List.mem_map] at h
-  rcases h with ⟨_, _, _, hqmem, heq⟩
+  rcases h with ⟨_, _, q, hqmem, heq⟩
   injection heq with hpeer _
-  simp only [inboundTargets, List.mem_filter] at hqmem
-  have hne : _ ≠ sender := of_decide_eq_true hqmem.2
-  exact hne hpeer
+  subst hpeer
+  rcases List.mem_append.1 hqmem with hq | hq
+  · simp only [inboundTargets, List.mem_filter] at hq
+    exact of_decide_eq_true hq.2 rfl
+  · simp only [List.mem_filter, Bool.and_eq_true] at hq
+    exact of_decide_eq_true hq.2.1 rfl
 
 private theorem handleIhave_not_deliver (p : Params) (s : State) (sender : Peer)
     (i : Rpc.ControlIHave) (m : Message) :
@@ -2403,6 +2515,16 @@ private theorem controlActions_not_deliver (p : Params) (s : State) (sender : Pe
     · exact mapHandlers_not_deliver _ (fun s b => handleGraft_not_deliver p s sender b) _ _ _ h
   · exact mapHandlers_not_deliver _ (fun s b => handlePrune_not_deliver p s sender b) _ _ _ h
 
+private theorem pxAccept_not_deliver (p : Params) (s : State) (sender : Peer)
+    (c : Rpc.ControlMessage) (m : Message) : Action.deliver m ∉ pxAccept p s sender c := by
+  intro h
+  simp only [pxAccept] at h
+  split at h
+  · simp only [List.mem_filterMap] at h
+    obtain ⟨_, _, hq⟩ := h
+    split at hq <;> simp at hq
+  · simp at h
+
 /-- A message reaches the application only when the pre-state seen cache
 does not hold its id. -/
 private theorem handleSubs_seen (s : State) (sender : Peer) (subs : List Rpc.SubOpts) :
@@ -2447,8 +2569,8 @@ private theorem unsubscribe_not_deliver (p : Params) (s : State) (topic : TopicI
   obtain ⟨q, -, hq⟩ := h
   cases hq
 
-private theorem planActions_not_deliver (p : Params) (pl : TopicPlan) (m : Message) :
-    Action.deliver m ∉ planActions p pl := by
+private theorem planActions_not_deliver (p : Params) (s : State) (pl : TopicPlan) (m : Message) :
+    Action.deliver m ∉ planActions p s pl := by
   simp [planActions, List.mem_map]
 
 private theorem planActionsOf_not_deliver (p : Params) (s : State) (now : Millis)
@@ -2457,7 +2579,7 @@ private theorem planActionsOf_not_deliver (p : Params) (s : State) (now : Millis
   intro h
   simp only [planActionsOf, List.mem_flatMap] at h
   obtain ⟨pl, -, hp⟩ := h
-  exact planActions_not_deliver p pl m hp
+  exact planActions_not_deliver p _ pl m hp
 
 private theorem negativeActions_not_deliver (p : Params) (s : State) (now : Millis)
     (order : List Peer) (m : Message) :
@@ -2503,7 +2625,7 @@ private theorem handleValidated_not_deliver (p : Params) (s : State) (id : Messa
   split at h
   · simp at h
   · cases outcome with
-    | accept => exact forwardPubs_not_deliver s _ _ m (mem_dropForPartial (mem_dropDontWant h))
+    | accept => exact forwardPubs_not_deliver p s _ _ m (mem_dropForPartial (mem_dropDontWant h))
     | reject => simp at h
     | ignore => simp at h
 
@@ -2602,6 +2724,10 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
       simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
       obtain ⟨-, rfl⟩ := hstep
       simp at hdel
+  | protocol peer proto =>
+      simp only [step, Except.ok.injEq, Prod.mk.injEq] at hstep
+      obtain ⟨-, rfl⟩ := hstep
+      simp at hdel
   | rpc sender bytes =>
       simp only [step, rpcStep] at hstep
       split at hstep
@@ -2646,7 +2772,7 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
                   (List.filter (fun m => validationOk p m) rpc.publish) m hm'
                 rwa [hseen, hnow] at hgate
               · exact absurd (mem_dropForPartial hdl)
-                  (forwardPubs_not_deliver (handleSubs s sender rpc.subscriptions) sender
+                  (forwardPubs_not_deliver p (handleSubs s sender rpc.subscriptions) sender
                     ((accept (handleSubs s sender rpc.subscriptions).seen
                         (handleSubs s sender rpc.subscriptions).now p.msgId []
                         (handleSubs s sender rpc.subscriptions).seen
@@ -2657,8 +2783,10 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
                   simp [handleControl] at hdel
               | some c =>
                   rw [hctl] at hdel
-                  simp only [handleControl] at hdel
-                  exact absurd hdel (controlActions_not_deliver p _ sender c m)
+                  simp only [handleControl, List.mem_append] at hdel
+                  rcases hdel with hdel | hdel
+                  · exact absurd hdel (controlActions_not_deliver p _ sender c m)
+                  · exact absurd hdel (pxAccept_not_deliver p _ sender c m)
             · exact absurd hdel (handlePartialIn_not_deliver p _ sender rpc.partialRpc m)
 
 /-! ## The backoff theorem -/
@@ -2671,8 +2799,8 @@ private theorem rpcGrafts_graftRpc (t t' : TopicId) (h : rpcGrafts (graftRpc t) 
   obtain ⟨t'n⟩ := t'
   simpa using hgt.symm
 
-private theorem rpcGrafts_pruneRpc (t t' : TopicId) (b : Millis) :
-    ¬ rpcGrafts (pruneRpc t b) t' := by
+private theorem rpcGrafts_pruneRpc (t t' : TopicId) (b : Millis) (px : List Rpc.PeerInfo) :
+    ¬ rpcGrafts (pruneRpc t b px) t' := by
   simp [rpcGrafts, pruneRpc, controlRpc]
 
 private theorem rpcGrafts_ihaveRpc (t t' : TopicId) (ids : List MessageId) :
@@ -2691,7 +2819,8 @@ private theorem planTopic_added_backoff (p : Params) (s : State) (now : Millis)
   -- `added` is a pick of the candidates (`mem_pickAdded`).
   have hc : q ∈ order.filter (fun q =>
       !memB q (meshOf s topic) && !(Cache.Backoff.active s.backoff q topic now) &&
-        (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit) :=
+        (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit &&
+          !isFlood s q) :=
     mem_pickAdded h
   cases hb : Cache.Backoff.active s.backoff q topic now with
   | false => rfl
@@ -2719,7 +2848,7 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
       simp only [planActions, List.mem_append, List.mem_map] at hmem
       rcases hmem with ⟨q, hq, hqeq⟩ | ⟨q, hq, hqeq⟩
       · cases hqeq
-        exact absurd hgraft (rpcGrafts_pruneRpc _ _ _)
+        exact absurd hgraft (rpcGrafts_pruneRpc _ _ _ _)
       · cases hqeq
         have htopic : topic = pl.topic := rpcGrafts_graftRpc pl.topic topic hgraft
         subst htopic
@@ -2741,7 +2870,7 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
     · simp only [negativeActions, List.mem_flatMap, List.mem_map] at hmem
       obtain ⟨pl, -, q, -, hqeq⟩ := hmem
       cases hqeq
-      exact absurd hgraft (rpcGrafts_pruneRpc _ _ _)
+      exact absurd hgraft (rpcGrafts_pruneRpc _ _ _ _)
   · simp only [gossipActions, List.mem_flatMap] at hmem
     obtain ⟨t, -, ht⟩ := hmem
     split at ht
@@ -2750,5 +2879,45 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
       obtain ⟨q, -, hqeq⟩ := ht
       cases hqeq
       exact absurd hgraft (rpcGrafts_ihaveRpc _ _ _)
+
+/-! ## The peer exchange and floodsub theorems -/
+
+/-- With `doPX` off, no prune names a peer. -/
+theorem pxPeersOff (p : Params) (s : State) (target : Peer) (topic : TopicId)
+    (h : p.doPX = false) : pxPeers p s target topic = [] := by
+  simp [pxPeers, h]
+
+/-- A prune names at most `prunePeers` peers. -/
+theorem pxPeersLength (p : Params) (s : State) (target : Peer) (topic : TopicId) :
+    (pxPeers p s target topic).length ≤ p.prunePeers := by
+  unfold pxPeers
+  split
+  · simp only [List.length_map]
+    exact List.length_take_le _ _
+  · simp
+
+/-- A target below score 0 gets no peer exchange (`gossipsub-v1.1.md`:
+"no PX information is emitted towards those peers"). -/
+theorem pxPeersNegative (p : Params) (s : State) (target : Peer) (topic : TopicId)
+    (h : scoreOf p s target < 0) : pxPeers p s target topic = [] := by
+  have hn : ¬ (0 ≤ scoreOf p s target) := Int.not_le.2 h
+  simp [pxPeers, hn]
+
+/-- A sender whose score does not exceed `acceptPXThreshold` gets no
+connect action. -/
+theorem pxAcceptGate (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage)
+    (h : ¬ p.thresholds.acceptPXThreshold < scoreOf p s sender) :
+    pxAccept p s sender c = [] := by
+  simp [pxAccept, h]
+
+/-- A heartbeat grafts no floodsub peer: the candidates of a plan exclude
+them. -/
+theorem planTopicAddedNotFlood (p : Params) (s : State) (now : Millis) (order : List Peer)
+    (topic : TopicId) {q : Peer} (h : q ∈ (planTopic p s now order topic).added) :
+    isFlood s q = false := by
+  simp only [planTopic] at h
+  have hc := mem_pickAdded h
+  simp only [List.mem_filter, Bool.and_eq_true, Bool.not_eq_true'] at hc
+  exact hc.2.2
 
 end Libp2p.Protocols.Gossipsub.Core

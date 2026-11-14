@@ -30,9 +30,11 @@ and linear copying.
 
 ## Ownership
 
-The task set of the node owns the loop, alarm and writer tasks. Stop joins
-them. The host owns the handler tasks of the inbound streams. Nothing cancels a task:
-`stop` closes the event queue, and the close wakes the parked loop. The
+The task set of the node owns the loop, alarm, writer and connector tasks.
+Stop joins them. The host owns the handler tasks of the inbound streams.
+Nothing cancels a task: `stop` closes the event queue, and the close wakes
+the parked loop. It closes the peer-exchange queue too, which wakes the
+parked connectors; a connector inside a dial ends with the dial. The
 router state and pending gossip are local to the loop. Shared registries,
 subscriptions and the closing flag change through OnceRef.update or
 updateGet (root ARCHITECTURE §4.1). Only the first stop caller joins.
@@ -104,6 +106,18 @@ updateGet (root ARCHITECTURE §4.1). Only the first stop caller joins.
   writer and stream. The core keeps the peer and accepts further RPCs on its
   live inbound stream. Retirement checks the writer id, so an old writer
   cannot remove a newer entry for the same peer.
+- **The shell holds the signed peer records.** The core names the
+  peer-exchange peers by id (`Core.pxPeers`); the send path adds each
+  record the host holds (`fillRecords`), so the core stays free of
+  signatures and IO. On the way in, `pxConnect` checks each record
+  through the host and queues the peer for one of `Config.connectors`
+  dial tasks, in a queue of `Config.maxPendingConnections`. go-libp2p-pubsub
+  splits the work the same way (`pxConnect`, `connector`).
+- **A floodsub peer is marked after its join.** The host announces a
+  connection before any stream negotiates, so the join records
+  `meshsub`. The stream that negotiates `/floodsub/1.0.0`, ours or the
+  peer's, then posts `Core.Event.protocol`, and the router takes the
+  peer out of every mesh.
 -/
 
 set_option autoImplicit false
@@ -177,6 +191,16 @@ structure Config where
   the loop task, so it must not park. The application answers through
   `Node.sendPartial`, and scores the parts through `Node.judgePartial`. -/
   onPartial : Peer → Rpc.PartialMessage → BaseIO Unit := fun _ _ => pure ()
+  /-- Serve and speak `/floodsub/1.0.0` (pubsub `README.md`): the
+  handler takes floodsub streams, and our writer proposes floodsub last.
+  go-libp2p-pubsub and Lodestar speak it; rust-libp2p, and so
+  Lighthouse, leave it off by default, and so does this node. -/
+  floodsub : Bool := false
+  /-- The dials a peer exchange may queue: go's `MaxPendingConnections`,
+  128. A full queue drops the peer, as go's `pxConnect` does. -/
+  maxPendingConnections : Nat := 128
+  /-- The tasks that dial peer-exchange peers: go's `Connectors`, 8. -/
+  connectors : Nat := 8
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
 Lighthouse's `lighthouse_network` metrics are off in the shadow node
@@ -317,7 +341,7 @@ entry and closes its queue. The core peer stays connected. Stop resets an
 installed stream; a late open checks closing too. -/
 private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     (outbound : Conc.OnceRef (List (Peer × Outbound))) (unsupported : Conc.OnceRef (List Peer))
-    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit)
+    (onVersion : Peer → Libp2p.Core.ProtocolId → BaseIO Unit) (floodsub : Bool)
     (peer : Peer) (ob : Outbound) : Conc.Async Unit := do
   let fail : Conc.Async Unit := do
     (ob.queue.close : BaseIO Unit)
@@ -325,9 +349,11 @@ private def writer (host : HostSeam) (closing : Conc.OnceRef Bool)
     if let some stream ← (ob.stream.get : BaseIO (Option Streams.Stream)) then stream.reset
   try
     -- The newest first: a peer answers `na` to an id it lacks, and the
-    -- negotiation falls back to v1.2, then v1.1.
-    match ← host.newStream peer [Constants.meshsubV13Id, Constants.meshsubV12Id,
-        Constants.meshsubId] with
+    -- negotiation falls back to v1.2, then v1.1, then floodsub when the
+    -- node speaks it (go's `GossipSubDefaultProtocols` order).
+    let ids := [Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId] ++
+      (if floodsub then [Constants.floodsubId] else [])
+    match ← host.newStream peer ids with
     | .ok (id, stream) =>
       (onVersion peer id : BaseIO Unit)
       (ob.stream.set (some stream) : BaseIO Unit)
@@ -430,6 +456,12 @@ def handler (events : Conc.Chan Input) (cap : Nat := Constants.rpcCap)
     if let .error _ ← events.send (.event (.peerJoined peer .meshsub)) then
       stream.close
       return .ok ()
+    -- A floodsub stream marks its peer after the join, so the router
+    -- knows the peer when the mark arrives.
+    if id == Constants.floodsubId then
+      if let .error _ ← events.send (.event (.protocol peer .floodsub)) then
+        stream.close
+        return .ok ()
     let answer ← readFrames events cap split peer stream
     match answer with
     | .ok () => stream.close
@@ -499,6 +531,9 @@ private structure Env where
   as rust-libp2p sends it once per peer (`behaviour.rs`,
   `handle_established_*_connection`). `removePeer` clears the entry. -/
   extSent : Conc.OnceRef (List Peer)
+  /-- The peer-exchange peers that wait for a connector. `stop` closes
+  it, and the connectors end. -/
+  pxQueue : Conc.Chan Peer
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
 A full queue drops its frame. Each peer has one writer and one stream. -/
@@ -528,9 +563,13 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
       let id ← env.nextOutbound.updateGet (fun n => (n, n + 1))
       let ob : Outbound := { id, queue := ← Conc.Chan.new 32, stream := ← Conc.OnceRef.new none }
       env.outbound.update (fun table => (peer, ob) :: table)
-      let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
+      let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit := do
         env.versions.update fun l => (q, id) :: l.filter (·.1 != q)
-      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record peer ob)
+        -- The router took the peer for a gossipsub peer at its join.
+        if id == Constants.floodsubId then
+          discard <| env.events.trySend (.event (.protocol q .floodsub))
+      env.tasks.spawn (writer env.host env.closing env.outbound env.unsupported record
+        env.config.floodsub peer ob)
       pure ob
   -- The first frame to a peer carries the Extensions message. A v1.1 or
   -- v1.2 peer skips field 6 as an unknown field.
@@ -611,6 +650,52 @@ private structure LoopState where
   /-- The time of the next explicit-peer connectivity check. -/
   nextExplicitCheck : Millis := 0
 
+/-- The peer of a peer-exchange entry, when its id decodes. -/
+private def infoPeer? (info : Rpc.PeerInfo) : Option Peer :=
+  info.peerId.bind fun b => (Libp2p.Identity.PeerId.ofBytes? (Bytes.ofNatList b)).toOption
+
+/-- Add the signed peer record the host holds to each peer-exchange entry
+of a prune (`Core.pxPeers` leaves it out), as go's `makePrune` reads it
+from the certified address book. An entry with no record goes as the
+peer id alone, which the spec allows. -/
+private def fillRecords (env : Env) (rpc : Rpc.RPC) : BaseIO Rpc.RPC := do
+  let some c := rpc.control | return rpc
+  if c.prune.all (·.peers.isEmpty) then return rpc
+  let prune ← c.prune.mapM fun q => do
+    let peers ← q.peers.mapM fun info => do
+      match infoPeer? info with
+      | none => pure info
+      | some pid => do
+        let spr ← env.host.recordOf pid
+        pure { info with signedPeerRecord := spr.map Bytes.toNatList }
+    pure { q with peers }
+  return { rpc with control := some { c with prune } }
+
+/-- Handle the peers a prune offered (`Core.Action.pxConnect`): a peer
+whose signed record fails the check is skipped, as go's `pxConnect`
+skips it; a valid record's addresses enter the peerstore. Each peer then
+waits for a connector in the bounded queue; a full queue drops it. -/
+private def pxConnect (env : Env) (infos : List Rpc.PeerInfo) : BaseIO Unit := do
+  for info in infos do
+    let some pid := infoPeer? info | continue
+    if let some spr := info.signedPeerRecord then
+      if !(← env.host.consumeRecord pid (Bytes.ofNatList spr)) then continue
+    discard <| env.pxQueue.trySend pid
+
+/-- One connector: dial each queued peer the host does not serve yet,
+until `stop` closes the queue. go-libp2p-pubsub's `connector`. -/
+private def connector (env : Env) : Conc.Async Unit := do
+  repeat
+    -- Park: a peer arrives, or `stop` closes the queue.
+    match ← env.pxQueue.recv with
+    | none => break
+    | some pid =>
+      let live ← match env.host.peers with
+        | some get => (get : BaseIO (List Peer))
+        | none => pure []
+      if !live.contains pid then
+        discard <| env.host.dial pid
+
 /-- Run the actions of one core step, in order, and answer the delayed
 sends. `gossipAt` is the time of the tick when a tick made the actions. The
 run-wide i-th IHAVE waits for trickle i milliseconds. Every other action
@@ -624,7 +709,9 @@ private def perform (env : Env) (gossipAt : Option Millis) (index : Nat)
     | .deliver m => (deliver env.subs m : BaseIO Unit)
     | .validate m id source => env.config.onValidate m id source
     | .partialIn source pm => env.config.onPartial source pm
-    | .sendRpc to rpc =>
+    | .pxConnect _ infos => pxConnect env infos
+    | .sendRpc to rpc0 =>
+      let rpc ← fillRecords env rpc0
       match gossipAt with
       | some now =>
         if hasIhave rpc then
@@ -847,6 +934,8 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   host.setHandler (handler events config.maxRpcSize Constants.meshsubV13Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubV12Id record split)
   host.setHandler (handler events config.maxRpcSize Constants.meshsubId record split)
+  if config.floodsub then
+    host.setHandler (handler events config.maxRpcSize Constants.floodsubId record split)
   let tasks ← Conc.TaskSet.new
   let alarm ← Conc.Alarm.new
   let outbound ← Conc.OnceRef.new ([] : List (Peer × Outbound))
@@ -855,10 +944,16 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   let drops ← Conc.OnceRef.new 0
   let unsupported ← Conc.OnceRef.new ([] : List Peer)
   let extSent ← Conc.OnceRef.new ([] : List Peer)
+  -- A configured 0 gets one slot: the channel needs a positive capacity.
+  let pxQueue : Conc.Chan Peer ←
+    if h : 0 < config.maxPendingConnections then Conc.Chan.new config.maxPendingConnections h
+    else Conc.Chan.new 1
   tasks.spawn <| alarm.run config.clock (fun now => events.send (.wake now))
   let env : Env :=
     { host, config, subs, events, alarm, tasks, outbound, nextOutbound, closing, drops, unsupported,
-      versions, payloads, extSent }
+      versions, payloads, extSent, pxQueue }
+  for _ in [0:config.connectors] do
+    tasks.spawn (connector env)
   tasks.spawn <| loop env
     { router := { initialState config.params now with explicit := config.explicitPeers }
       pending := []
@@ -976,6 +1071,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       let first ← (closing.updateGet (fun was => (!was, true)) : BaseIO Bool)
       if first then
         (events.close : BaseIO Unit)
+        (pxQueue.close : BaseIO Unit)
         for (_, ob) in ← (outbound.get : BaseIO (List (Peer × Outbound))) do
           endOutbound ob
         tasks.joinAll }

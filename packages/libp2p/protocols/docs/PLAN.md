@@ -184,6 +184,30 @@ in the codec group wrapping upstream `google/snappy`.
   foreign nodes, and it closes the unit where no vector file can.
 - The suite passes under `+RTS -N1`.
 
+## Test milestones (peer exchange and floodsub)
+
+The spike adds both on `experiment/client`. The core half runs in
+`Tests/Gossipsub/Px.lean` (`LEANP2P_SUITE=px`), the theorems sit at the
+end of `Gossipsub/Core.lean`, and `scripts/pubsub-interop.sh` runs the
+node half against go-libp2p-pubsub v0.19.0.
+
+- Theorems: `pxPeersOff` (no PX with `doPX` off), `pxPeersLength` (at
+  most `prunePeers`), `pxPeersNegative` (none to a target below 0),
+  `pxAcceptGate` (no connect at or below `acceptPXThreshold`), and
+  `planTopicAddedNotFlood` (a heartbeat grafts no floodsub peer).
+- The send side: a GRAFT into a full mesh draws a prune that names the
+  other peers of the topic, with no record in the core; `doPX` off, the
+  cap, a negative peer, and an unsubscribe each have a check.
+- The accept side: the strict threshold, a lifted score, an unknown
+  topic, an undecodable peer id, a known peer, and the cap.
+- Floodsub: our publish and our forward reach a floodsub peer, a
+  heartbeat never grafts it, a `protocol` event takes a mesh peer out,
+  and no prune names it.
+- Interop: a go floodsub-only node and ours exchange a message each way;
+  go prunes our GRAFT with peer exchange, and we connect to a peer we
+  only know from its signed record; we prune go's GRAFT with peer
+  exchange, and go connects to a peer it only knows from our records.
+
 ## Vector stance
 
 - **Identify has a vector.** The spike pins
