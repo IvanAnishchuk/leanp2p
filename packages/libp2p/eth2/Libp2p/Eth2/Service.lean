@@ -499,9 +499,18 @@ def start (cfg : Config) : Async Service := do
       | none => pure true
     allowInbound := fun _ _ => pure true
     allowSecured := fun _ p _ _ => allowed p }
+  -- The connection caps of Lighthouse (`service/mod.rs`,
+  -- `with_max_established`): the target, plus `PEER_EXCESS_FACTOR` (0.1)
+  -- and `PRIORITY_PEER_EXCESS` (0.2) of it, rounded up. Lighthouse allows
+  -- one connection per peer. The host dedups a pair of crossed dials only
+  -- after both handshakes, and a cap of one would make each side refuse
+  -- the other's connection, so the cap is two.
+  let (resources, _) ← (Libp2p.Host.Limits.manager
+    { connections := (cfg.targetPeers * 13 + 9) / 10, connectionsPerPeer := 2 } : BaseIO _)
   let hostCfg : Libp2p.Host.Config := {
     identity := cfg.key
     gater
+    resources
     transports := [Streams.Tcp.transport]
     securedTransports := if cfg.quicPort.isSome then [Libp2p.Quic.transport tls] else []
     security := [Security.Noise.securityProtocol noise]

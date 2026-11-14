@@ -454,6 +454,28 @@ private def liveForkChecks (r : Runner) : Async Unit := do
   r.check "eth2 fork: the two digests differ" (pre != post)
   a.stop
 
+/-- The connection cap: a target of one peer allows two connections
+(Lighthouse's 1.3 times the target, rounded up), so of three peers that
+dial, two at most stay. -/
+private def limitChecks (r : Runner) : Async Unit := do
+  let c ← devnetChain ((← wallMs) / 1000)
+  let ev ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let key ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 9⟩)
+  let a ← Service.start {
+    chain := c, key, ip := [127, 0, 0, 1], tcpPort := 0, discPort := 0, advert := { cgc := 4 }
+    targetPeers := 1, onEvent := fun e => ev.update (· ++ [e]) }
+  let boot ← (a.localEnr : BaseIO Enr)
+  let others ← [11, 12, 13].mapM fun (seed : UInt8) => do
+    let evo ← (OnceRef.new ([] : List Event) : BaseIO _)
+    startOn c seed evo [boot]
+  let connected : Async Bool := do return (← (a.peers : BaseIO (List PeerId))).length ≥ 2
+  r.check "eth2 limits: two peers connect" (← waitUntil connected 5000)
+  IO.sleep 2000
+  r.check "eth2 limits: the third connection is refused"
+    ((← (a.peers : BaseIO (List PeerId))).length == 2)
+  for o in others do o.stop
+  a.stop
+
 def run (r : Runner) : IO Unit := do
   r.section "eth2" "vendor/consensus-specs: specs/*/p2p-interface.md to fulu, fulu beacon-chain.md"
   chainChecks r
@@ -464,5 +486,6 @@ def run (r : Runner) : IO Unit := do
   peersChecks r
   Async.run (serviceChecks r)
   Async.run (liveForkChecks r)
+  Async.run (limitChecks r)
 
 end Tests.Eth2

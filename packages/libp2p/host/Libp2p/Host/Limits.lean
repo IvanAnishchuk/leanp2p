@@ -25,21 +25,24 @@ namespace Libp2p.Host.Limits
 
 open Conc Libp2p.Core Libp2p.Identity
 
-/-- The bounds. The defaults are spike placeholders with no source. A
-consensus client sets its own. -/
+/-- The bounds. The defaults are the base limits of go-libp2p's
+resource manager (`DefaultLimits`, `vendor/go-libp2p/p2p/host/
+resource-manager/limit_defaults.go`), before go scales them with the
+machine's memory. A consensus client sets its own. -/
 structure Bounds where
-  /-- Connections over the host. -/
-  connections : Nat := 256
-  /-- Connections per peer. -/
+  /-- Connections over the host: `SystemBaseLimit.Conns`. -/
+  connections : Nat := 128
+  /-- Connections per peer: `PeerBaseLimit.Conns`. -/
   connectionsPerPeer : Nat := 8
-  /-- Streams per connection. -/
+  /-- Streams per connection. go sets no limit at this scope, so the
+  bound is the per-peer one. -/
   streamsPerConnection : Nat := 512
-  /-- Streams per peer. -/
-  streamsPerPeer : Nat := 1024
-  /-- Buffered bytes per connection. -/
+  /-- Streams per peer: `PeerBaseLimit.Streams`. -/
+  streamsPerPeer : Nat := 512
+  /-- Buffered bytes per connection: `ConnBaseLimit.Memory`, 32 MiB. -/
   memoryPerConnection : Nat := 32 * 2 ^ 20
-  /-- Buffered bytes over the host. -/
-  memory : Nat := 512 * 2 ^ 20
+  /-- Buffered bytes over the host: `SystemBaseLimit.Memory`, 128 MiB. -/
+  memory : Nat := 128 * 2 ^ 20
 
 /-- The use of one peer. -/
 structure PeerUse where
