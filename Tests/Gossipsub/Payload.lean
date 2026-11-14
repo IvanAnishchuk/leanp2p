@@ -67,9 +67,9 @@ def run (r : Runner) : IO Unit := do
     let (rpc, s) := randomRpc seed
     seed := s
     let raw := Bytes.ofNatList (Pb.encodeMessage rpc)
-    match Payload.splitInbound raw idOf with
-    | none => splitOk := false
-    | some (small, payloads) =>
+    match Payload.splitInbound raw (fun t d => some (idOf t d)) with
+    | .error _ => splitOk := false
+    | .ok (small, payloads) =>
       if decode small != some (withHandles rpc) then splitOk := false
       let expected := rpc.publish.map fun m =>
         let d := Bytes.ofNatList (m.data.getD [])
@@ -80,5 +80,18 @@ def run (r : Runner) : IO Unit := do
       if decode (Payload.joinOutbound (withHandles rpc) lookup) != some rpc then joinOk := false
   r.check "payload: the split RPC decodes to the original with handles, payloads by id" splitOk
   r.check "payload: the joined bytes decode to the original RPC" joinOk
+  -- One message with data, so the id function runs once.
+  let one : Rpc.RPC := { subscriptions := [], control := none, publish :=
+    [{ «from» := none, data := some [1, 2, 3], seqno := none, topic := ⟨"blocks"⟩,
+       signature := none, key := none }] }
+  let oneRaw := Bytes.ofNatList (Pb.encodeMessage one)
+  r.check "payload: a payload with no id fails the split with noId"
+    (match Payload.splitInbound oneRaw (fun _ _ => none) with
+     | .error .noId => true
+     | _ => false)
+  r.check "payload: a truncated RPC fails the split with malformed"
+    (match Payload.splitInbound (oneRaw.extract 0 (oneRaw.size - 1)) (fun t d => some (idOf t d)) with
+     | .error .malformed => true
+     | _ => false)
 
 end Tests.Gossipsub.Payload

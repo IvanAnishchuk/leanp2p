@@ -20,10 +20,9 @@ Fulu, so it has no phase0 form.
 
 The function is pure, as the node's `payloadId` seam asks. The
 SHA-256 of the crypto facade answers `Except`, for a fault of the
-OpenSSL shim. A fault gives the empty id. The seen cache then treats
-every faulted message as one id, and the node drops the later ones
-until the fault ends. A shim fault is not a peer input: it means the
-process is broken.
+OpenSSL shim. A fault gives `none`, and the node then drops the
+message (`Config.payloadId`). A shim fault is not a peer input: it
+means the process is broken.
 -/
 
 set_option autoImplicit false
@@ -39,14 +38,15 @@ def messageIdInput (topic : String) (data : ByteArray) : ByteArray :=
   | .ok raw => Constants.messageDomainValidSnappy ++ Chain.le64 t.size ++ t ++ raw
   | .error _ => Constants.messageDomainInvalidSnappy ++ Chain.le64 t.size ++ t ++ data
 
-/-- The message id of `data` on `topic`, as bytes. -/
-def messageIdBytes (topic : String) (data : ByteArray) : ByteArray :=
+/-- The message id of `data` on `topic`, as bytes. `none` on a fault of
+the SHA-256 shim. -/
+def messageIdBytes (topic : String) (data : ByteArray) : Option ByteArray :=
   match Crypto.sha256 (messageIdInput topic data) with
-  | .ok h => h.extract 0 Constants.messageIdLen
-  | .error _ => ByteArray.empty
+  | .ok h => some (h.extract 0 Constants.messageIdLen)
+  | .error _ => none
 
 /-- The message id in the router's form. -/
-def messageId (topic : String) (data : ByteArray) : MessageId :=
-  ⟨(messageIdBytes topic data).toList.map (·.toNat)⟩
+def messageId (topic : String) (data : ByteArray) : Option MessageId :=
+  (messageIdBytes topic data).map fun b => ⟨b.toList.map (·.toNat)⟩
 
 end Libp2p.Eth2

@@ -181,8 +181,9 @@ structure Config where
   the handle, and checks `params.maxDataSize` itself. It drops an RPC
   with an oversize payload whole, with no P₄ penalty. `onValidate` gets
   the message with its handle in `data`, and `Node.payload` reads the
-  bytes. -/
-  payloadId : Option (String → ByteArray → MessageId) := none
+  bytes. A `none` id is a local fault, for example of a hash shim. The
+  node then drops the inbound RPC whole, and `publish` answers `false`. -/
+  payloadId : Option (String → ByteArray → Option MessageId) := none
   /-- The heartbeats between opportunistic grafting rounds. rust's
   `opportunistic_graft_ticks` is 60. -/
   opportunisticGraftTicks : Nat := 60
@@ -973,16 +974,18 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     match config.params.maxDataSize with
     | some cap => decide (cap < d.size)
     | none => false
-  -- The inbound split of the payload path (`Payload.splitInbound`). An RPC
-  -- that does not split goes to the core as it came, and the core's
-  -- decoder reports it. The split drops an RPC with an oversize payload.
+  -- The inbound split of the payload path (`Payload.splitInbound`). A
+  -- malformed RPC goes to the core as it came, and the core's decoder
+  -- reports it. The split drops an RPC with an oversize payload, or with
+  -- a payload that has no id.
   let split : ByteArray → BaseIO (Option ByteArray) := fun body => do
     match config.payloadId with
     | none => return some body
     | some idOf =>
       match Payload.splitInbound body idOf with
-      | none => return some body
-      | some (small, ps) =>
+      | .error .malformed => return some body
+      | .error .noId => return none
+      | .ok (small, ps) =>
         if ps.any (fun (_, d) => over d) then return none
         let t ← config.clock.nowMs
         payloads.update fun m =>
@@ -1054,7 +1057,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
         -- The payload path: store the bytes, publish the handle.
         if over payload then pure false
         else do
-          let id := idOf topic.name payload
+          let some id := idOf topic.name payload | pure false
           let t ← config.clock.nowMs
           payloads.update (·.insert id (payload, t))
           post (.publish { messageOf topic .empty with data := some id.bytes })

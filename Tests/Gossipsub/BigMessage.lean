@@ -74,7 +74,7 @@ def runB (r : Runner) : IO Unit := do
   r.section "gossipsub big message, ByteArray path" "(spike F3: a measurement)"
   let size := Constants.maxPayloadSize
   let payload : ByteArray := ⟨(Array.range size).map (·.toUInt8)⟩
-  let idOf (_ : String) (d : ByteArray) : MessageId := ⟨(d.extract 0 20).toList.map (·.toNat)⟩
+  let idOf (_ : String) (d : ByteArray) : Option MessageId := some ⟨(d.extract 0 20).toList.map (·.toNat)⟩
   -- The raw RPC, with its fields written directly around the payload, as
   -- a peer would send it.
   let header : Message :=
@@ -82,7 +82,7 @@ def runB (r : Runner) : IO Unit := do
   let inner := Bytes.ofNatList (Pb.encodeMessage header)
   let raw := Payload.lenField Payload.rpcPublish (inner ++ Payload.lenField Payload.msgData payload)
   let t0 ← IO.monoMsNow
-  let some (small, ps) := Payload.splitInbound raw idOf
+  let .ok (small, ps) := Payload.splitInbound raw idOf
     | r.check "bigmsgB: the RPC splits" false
   let t1 ← IO.monoMsNow
   IO.println s!"bigmsgB: split {raw.size} bytes into {small.size} and {ps.length} payload in {t1 - t0} ms"

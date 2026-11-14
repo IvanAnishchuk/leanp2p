@@ -112,12 +112,13 @@ private def topic : String := "/eth2/8049f250/beacon_block/ssz_snappy"
 
 private def messageIdChecks (r : Runner) : IO Unit := do
   r.check "eth2: data that does not decompress takes the invalid domain"
-    (messageIdBytes topic ⟨#[0xff, 0xff, 0xff]⟩ == hex "cdeedbbf61c3f27499d55d88a971e19d2e1da339")
+    (messageIdBytes topic ⟨#[0xff, 0xff, 0xff]⟩ == some (hex "cdeedbbf61c3f27499d55d88a971e19d2e1da339"))
   let raw := "hello consensus".toUTF8
   let data ← expectOk "snappy compress" (Snappy.compress raw)
   r.check "eth2: compressed data takes the valid domain over the raw bytes"
-    (messageIdBytes topic data == hex "b4ba60d2bba298249bed48c66fb8611d872e9dbc")
-  r.check "eth2: the message id has 20 bytes" ((messageId topic data).bytes.length == 20)
+    (messageIdBytes topic data == some (hex "b4ba60d2bba298249bed48c66fb8611d872e9dbc"))
+  r.check "eth2: the message id has 20 bytes"
+    ((messageId topic data).map (·.bytes.length) == some 20)
   r.check "eth2: the topic enters the id"
     (messageIdBytes "/eth2/8049f250/voluntary_exit/ssz_snappy" data != messageIdBytes topic data)
 
@@ -214,7 +215,7 @@ private def serviceChecks (r : Runner) : Async Unit := do
   let data ← expectOk "compress" (Snappy.compress block)
   r.check "eth2 service: the held id is the consensus message id"
     (ids.head? ==
-      some (messageId (← (a.topic .beaconBlock : IO Libp2p.Protocols.Gossipsub.TopicId)).name data))
+      messageId (← (a.topic .beaconBlock : IO Libp2p.Protocols.Gossipsub.TopicId)).name data)
   if let some id := ids.head? then
     r.check "eth2 service: the validation answer posts" (← (a.report id bPeer .accept : BaseIO Bool))
   -- A block request with its context bytes.

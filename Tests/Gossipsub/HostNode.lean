@@ -108,7 +108,7 @@ def run (r : Runner) : IO Unit := Async.run do
     let held : Chan (MessageId × Peer) ← Chan.new 4
     let cap := Libp2p.Protocols.Constants.gossipMaxMessageSize
     let base : Node.Config :=
-      { clock := p.clock.clock, payloadId := some idOf, maxRpcSize := cap
+      { clock := p.clock.clock, payloadId := some fun t d => some (idOf t d), maxRpcSize := cap
         params := { Core.defaults with validateMessages := true } }
     let server ← (Node.start (HostSeam.ofHost p.server)
       { base with onValidate := fun _ id src => discard (held.trySend (id, src)) } : BaseIO Node.Node)
@@ -138,6 +138,36 @@ def run (r : Runner) : IO Unit := Async.run do
     client.stop
     server.stop
     r.check "hosts: the pair closes with no fault (payload)" (← p.close).isNone
+  -- An id function that gives no id, as a hash shim fault does: the
+  -- server drops the client's message, and its own publish fails.
+  do
+    let p ← hostPair
+    let held : Chan MessageId ← Chan.new 4
+    let ok (topic : String) (d : ByteArray) : Option MessageId :=
+      some ⟨topic.length :: (d.extract 0 8).toList.map (·.toNat)⟩
+    let base : Node.Config :=
+      { clock := p.clock.clock, params := { Core.defaults with validateMessages := true } }
+    let server ← (Node.start (HostSeam.ofHost p.server)
+      { base with payloadId := some fun _ _ => none
+                  onValidate := fun _ id _ => discard (held.trySend id) } : BaseIO Node.Node)
+    let client ← (Node.start (HostSeam.ofHost p.client) { base with payloadId := some ok } :
+      BaseIO Node.Node)
+    let topic : TopicId := ⟨"blocks"⟩
+    discard (server.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+    discard (client.subscribe topic (fun _ => pure ()) : BaseIO Bool)
+    r.check "no id: the client meshes the server"
+      (← waitStats p.clock client (fun s => s.mesh.any (·.2 == 1)) 5)
+    r.check "no id: the client's publish posts"
+      (← (client.publish topic ⟨Array.replicate 100 9⟩ : BaseIO Bool))
+    r.check "no id: the server's publish answers false"
+      (!(← (server.publish topic ⟨Array.replicate 100 8⟩ : BaseIO Bool)))
+    for i in [0:40] do
+      nap
+      if i % 10 == 9 then p.clock.advance 1000
+    r.check "no id: the server holds no message" (← (held.tryRecv : BaseIO _)).isNone
+    client.stop
+    server.stop
+    r.check "hosts: the pair closes with no fault (no id)" (← p.close).isNone
   -- A message over the RPC cap (spike P7): the node counts it in
   -- `dropped`. The client's cap is 64 bytes. The server subscribes, so
   -- the client's publish goes to it through the fanout.
