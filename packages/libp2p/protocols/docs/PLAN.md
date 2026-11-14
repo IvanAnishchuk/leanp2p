@@ -193,12 +193,12 @@ node half against go-libp2p-pubsub v0.19.0.
 
 - Theorems: `pxPeersOff` (no PX with `doPX` off), `pxPeersLength` (at
   most `prunePeers`), `pxPeersNegative` (none to a target below 0),
-  `pxAcceptGate` (no connect at or below `acceptPXThreshold`), and
+  `pxAcceptGate` (no connect below `acceptPXThreshold`), and
   `planTopicAddedNotFlood` (a heartbeat grafts no floodsub peer).
 - The send side: a GRAFT into a full mesh draws a prune that names the
   other peers of the topic, with no record in the core; `doPX` off, the
   cap, a negative peer, and an unsubscribe each have a check.
-- The accept side: the strict threshold, a lifted score, an unknown
+- The accept side: a score at the threshold, one below it, a lifted score, an unknown
   topic, an undecodable peer id, a known peer, and the cap.
 - Floodsub: our publish and our forward reach a floodsub peer, a
   heartbeat never grafts it, a `protocol` event takes a mesh peer out,

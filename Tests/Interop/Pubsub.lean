@@ -24,8 +24,8 @@ peer record.
   floodsub-only node, publishes `from-lean`, and waits for `from-go`.
   go speaks no meshsub, so both directions negotiate `/floodsub/1.0.0`.
 * `pubsub-interop px-accept ADDR`: dial a go gossipsub node with peer
-  exchange on and a full mesh, raise its app score above
-  `acceptPXThreshold`, and join the topic. go prunes our GRAFT with the
+  exchange on and a full mesh, give it a positive app score (the spec's
+  bootstrapper setup), and join the topic. go prunes our GRAFT with the
   other peers of its mesh and their signed records. The check passes
   once we connect to one of them; their addresses reach us only through
   the records.
@@ -184,8 +184,8 @@ def floodsubMode (target : String) : Async UInt32 := do
   return 1
 
 def pxAcceptMode (target : String) : Async UInt32 := do
-  -- The app score counts, so the bootstrapper scores above the
-  -- threshold of 0, as the spec's bootstrapper setup does.
+  -- The app score counts, so the bootstrapper scores above 0, as the
+  -- spec's bootstrapper setup does.
   let base := Core.defaults
   let params : Core.Params :=
     { base with score := { base.score with global := { base.score.global with appSpecificWeight := 1 } } }

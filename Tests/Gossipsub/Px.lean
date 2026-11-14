@@ -17,8 +17,8 @@ Exchange", and go-libp2p-pubsub's `makePrune` and `handlePrune`:
   score 0;
 * an unsubscribe prunes with the peer exchange too;
 * a received prune's peers become one `pxConnect` when the sender's
-  score exceeds `acceptPXThreshold`, the topic is ours, and the peer is
-  new; `prunePeers` caps them.
+  score is not below `acceptPXThreshold`, the topic is ours, and the
+  peer is new; `prunePeers` caps them.
 
 Floodsub peers follow go-libp2p-pubsub's `rpcs`: they get our messages
 and our forwards, never a GRAFT or an IHAVE, and a `protocol` event
@@ -155,10 +155,13 @@ def run (r : Runner) : IO Unit := do
 
   /- ## Accepting -/
   let px := [infoOf pe, infoOf pc]
-  -- A zero score does not exceed the threshold 0: no connect.
+  -- A score at the threshold 0 is accepted ("below this threshold is
+  -- ignored"); `pc` is known, so only `pe` remains.
   let (_, a0) := stepOf params start (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
-  r.check "px.accept.threshold-strict" (connects a0).isEmpty
-  -- A positive score does; `pc` is known, so only `pe` remains.
+  r.check "px.accept.at-threshold" (connects a0 == [(pa, [infoOf pe])])
+  -- A score below it is ignored.
+  let (_, aLow) := stepOf params (withScore start pa (-1)) (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
+  r.check "px.accept.below-threshold" (connects aLow).isEmpty
   let lifted := withScore start pa 1
   let (_, a1) := stepOf params lifted (.rpc pa (Pb.encodeMessage (pruneOf ta px)))
   r.check "px.accept.connect" (connects a1 == [(pa, [infoOf pe])])

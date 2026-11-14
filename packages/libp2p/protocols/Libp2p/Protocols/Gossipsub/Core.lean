@@ -1249,16 +1249,19 @@ def controlActions (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMess
 
 /-- The peer exchange a prune offers, as the connect actions. A prune
 counts when we joined its topic, as go and rust skip a prune of an
-unknown topic. The sender's score must exceed `acceptPXThreshold`, the
-spec's word ("only accept it ... if the originating peer's score exceeds
-this threshold"); go and rust accept at the threshold too, so a peer
-scoring exactly the threshold differs. From each prune the action keeps
+unknown topic. A sender below `acceptPXThreshold` is ignored: the spec's
+parameter table says "PX information by peers below this threshold is
+ignored", and go and rust read it so (`score < acceptPXThreshold`). The
+prose of "Peer Scoring" says "exceeds", which would refuse a peer at the
+threshold, so at the default 0 every new peer; the table, its
+constraint "Must be >= 0", and both implementations settle it. From each
+prune the action keeps
 up to `prunePeers` entries whose peer id decodes and names a peer we do
 not know; go truncates after a shuffle, this core in wire order. The
 score is read from the state before the prunes, as go's
 `handlePrune` reads it. -/
 def pxAccept (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) : List Action :=
-  if decide (p.thresholds.acceptPXThreshold < scoreOf p s sender) then
+  if decide (p.thresholds.acceptPXThreshold ≤ scoreOf p s sender) then
     c.prune.filterMap fun q =>
       let fresh := (q.peers.filter fun info =>
         match info.peerId with
@@ -2903,12 +2906,12 @@ theorem pxPeersNegative (p : Params) (s : State) (target : Peer) (topic : TopicI
   have hn : ¬ (0 ≤ scoreOf p s target) := Int.not_le.2 h
   simp [pxPeers, hn]
 
-/-- A sender whose score does not exceed `acceptPXThreshold` gets no
-connect action. -/
+/-- A sender below `acceptPXThreshold` gets no connect action. -/
 theorem pxAcceptGate (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage)
-    (h : ¬ p.thresholds.acceptPXThreshold < scoreOf p s sender) :
+    (h : scoreOf p s sender < p.thresholds.acceptPXThreshold) :
     pxAccept p s sender c = [] := by
-  simp [pxAccept, h]
+  have hn : ¬ (p.thresholds.acceptPXThreshold ≤ scoreOf p s sender) := Int.not_le.2 h
+  simp [pxAccept, hn]
 
 /-- A heartbeat grafts no floodsub peer: the candidates of a plan exclude
 them. -/

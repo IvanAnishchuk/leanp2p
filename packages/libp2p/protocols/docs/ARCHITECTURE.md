@@ -302,14 +302,17 @@ Both spike programs call `Ping.ping`.
   forbids the request and a wait would park on another request's
   deadline. The slot goes back on every path. The responder's side of
   the rule, "MAY penalise", is scoring, and stays with the client.
-- **Peer exchange accepts strictly above `acceptPXThreshold`.** The
-  spec accepts PX "if the originating peer's score exceeds this
-  threshold". go-libp2p-pubsub and rust-libp2p ignore PX only below
-  it, so they accept at the threshold. The spec wins (PRINCIPLES 2.1):
-  with the default threshold 0, a peer at score 0 gets its PX ignored,
-  and a node that wants PX from a bootstrapper lifts its score, as the
-  spec's bootstrapper setup does through the application score. The
-  pubsub interop runs that setup.
+- **Peer exchange is ignored below `acceptPXThreshold`, and accepted at
+  it.** The spec says it two ways. Its parameter table: "PX information
+  by peers below this threshold is ignored", with the constraint "Must
+  be >= 0". Its "Peer Scoring" prose: accept "if the originating peer's
+  score exceeds this threshold". Read strictly, the prose would refuse
+  every new peer at the default threshold 0, against the table's
+  meaning. The table is the normative definition of the parameter, and
+  go-libp2p-pubsub and rust-libp2p both implement it
+  (`score < acceptPXThreshold` ignores), so the core does too. The
+  pubsub interop still lifts the bootstrapper's application score, the
+  spec's bootstrapper setup.
 - **The core names PX peers; the shell adds their records.** The core
   stays free of signatures: `pxPeers` names the peers by id, and the
   node's send path adds the record the host holds, as go's `makePrune`
