@@ -424,6 +424,50 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
   c.stop
   r.check "discv5 udp: the nodes stop" true
 
+/-! ## A lost datagram -/
+
+/-- A PING from A to B through a relay that drops the first `drops`
+datagrams from A, and the answer. A knows B by a record that B signs
+with the relay's port, so every packet passes the relay; the relay
+forwards the rest both ways. -/
+private def pingThroughLoss (ka kb : Crypto.Key32) (drops : Nat) : Conc.Async Bool := do
+  let lo := [127, 0, 0, 1]
+  let a ← Node.start ka lo 0
+  let b ← Node.start kb lo 0
+  let relay ← (Streams.Udp.bind lo 0 : IO Streams.Udp.Socket)
+  let viaRelay : List Libp2p.Identity.Enr.Pair :=
+    [⟨.ip, .bytes lo⟩, ⟨.udp, .bytes (Libp2p.Identity.Rlp.ofScalar relay.port)⟩]
+  let some eb := (Libp2p.Identity.Enr.sign kb 1 viaRelay).toOption
+    | return false
+  let dropped : Conc.OnceRef Nat ← Conc.OnceRef.new 0
+  let ts ← Conc.TaskSet.new
+  ts.spawn do
+    repeat
+      let some (bytes, _, port) ← Streams.Udp.recv relay | break
+      if port == a.port then
+        let n ← (dropped.updateGet fun n => (n + 1, n + 1) : BaseIO Nat)
+        if drops < n then Streams.Udp.send relay bytes lo b.port
+      else if port == b.port then
+        Streams.Udp.send relay bytes lo a.port
+  -- A short deadline per attempt keeps the check fast; the retry gets
+  -- the same one.
+  let pong ← a.ping eb (timeoutMs := 500)
+  Streams.Udp.close relay
+  ts.joinAll
+  a.stop
+  b.stop
+  return pong.isSome
+
+/-- The retry (`Node.requestRetries`, Lighthouse's `request_retries(1)`):
+one lost PING still gets its PONG, and two do not, so the node sends a
+request at most twice. -/
+private def retryChecks (r : Runner) : IO Unit := Conc.Async.run do
+  let some ka := key32 nodeAKey | r.check "discv5 retry: key A" false
+  let some kb := key32 nodeBKey | r.check "discv5 retry: key B" false
+  r.check "discv5 retry: the relay passes a PING with no loss" (← pingThroughLoss ka kb 0)
+  r.check "discv5 retry: one lost PING is sent again and answered" (← pingThroughLoss ka kb 1)
+  r.check "discv5 retry: two lost PINGs end the request" !(← pingThroughLoss ka kb 2)
+
 /-! ## The UDP socket's close -/
 
 /-- `close` wakes a parked receive with `none`, within one second of
@@ -810,6 +854,7 @@ def run (r : Runner) : IO Unit := do
   gethChecks r
   policyChecks r
   udpChecks r
+  retryChecks r
   socketChecks r
   talkChecks r
   ipv6Checks r
