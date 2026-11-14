@@ -1,5 +1,20 @@
 # leanp2p: deferred findings and rejected findings
 
+## State on `experiment/client` (2026-11-14)
+
+Each deferral below has an end. A check of the files on the spike branch
+gives:
+
+| deferral | state | evidence |
+|---|---|---|
+| the cleanup batch of tasks 1, 2, 5, 6, 7, 12, 14, and 15 | done | commit `802305e`, and the files: conc ARCHITECTURE cites §4.1 and §5.4 for `withinDeadline`, the multiformats PLAN cites W5.7 for identify, and the security ARCHITECTURE has the host supply the expectation |
+| the four W0.1 docstrings | done | the W0 cleanup batch below. `Snappy.lean` names W6.2 once. |
+| the "byte floor" term in the bytes pair | done | the bytes ARCHITECTURE, `Bytes.lean`, and `Bytes/Text.lean` now name the package and the model |
+| W0.2c, CI `timeout-minutes` | done | `.github/workflows/ci.yml`, lines 16 and 84 |
+| W0.2c, CI green unverified | closed | the first CI run on `etheorem/leanp2p` passed all five gates ("W0 deferred closure", below) |
+| the multicodec CSV vendor entry | done | `VECTORS.lock` vendors `vendor/multicodec` (`table.csv`) |
+| the `public import` caveat of the lint | standing | `public import` does not compile on the v4.34 pin. The lint's comment asks for a rerun at the next toolchain bump. |
+
 Findings from review that are not blocking. Each carries its file,
 line, and the reviewer's wording. A deferred finding is either fixed in
 a cleanup pass or dropped with a reason. A finding that changes scope

@@ -9,7 +9,7 @@ import Bytes.Blob
 /-!
 # Bytes
 
-The byte floor of the stack (ARCHITECTURE §4.2). It holds the
+The lowest byte package of the stack (ARCHITECTURE §4.2). It holds the
 `List Nat` byte model and its conversions, the `Codec` and
 `LawfulCodec` classes with the shared `DecodeError`, and the generic
 round-trip harness that every later codec package runs.

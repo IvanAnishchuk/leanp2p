@@ -3,7 +3,7 @@ import Bytes.Model
 /-!
 # Hex and UTF-8 conversions
 
-The `String` and hex forms of the byte floor (ARCHITECTURE §4.2). The
+The `String` and hex forms of the byte model (ARCHITECTURE §4.2). The
 model stays the source of truth: `toHex` renders a `ByteArray` as two
 lowercase digits per byte, and `ofHex?` reads that form back. `ofString`
 and `toString?` bridge to UTF-8.

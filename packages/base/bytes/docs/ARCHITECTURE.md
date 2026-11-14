@@ -1,6 +1,6 @@
 # leanp2p bytes: architecture
 
-`base/bytes` is the byte floor of the stack. It holds the conversions
+`base/bytes` is the lowest byte package of the stack. It holds the conversions
 between the `List Nat` byte model and `ByteArray`, `String`, and hex.
 It also holds the `Codec` and `LawfulCodec` classes (§3.2), the shared
 `DecodeError`, and the generic round-trip harness that every later
@@ -70,7 +70,7 @@ follow the spike.
   complete the value) and `malformed` (a protocol error, and the
   reader stops waiting).
 
-The split lives at this floor because every codec shares the type
+The split lives in this package because every codec shares the type
 (ARCHITECTURE §3.2): the vocabulary must exist before the first codec
 lands, and §5.2 needs the distinction at every layer. A model decoder
 sees a finite list, so it cannot report an end of stream. §3.5 keeps
@@ -96,7 +96,7 @@ the budget, such as a non-minimal varint, is `malformed` too.
    model pin once per instance. A codec package writes no round-trip
    loop of its own (ARCHITECTURE §3.2, §6).
 3. **The instance rules start here.** Every wire codec implements
-   `Codec`, so the §3.2 rules bind from this floor up: one instance
+   `Codec`, so the §3.2 rules bind from this package up: one instance
    per type, no instance on `Nat`, `String`, `ByteArray`, `List`, or
    `Option` (wrap the type first), the instance lives with the type,
    no method in `IO`, and instance search stays one step deep.
