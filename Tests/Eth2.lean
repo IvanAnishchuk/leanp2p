@@ -342,6 +342,15 @@ private def serviceChecks (r : Runner) : Async Unit := do
     (← waitUntil (has evB fun | .status p s => p == aPeer && s.forkDigest == digest | _ => false) 5000)
   r.check "eth2 service: the listener gets the dialer's Status"
     (← waitUntil (has evA fun | .status p _ => p == bPeer | _ => false) 5000)
+  -- B's identify answer names B's listeners.
+  let named ← match ← a.base.host.newStream bPeer [Libp2p.Protocols.Identify.protocolId] with
+    | .error _ => pure []
+    | .ok (_, st) =>
+      match ← Libp2p.Protocols.Identify.client st Clock.system 5000 (some bPeer) with
+      | .ok (some (m, _)) => pure m.listenAddrs
+      | _ => pure []
+  r.check "eth2 service: the identify answer names the listeners"
+    (!b.listenAddrs.isEmpty && b.listenAddrs.all fun la => named.contains la.toBytes)
   -- Gossip: both subscribe, and B publishes once A is in B's mesh.
   r.check "eth2 service: the subscribes post" ((← a.subscribe .beaconBlock) && (← b.subscribe .beaconBlock))
   -- A burst past the control queue of the gossipsub node (`inputSlots`,

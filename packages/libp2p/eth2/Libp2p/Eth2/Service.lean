@@ -602,7 +602,6 @@ def start (cfg : Config) : Async Service := do
     peers
     tasks := ← TaskSet.new }
   for h in base.handlers do (host.setHandler h : BaseIO Unit)
-  (host.setHandler (Identify.respondHandler pub [] Base.servedIds "leanp2p") : BaseIO Unit)
   base.watchPeers
   -- Gossip: the payload path, and the held validation. The callback
   -- needs the node, which exists only after the start, so it reads it
@@ -634,6 +633,10 @@ def start (cfg : Config) : Async Service := do
       pure [← orThrow "the QUIC listener does not start" (← host.startListening quicAt)]
     | none => pure []
   let listenAddrs := tcp :: quic
+  -- The identify answer names the listeners, which exist only now. No
+  -- connection comes before them: the first dial is the boot dial below.
+  (host.setHandler (Identify.respondHandler pub (listenAddrs.map (·.toBytes)) Base.servedIds
+    "leanp2p") : BaseIO Unit)
   -- Discovery, with the consensus fields and the libp2p ports in our
   -- record. discv5 writes `ip` and `udp` itself.
   let advert ← orThrow "the ENR fields" (advertPairs cfg.chain epoch cfg.advert)
