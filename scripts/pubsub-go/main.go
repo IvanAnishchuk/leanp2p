@@ -21,11 +21,11 @@
 //
 // With -partial request or -partial support, the node runs the v1.3
 // partial-messages extension on its topic. It prints `PARTIAL <from>
-// data=<data> meta=<metadata>` for each partial message a peer sends,
-// and with -publish-partial it offers one partial message of group `g`
-// every 200 ms. It exits 0 once a partial message arrives whose data has
-// the -expect-partial prefix, or whose metadata has the -expect-meta
-// prefix.
+// data=<data> meta=<metadata>` for each partial message from a peer.
+// With -publish-partial, it offers one partial message of group `g`
+// every 200 ms. It exits 0 when a partial message arrives with data
+// that starts with the -expect-partial prefix. It also exits 0 when the
+// metadata starts with the -expect-meta prefix.
 package main
 
 import (
@@ -41,10 +41,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p-pubsub/partialmessages"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -191,8 +191,8 @@ func nodeMode(args []string) {
 		pubsub.WithNoAuthor(),
 		pubsub.WithMessageIdFn(func(m *pb.Message) string { return string(m.Data) }),
 	}
-	// The partial-messages extension: it prints each partial message, and
-	// the application state per peer is empty, since each offer carries
+	// The partial-messages extension. It prints each partial message. It
+	// keeps no application state per peer, because each offer carries
 	// the whole text.
 	var topicOpts []pubsub.TopicOpt
 	switch *partial {
@@ -329,7 +329,7 @@ func nodeMode(args []string) {
 					count++
 					data := []byte(fmt.Sprintf("%s-%d", *publishPartial, count))
 					// The data goes only to a peer that requested partial
-					// messages; the metadata goes to each peer.
+					// messages. The metadata goes to each peer.
 					actions := func(states map[peer.ID]struct{}, requests func(peer.ID) bool) iter.Seq2[peer.ID, partialmessages.PublishAction] {
 						return func(yield func(peer.ID, partialmessages.PublishAction) bool) {
 							for p := range states {

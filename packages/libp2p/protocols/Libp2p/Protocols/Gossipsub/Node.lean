@@ -32,8 +32,8 @@ and linear copying.
 
 The task set of the node owns the loop, alarm, writer and connector tasks.
 Stop joins them. The host owns the handler tasks of the inbound streams.
-Nothing cancels a task: `stop` closes the event queue, and the close wakes
-the parked loop. It closes the peer-exchange queue too, which wakes the
+Nothing cancels a task: `stop` closes the two input queues, and the close
+wakes the parked loop. It closes the peer-exchange queue too, which wakes the
 parked connectors; a connector inside a dial ends with the dial. The
 router state and pending gossip are local to the loop. Shared registries,
 subscriptions and the closing flag change through OnceRef.update or
@@ -195,8 +195,8 @@ structure Config where
   requested partial messages, in place of their IHAVE
   (`partial-messages.md`, "Partial Message Gossip"). The application
   offers the groups it holds through `Node.sendPartial`, as go's
-  `OnEmitGossip` does. It runs on the loop task, so it must not park;
-  `Node.sendPartial` only queues. -/
+  `OnEmitGossip` does. It runs on the loop task, so it must not park.
+  `Node.sendPartial` only queues, so the callback can call it. -/
   onPartialGossip : TopicId → List Peer → BaseIO Unit := fun _ _ => pure ()
   /-- Serve and speak `/floodsub/1.0.0` (pubsub `README.md`): the
   handler takes floodsub streams, and our writer proposes floodsub last.
@@ -291,8 +291,8 @@ structure Node where
   with its request flag. `none` when the node stopped or its queue is
   full. -/
   partialPeers : TopicId → Conc.Async (Option (List (Peer × Bool)))
-  /-- Close the event queue and join the loop task. The loop serves the
-  queued events first, and drops the gossip that waits for its time. This
+  /-- Close the two input queues and join the loop task. The loop serves
+  the queued inputs first, and drops the gossip that waits for its time. This
   field runs in `Async` because a join parks, and a parked `BaseIO` action would
   hold a thread. A second call does nothing. -/
   stop : Conc.Async Unit
@@ -316,7 +316,10 @@ choice for the topic (`Core.subOpts`). -/
 def subOptRpc (p : Core.Params) (t : TopicId) (on : Bool) : Rpc.RPC :=
   { subscriptions := [Core.subOpts p t on], publish := [], control := none }
 
-/-- The one input queue carries core events and alarm wakes. -/
+/-- An input of the loop: a core event, an alarm wake, a read of the
+router, or a replacement of topic parameters. Inbound RPCs reach the loop
+on one queue. Every other input reaches it on a second queue
+(`nextInput`). -/
 inductive Input where
   | event (e : Core.Event)
   | wake (now : Millis)
@@ -857,18 +860,21 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
   return st
 
-/-- The loop's next input: a queued control input first, then whichever
-queue fills first. A burst of inbound RPCs fills `events` and parks its
-readers, and the control inputs still go first: the heartbeat, the
-application's posts, and the host's joins and leaves. `none` once both
-queues are closed and empty; a closed queue serves its queued inputs
-first.
+/-- The next input of the loop. A queued control input comes first.
+Otherwise the input that arrives first on either queue comes next.
 
-The two queues keep no order between them. A host's leave can pass the
-join a stream handler queued before it; the router then keeps a peer
-that is gone until the next heartbeat, whose `reconcile` runs before the
-mesh plans and drops it. An RPC that passes its peer's leave meets an
-unknown peer, and the core ignores it. -/
+A burst of inbound RPCs can fill `events` and park its readers. The
+control inputs still come first: the heartbeat, the application's posts,
+and the host's joins and leaves.
+
+The answer is `none` when both queues are closed and empty. The loop
+still reads the queued inputs of a closed queue.
+
+The two queues keep no order between them. A host's leave can pass a
+join that a stream handler queued earlier. The router then keeps a
+departed peer until the next heartbeat. That heartbeat's `reconcile`
+drops the peer before the mesh plans. An RPC that passes its peer's
+leave finds an unknown peer, and the core ignores it. -/
 def nextInput {α : Type} (control events : Conc.Chan α) : Conc.Async (Option α) := do
   if let some i ← (control.tryRecv : BaseIO (Option α)) then return some i
   -- Park: an input on either queue wakes it, and so does a close.
@@ -876,12 +882,13 @@ def nextInput {α : Type} (control events : Conc.Chan α) : Conc.Async (Option �
     #[Conc.Park.recv control (true, ·), Conc.Park.recv events (false, ·)]
   match got with
   | some i => return some i
-  -- One queue is closed and empty; the other serves out.
+  -- One queue is closed and empty. Read the other queue until it ends.
   | none => if fromControl then events.recv else control.recv
 
 /-- Run the core through one receive park. Each action returns its state.
-The closed queues serve their queued inputs before `nextInput` returns
-none. The tail closes the alarm and every cached outbound stream. -/
+`nextInput` returns `none` only after the loop reads every queued input
+of the closed queues. The tail closes the alarm and every cached
+outbound stream. -/
 private def loop (env : Env) (st0 : LoopState) : Conc.Async Unit := do
   let mut st := st0
   (env.alarm.set (dueOf st) : BaseIO Unit)
@@ -929,11 +936,14 @@ private def messageOf (topic : TopicId) (payload : ByteArray) : Message :=
     signature := none
     key := none }
 
+/-- The slots of each input queue of the loop. -/
+def inputSlots : Nat := 64
+
 /-- Build the state, register the handler, and start the loop. Each of
-the two queues holds 64 inputs. A full RPC queue parks an inbound
+the two queues holds `inputSlots` inputs. A full RPC queue parks an inbound
 handler, which carries the back-pressure to the peer. A full control
-queue refuses a `BaseIO` post of the application, and the loop serves
-that queue first, so inbound traffic never fills it. -/
+queue refuses a `BaseIO` post of the application. Inbound RPCs never
+enter the control queue, and the loop serves it first. -/
 def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
   -- On the payload path a message's `data` is its handle, the id bytes,
   -- so the core's id function reads it back.
@@ -942,8 +952,10 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
     else config
   let now ← config.clock.nowMs
   let subs : Conc.OnceRef Subscriptions ← Conc.OnceRef.new { next := 0, entries := [] }
-  let events : Conc.Chan Input ← Conc.Chan.new 64
-  let control : Conc.Chan Input ← Conc.Chan.new 64
+  -- `inputSlots` unfolds to a literal, so `decide` proves the capacity
+  -- positive.
+  let events : Conc.Chan Input ← Conc.Chan.new inputSlots (by decide)
+  let control : Conc.Chan Input ← Conc.Chan.new inputSlots (by decide)
   let versions ← Conc.OnceRef.new ([] : List (Peer × Libp2p.Core.ProtocolId))
   let record (q : Peer) (id : Libp2p.Core.ProtocolId) : BaseIO Unit :=
     versions.update fun l => (q, id) :: l.filter (·.1 != q)

@@ -329,27 +329,30 @@ Both spike programs call `Ping.ping`.
   feature. The consensus spec does not use floodsub; go and Lodestar
   speak it by default, rust-libp2p and Lighthouse do not, and the node
   leaves it off by default.
-- **Partial-message gossip goes to the application.** At each heartbeat
-  the core picks the gossip targets of a topic as before, then splits
-  them: a target that requested partial messages gets no IHAVE, and the
-  core emits one `partialGossip` with all such targets
-  (`partial-messages.md`, "Partial Message Gossip": "The node SHOULD send
-  a partial message instead"). The node hands it to
-  `Config.onPartialGossip`, and the application answers through
-  `sendPartial`, since only the application knows its groups. This is
-  go-libp2p-pubsub's split (`emitGossip`, then `OnEmitGossip`), and the
-  offer goes out with an empty message cache, as go's does.
-  rust-libp2p keeps the groups in the library and also offers metadata
-  to non-mesh peers that only support partial messages; the spec asks
-  only for the requesters, so the core follows go.
+- **Partial-message gossip goes to the application.** At each
+  heartbeat, the core picks the gossip targets of a topic as before.
+  A target that requested partial messages gets no IHAVE. The core emits
+  one `partialGossip` action that names all such targets
+  (`partial-messages.md`, "Partial Message Gossip": "The node SHOULD
+  send a partial message instead"). The node passes the action to
+  `Config.onPartialGossip`. The application answers through
+  `sendPartial`, because only the application knows its groups.
+- **The partial-message gossip follows go.** go-libp2p-pubsub splits
+  the gossip targets the same way (`emitGossip`, then `OnEmitGossip`).
+  Like go, the core makes the offer also when the message cache is
+  empty. rust-libp2p keeps the groups in the library. It also offers
+  metadata to non-mesh peers that only support partial messages. The
+  spec asks only for the requesters, so the core follows go.
 - **Control inputs have their own queue.** The loop reads two queues of
-  64: inbound RPCs, whose full queue parks the reader and so pushes back
-  on the peer, and everything else (the heartbeat, the application's
-  posts and reads, the host's notices), which the loop serves first
-  (`Node.nextInput`). A burst of RPCs then cannot refuse a validation
-  answer or delay a heartbeat. The queues keep no order between them, so
-  a host's leave can pass a handler's queued join; the next heartbeat's
-  `reconcile` drops the peer before the mesh plans.
+  `Node.inputSlots` (64) inputs each. The first queue holds the inbound
+  RPCs. A full RPC queue parks the reader, so the back-pressure reaches
+  the peer. The second queue holds every other input: the heartbeat,
+  the application's posts and reads, and the host's notices. The loop
+  serves the second queue first (`Node.nextInput`). So a burst of RPCs
+  cannot refuse a validation answer or delay a heartbeat.
+- **The two input queues keep no order between them.** A host's leave
+  can pass a join that a stream handler queued earlier. The next
+  heartbeat's `reconcile` then drops the peer before the mesh plans.
 - **The suite runs between two hosts over the sim.** `Tests/HostPair.lean`
   builds two real hosts on the test values of root §3.1: the sim
   transport, the fixed-key Noise value, and a test clock, with yamux. The

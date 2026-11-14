@@ -2,27 +2,33 @@
 //! (scripts/pubsub-rust-interop.sh): rust-libp2p's gossipsub at the clone's
 //! c449090, with the v1.3 partial-messages extension.
 //!
-//! Usage: `pubsub-rust request|support ADDR SECS`. The node takes the
-//! Ed25519 key of 32 bytes of `R`, dials ADDR, enables partial messages on
-//! the topic `interop` (requesting them, or only supporting them), and
-//! subscribes. Every 200 ms it publishes the full message
-//! `from-rust-full-<n>` and the partial message of group `g<n>` with data
-//! `from-rust-partial-<n>` and metadata `meta-rust-<n>`; rust sends the data
-//! only to a peer that requested it. It prints `PARTIAL <peer> data=<data>
-//! meta=<metadata>` for each partial message and `GOT <data>` for each full
-//! message. It exits 0 two seconds after the first partial message that
-//! shows the peer honours our choice: data `from-lean-partial` when we
-//! request, metadata `meta-lean` when we only support. It exits 1 at SECS.
+//! Usage: `pubsub-rust request|support ADDR SECS`.
+//!
+//! 1. The node takes the Ed25519 key of 32 bytes of `R`, and dials ADDR.
+//! 2. It enables partial messages on the topic `interop`. It requests
+//!    them, or it only supports them.
+//! 3. It subscribes to the topic.
+//! 4. Every 200 ms, it publishes the full message `from-rust-full-<n>`.
+//!    In the same round, it publishes the partial message of group `g<n>`,
+//!    with data `from-rust-partial-<n>` and metadata `meta-rust-<n>`. rust
+//!    sends the data only to a peer that requested it.
+//!
+//! The node prints `PARTIAL <peer> data=<data> meta=<metadata>` for each
+//! partial message. It prints `GOT <data>` for each full message. The
+//! first partial message that shows our choice at work ends the check:
+//! data `from-lean-partial` when we request, and metadata `meta-lean` when
+//! we only support. The node exits 0 two seconds after that message. It
+//! exits 1 at SECS.
 
 use std::time::{Duration, Instant};
 
-use libp2p::{
-    Multiaddr, PeerId, futures::StreamExt, gossipsub, identity, noise,
-    swarm::SwarmEvent, tcp, yamux,
-};
 use libp2p::gossipsub::partial_messages::{Metadata, Partial, PartialAction, PartialError};
+use libp2p::{
+    Multiaddr, PeerId, futures::StreamExt, gossipsub, identity, noise, swarm::SwarmEvent, tcp,
+    yamux,
+};
 
-/// Metadata that is its bytes; an update replaces it.
+/// Metadata as plain bytes. An update replaces the bytes.
 #[derive(Debug, Clone)]
 struct Meta(Vec<u8>);
 
@@ -53,8 +59,8 @@ impl Partial for Part {
     fn metadata(&self) -> Box<dyn Metadata> {
         Box::new(self.meta.clone())
     }
-    // The part goes to each requester whatever it holds, and each inbound
-    // part goes to the application.
+    // Send the part to each requester, whatever the requester holds.
+    // Give each inbound part to the application.
     fn partial_action_from_metadata(
         &self,
         _peer: PeerId,
@@ -83,8 +89,12 @@ async fn main() {
         "support" => false,
         other => die(format!("mode {other}")),
     };
-    let target: Multiaddr = args[2].parse().unwrap_or_else(|e| die(format!("address: {e}")));
-    let secs: u64 = args[3].parse().unwrap_or_else(|e| die(format!("seconds: {e}")));
+    let target: Multiaddr = args[2]
+        .parse()
+        .unwrap_or_else(|e| die(format!("address: {e}")));
+    let secs: u64 = args[3]
+        .parse()
+        .unwrap_or_else(|e| die(format!("seconds: {e}")));
 
     let key = identity::Keypair::ed25519_from_bytes([b'R'; 32])
         .unwrap_or_else(|e| die(format!("key: {e}")));
@@ -101,17 +111,25 @@ async fn main() {
     let topic = gossipsub::IdentTopic::new("interop");
     // Partial messages must be enabled before the subscription.
     behaviour.enable_partials_for_topic(topic.hash(), requests);
-    behaviour.subscribe(&topic).unwrap_or_else(|e| die(format!("subscribe: {e}")));
+    behaviour
+        .subscribe(&topic)
+        .unwrap_or_else(|e| die(format!("subscribe: {e}")));
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
         .unwrap_or_else(|e| die(format!("transport: {e}")))
         .with_behaviour(|_| behaviour)
         .unwrap_or_else(|e| die(format!("behaviour: {e}")))
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
-    swarm.dial(target).unwrap_or_else(|e| die(format!("dial: {e}")));
+    swarm
+        .dial(target)
+        .unwrap_or_else(|e| die(format!("dial: {e}")));
 
     let deadline = tokio::time::sleep(Duration::from_secs(secs));
     tokio::pin!(deadline);
@@ -130,7 +148,7 @@ async fn main() {
                 }
                 count += 1;
                 let gs = swarm.behaviour_mut();
-                // Both fail until a peer subscribes; the next round retries.
+                // Both fail until a peer subscribes. The next round tries again.
                 let _ = gs.publish(topic.clone(), format!("from-rust-full-{count}"));
                 let _ = gs.publish_partial(topic.clone(), Part {
                     group: format!("g{count}").into_bytes(),

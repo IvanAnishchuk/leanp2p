@@ -12,14 +12,15 @@ import Libp2p.Protocols.Gossipsub.Node
 /-!
 # The pubsub interop driver
 
-The Lean side of the checks against go-libp2p-pubsub v0.19.0 over
-go-libp2p v0.51.0; `scripts/pubsub-interop.sh` builds the go side
-(`scripts/pubsub-go/`) and runs every mode below over loopback TCP. Our
-host runs TCP, Noise, and yamux, and answers identify with its signed
-peer record.
+The Lean side of the pubsub checks over loopback TCP. Two scripts run
+the modes below. `scripts/pubsub-interop.sh` checks against
+go-libp2p-pubsub v0.19.0 over go-libp2p v0.51.0 (`scripts/pubsub-go/`).
+`scripts/pubsub-rust-interop.sh` checks against the gossipsub of
+rust-libp2p (`scripts/pubsub-rust/`). Our host runs TCP, Noise, and
+yamux. It answers identify with its signed peer record.
 
 * `pubsub-interop record SEQ ADDR...`: print the hex of our signed peer
-  record (seed `L`); go's `verify` consumes it.
+  record (seed `L`). go's `verify` consumes it.
 * `pubsub-interop floodsub ADDR`: a node with floodsub on dials a go
   floodsub-only node, publishes `from-lean`, and waits for `from-go`.
   go speaks no meshsub, so both directions negotiate `/floodsub/1.0.0`.
@@ -27,24 +28,29 @@ peer record.
   exchange on and a full mesh, give it a positive app score (the spec's
   bootstrapper setup), and join the topic. go prunes our GRAFT with the
   other peers of its mesh and their signed records. The check passes
-  once we connect to one of them; their addresses reach us only through
+  when we connect to one of them. Their addresses reach us only through
   the records.
 * `pubsub-interop px-send PORT SECS`: listen with peer exchange on and a
-  mesh bound of two, ask each new peer for identify so its signed record
-  enters the host, and serve for SECS seconds. The script's go nodes
-  join; the last one's GRAFT finds the mesh full and gets our prune,
-  and that go node passes when it connects to a peer it only learned
-  from our records.
-* `pubsub-interop partial ADDR`: request partial messages (gossipsub
-  v1.3) on the topic, dial a go node that runs the extension, and each
-  200 ms offer it a partial message of group `g` and publish a full
-  message. The check passes once go's partial data reaches us, and only
-  if no full message from go arrived: go must honour our request. The
-  script checks the go side: a go requester gets our data and none of our
-  full messages, and a go supporter gets our metadata without the data.
-* `pubsub-interop partial-listen PORT`: the same check with a
-  rust-libp2p node, which dials us (`scripts/pubsub-rust-interop.sh`).
-  We pass once its data `from-rust-partial` arrives.
+  mesh bound of two. Ask each new peer for identify, so its signed
+  record enters the host. Serve for SECS seconds. The go nodes of the
+  script join. The GRAFT of the last one finds the mesh full and gets
+  our prune. That go node passes when it connects to a peer that it
+  knows only from our records.
+* `pubsub-interop partial ADDR`: the partial-messages check (gossipsub
+  v1.3) against go.
+  1. Request partial messages on the topic.
+  2. Dial the go node at ADDR, which runs the extension.
+  3. Every 200 ms, offer it a partial message of group `g`. Publish a
+     full message in the same round.
+
+  The check passes when the partial data of go reaches us, and no full
+  message from go arrived. go must honour our request. The script checks
+  the go side. A go requester must get our data and no full message. A
+  go supporter must get our metadata without the data.
+* `pubsub-interop partial-listen PORT`: the same check against
+  rust-libp2p. We listen on PORT, and the rust node dials us
+  (`scripts/pubsub-rust-interop.sh`). The check passes when the rust
+  data `from-rust-partial` arrives.
 
 Each mode exits 0 on success. The seeds are one character, 32 times, as
 the go side builds them.
@@ -234,7 +240,8 @@ def partialOf (data parts : String) : Rpc.PartialMessage :=
     partsMetadata := some (Bytes.toNatList parts.toUTF8) }
 
 /-- The partial-messages check against a peer whose partial data starts
-with `expected`. We dial `target`, or listen on `listen` for the peer. -/
+with `expected`. We dial `target`, or we listen on `listen` for the
+peer. -/
 def partialMode (expected : String) (target listen : Option String) : Async UInt32 := do
   let base := Core.defaults
   let params : Core.Params :=
@@ -252,8 +259,8 @@ def partialMode (expected : String) (target listen : Option String) : Async UInt
   -- We requested partial messages, so the peer must send us no full
   -- message.
   discard (running.node.subscribe topic fun _ => fulls.update (· + 1) : BaseIO Bool)
-  -- Each round offers a partial message to each peer that can take one,
-  -- and publishes a full message, which a requester must not get.
+  -- Each round offers a partial message to each peer that can take one.
+  -- It also publishes a full message, which a requester must not get.
   let count : OnceRef Nat ← OnceRef.new 0
   let round : Async Unit := do
     let n ← (count.updateGet fun n => (n + 1, n + 1) : BaseIO Nat)
@@ -263,7 +270,7 @@ def partialMode (expected : String) (target listen : Option String) : Async UInt
   let ok ← waitFor 20000 do
     round
     return (← (got.get : BaseIO (Option String))).isSome
-  -- Keep offering a moment, so the peer sees ours too.
+  -- Offer for one more second, so the peer gets our partial messages too.
   for _ in [0:5] do
     round
     sleep 200

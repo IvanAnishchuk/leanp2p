@@ -254,17 +254,17 @@ def run (r : Runner) : IO Unit := do
     ((sentTo pa acts).all (!hasIhave ·))
   r.check "core: gossip reaches the other non-mesh peer"
     ((sentTo pc acts).any hasIhave)
-  -- In place of the IHAVE, the application offers its partial messages
-  -- to the requesting gossip target, and only to it.
+  -- In place of the IHAVE, the core names the requesting gossip target
+  -- to the application. It names no other target.
   let offers := acts.filterMap fun a => match a with
     | .partialGossip t ps => some (t, ps)
     | _ => none
   r.check "core: the heartbeat offers partial messages to the requester"
     (offers == [(ta, [pa])])
-  -- Partial messages never enter the cache, so the offer goes out with
-  -- no full message to gossip.
+  -- Partial messages never enter the message cache. So the core makes
+  -- the offer also when the cache holds no message.
   let (_, quiet) := runAll s1 [.tick params.heartbeatInterval [pa, pb, pc]]
-  r.check "core: the offer goes out with an empty message cache"
+  r.check "core: the core makes the offer with an empty message cache"
     (quiet.any (· == .partialGossip ta [pa]) && quiet.all fun a => match a with
       | .sendRpc _ r => !hasIhave r
       | _ => true)

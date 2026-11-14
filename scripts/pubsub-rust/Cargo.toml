@@ -5,9 +5,9 @@ edition = "2024"
 publish = false
 description = "pubsub interop helper: rust-libp2p gossipsub with partial messages against the leanp2p node"
 
-# rust-libp2p from the local clone (../p2p/rust-libp2p at c449090, which
-# scripts/pubsub-rust-interop.sh checks), with gossipsub's v1.3 partial
-# messages turned on.
+# rust-libp2p comes from the local clone (../p2p/rust-libp2p at c449090).
+# scripts/pubsub-rust-interop.sh checks that commit. The
+# `gossipsub-partial-messages` feature enables the v1.3 partial messages.
 [dependencies]
 libp2p = { path = "../../../p2p/rust-libp2p/libp2p", features = [
   "ed25519", "gossipsub", "gossipsub-partial-messages", "macros", "noise", "tcp", "tokio", "yamux",

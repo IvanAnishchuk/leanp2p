@@ -210,31 +210,43 @@ node half against go-libp2p-pubsub v0.19.0.
 
 ## Test milestones (partial messages)
 
+A requester is a peer that requested partial messages on a topic. A
+supporter is a peer that can send partial messages on a topic and did
+not request them.
+
 The core half runs in `Tests/Gossipsub/Partial.lean`
 (`LEANP2P_SUITE=partial`). `scripts/pubsub-interop.sh` checks the node
-half against go-libp2p-pubsub v0.19.0, and
-`scripts/pubsub-rust-interop.sh` against rust-libp2p's gossipsub at
-`c449090` with its `partial-messages` feature.
+half against go-libp2p-pubsub v0.19.0. `scripts/pubsub-rust-interop.sh`
+checks it against the gossipsub of rust-libp2p at `c449090`, with the
+`partial-messages` feature on.
 
-- Theorems: `mem_partialGossip` (the heartbeat offer names only gossip
-  targets that requested partial messages), `gossipActions_no_ihave_partial`
-  (no IHAVE reaches such a peer), `gossipTargets_score`, and
-  `gossipTargets_off_mesh`.
-- The wire: the `SubOpts` flags, the Extensions message, and the partial
-  RPC at their field numbers, in field order.
-- The core: the behavior table of `SubOpts`, no full message to a
-  requester, the data only to a requester and the metadata to a
-  supporter, inbound partial messages to the application, the P₇
-  penalties, and the heartbeat offer, also with an empty cache and never
-  on a full-message topic.
-- The node: a control input goes before a full RPC queue, the RPCs keep
-  their order, and the closed queues serve out (`node.input.*`).
-- Interop, against each of go and rust: a requester and our node
-  exchange partial data both ways, and neither gets a full message from
-  the other; a peer that only supports partial messages gets our
-  metadata without the data, and we get its data. The supporter also
-  gets our full messages, which shows the requester's absence of them is
-  the rule at work.
+- Theorems:
+  - `mem_partialGossip`: the heartbeat offer names only gossip targets
+    that are requesters.
+  - `gossipActions_no_ihave_partial`: no IHAVE reaches a requester.
+  - `gossipTargets_score`: each gossip target is at or above the gossip
+    threshold.
+  - `gossipTargets_off_mesh`: no gossip target is in the mesh or the
+    fanout of the topic.
+- The wire: the `SubOpts` flags, the Extensions message, and the
+  partial RPC sit at their field numbers, in field order.
+- The core:
+  - the behavior table of `SubOpts`
+  - no full message to a requester
+  - the data only to a requester, and the metadata to a supporter
+  - each inbound partial message to the application
+  - the P₇ penalties
+  - the heartbeat offer, also with an empty message cache, and never on
+    a full-message topic
+- The node: a control input comes before a full RPC queue. The RPCs keep
+  their order. After a close, the loop still reads every queued input
+  (`node.input.*`).
+- Interop, against go and against rust:
+  - A requester and our node exchange partial data in both directions.
+    Neither side gets a full message from the other.
+  - A supporter gets our metadata without the data. We get its data.
+  - The supporter also gets our full messages. So full messages do
+    flow, and the zero count at the requester comes from the rule.
 
 ## Vector stance
 

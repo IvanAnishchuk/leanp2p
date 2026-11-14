@@ -1067,6 +1067,13 @@ interface seams exist, and no implementation work is scheduled.
   and discv5 does the discovery. Teku sends peer exchange, and go and
   Lodestar speak floodsub, so the spike built both (`libp2p/protocols`
   docs), each off by default.
+- Gossipsub v1.2 (IDONTWANT) and v1.3 (the Extensions message and
+  partial messages). No phase spec requires them. The Fulu
+  `partial-columns` feature sends data columns as partial messages.
+  go-libp2p-pubsub and rust-libp2p speak `/meshsub/1.3.0` and
+  `/meshsub/1.2.0`. The spike built both versions (`libp2p/protocols`
+  docs). Its interop scripts check partial messages against go and rust
+  over real sockets.
 
 **Not needed for consensus (defer, keep the seams only):**
 

@@ -426,10 +426,11 @@ private def udpChecks (r : Runner) : IO Unit := Conc.Async.run do
 
 /-! ## A lost datagram -/
 
-/-- A PING from A to B through a relay that drops the first `drops`
-datagrams from A, and the answer. A knows B by a record that B signs
-with the relay's port, so every packet passes the relay; the relay
-forwards the rest both ways. -/
+/-- Send a PING from A to B through a relay, and answer whether a PONG
+came back. The relay drops the first `drops` datagrams from A. A knows B
+by a record that B signs with the relay's port, so every packet passes
+through the relay. The relay forwards every other datagram in both
+directions. -/
 private def pingThroughLoss (ka kb : Crypto.Key32) (drops : Nat) : Conc.Async Bool := do
   let lo := [127, 0, 0, 1]
   let a ← Node.start ka lo 0
@@ -443,14 +444,15 @@ private def pingThroughLoss (ka kb : Crypto.Key32) (drops : Nat) : Conc.Async Bo
   let ts ← Conc.TaskSet.new
   ts.spawn do
     repeat
+      -- Park: a datagram arrives, or the close below wakes it with `none`.
       let some (bytes, _, port) ← Streams.Udp.recv relay | break
       if port == a.port then
         let n ← (dropped.updateGet fun n => (n + 1, n + 1) : BaseIO Nat)
         if drops < n then Streams.Udp.send relay bytes lo b.port
       else if port == b.port then
         Streams.Udp.send relay bytes lo a.port
-  -- A short deadline per attempt keeps the check fast; the retry gets
-  -- the same one.
+  -- A short deadline keeps the check fast. The retry gets the same
+  -- deadline.
   let pong ← a.ping eb (timeoutMs := 500)
   Streams.Udp.close relay
   ts.joinAll
@@ -458,9 +460,10 @@ private def pingThroughLoss (ka kb : Crypto.Key32) (drops : Nat) : Conc.Async Bo
   b.stop
   return pong.isSome
 
-/-- The retry (`Node.requestRetries`, Lighthouse's `request_retries(1)`):
-one lost PING still gets its PONG, and two do not, so the node sends a
-request at most twice. -/
+/-- The retry checks (`Node.requestRetries`, Lighthouse's
+`request_retries(1)`). After one lost PING, the PONG still comes. After
+two lost PINGs, the request ends. So the node sends a request at most
+twice. -/
 private def retryChecks (r : Runner) : IO Unit := Conc.Async.run do
   let some ka := key32 nodeAKey | r.check "discv5 retry: key A" false
   let some kb := key32 nodeBKey | r.check "discv5 retry: key B" false

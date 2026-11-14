@@ -21,10 +21,10 @@
 #    A1 and A2 fill our mesh, then A3 joins. Our prune of A3 names A1 and
 #    A2 with their records, and A3 passes when it connects to one of them.
 # 5. partial requester: a go node that requests partial messages (v1.3)
-#    and we exchange partial data both ways, and neither side gets a full
-#    message from the other.
+#    and our node exchange partial data in both directions. Neither side
+#    gets a full message from the other.
 # 6. partial supporter: a go node that only supports partial messages
-#    gets our metadata without the data, and we get its data.
+#    gets our metadata without the data. We get its data.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -153,8 +153,8 @@ else
 fi
 cleanup
 
-# 5. Partial messages with a go requester: each side gets the other's
-# partial data, and neither gets a full message from the other.
+# 5. Partial messages with a go requester. Each side gets the partial
+# data of the other. Neither side gets a full message from the other.
 go_node partr -seed P -partial request -publish from-go-full -publish-partial from-go-partial \
   -expect-partial from-lean-partial -timeout 30
 if "$lean" partial "$addr" >"$out/lean-partr.out" 2>"$out/lean-partr.err" && wait "$pid" &&
@@ -168,8 +168,8 @@ else
 fi
 cleanup
 
-# 6. Partial messages with a go node that only supports them: go gets our
-# metadata and never our data, and we still get go's data.
+# 6. Partial messages with a go node that only supports them. go gets our
+# metadata and never our data. We still get the data of go.
 go_node parts -seed Q -partial support -publish from-go-full -publish-partial from-go-partial \
   -expect-meta meta-lean -timeout 30
 if "$lean" partial "$addr" >"$out/lean-parts.out" 2>"$out/lean-parts.err" && wait "$pid" &&

@@ -767,9 +767,9 @@ private def publisherOrder (r : Tests.Runner) : Async Unit := do
   IO.println s!"node.measure.publishers countA={seqA.length} countB={seqB.length} streamsA={oa} streamsB={ob} inversionsA={ia} inversionsB={ib}"
   finish sw [a,b,sink]
 
-/-- The loop's input order (`nextInput`): a control input goes before a
-backlog of RPCs, the backlog keeps its order, and the closed queues
-serve out before the end. -/
+/-- The input order of the loop (`nextInput`). A control input comes
+before a backlog of RPCs. The backlog keeps its order. After a close,
+the loop still reads every queued input before the end. -/
 private def inputOrderChecks (r : Tests.Runner) : Async Unit := do
   let control ← (Chan.new 64 : BaseIO (Chan Nat))
   let events ← (Chan.new 64 : BaseIO (Chan Nat))
@@ -780,10 +780,10 @@ private def inputOrderChecks (r : Tests.Runner) : Async Unit := do
   r.check "node.input.control-before-a-full-rpc-queue" ((← nextInput control events) == some 1)
   r.check "node.input.rpcs-in-order"
     ((← nextInput control events) == some 100 && (← nextInput control events) == some 101)
-  -- A control input that comes amid the backlog still goes next.
+  -- A control input that arrives during the backlog is the next input.
   discard (control.trySend 2 : BaseIO Bool)
   r.check "node.input.late-control-goes-next" ((← nextInput control events) == some 2)
-  -- Stop closes both queues; the queued inputs still come out.
+  -- Stop closes both queues. The loop still reads the queued inputs.
   discard (control.trySend 3 : BaseIO Bool)
   (control.close : BaseIO Unit)
   (events.close : BaseIO Unit)
@@ -792,7 +792,7 @@ private def inputOrderChecks (r : Tests.Runner) : Async Unit := do
     match ← nextInput control events with
     | some i => rest := rest ++ [i]
     | none => break
-  r.check "node.input.closed-queues-serve-out"
+  r.check "node.input.closed-queues-keep-queued-inputs"
     (rest == 3 :: (List.range 62).map (102 + ·))
   r.check "node.input.none-after-both-close" ((← nextInput control events).isNone)
 

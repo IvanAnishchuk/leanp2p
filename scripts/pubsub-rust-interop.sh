@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Partial-messages interoperability (gossipsub v1.3) with rust-libp2p's
-# gossipsub, the implementation Lighthouse runs, built from the clone
-# beside the repo (../p2p/rust-libp2p at c449090) with its
-# `partial-messages` feature.
+# Partial-messages interoperability (gossipsub v1.3) with the gossipsub
+# of rust-libp2p, which Lighthouse runs. The helper builds from the clone
+# beside the repo (../p2p/rust-libp2p at c449090), with the
+# `partial-messages` feature on.
 #
 # The helper (scripts/pubsub-rust) dials our `pubsub-interop
 # partial-listen` node, which requests partial messages on the topic.
 #
-# 1. rust requester: each side gets the other's partial data, and neither
-#    gets a full message from the other.
-# 2. rust supporter: rust gets our metadata without the data, and we get
-#    its data.
+# 1. rust requester: each side gets the partial data of the other.
+#    Neither side gets a full message from the other.
+# 2. rust supporter: rust gets our metadata without the data. We get its
+#    data.
 #
-# The helper builds with cargo on two cores into
+# Cargo builds the helper on two cores into
 # .tmp/pubsub-interop/rust-target.
 set -euo pipefail
 
@@ -47,7 +47,7 @@ fi
 
 status=0
 
-# Start our node in the background and wait for its ADDR line; sets `addr`.
+# Start our node in the background. Wait for its ADDR line, and set `addr`.
 lean_node() {
   "$lean" partial-listen "$port" >"$out/lean-$1.out" 2>"$out/lean-$1.err" &
   pid=$!

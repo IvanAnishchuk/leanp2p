@@ -45,9 +45,10 @@ fork-digest match on `eth2` and a subnet match on `attnets` or
   check in the suite.
 - Real sockets: two nodes over UDP, over IPv6, the TALK handler, and
   the liveness checks, with a record pull on a higher `seq`.
-- A lost datagram: a relay between two nodes drops the first PINGs. One
-  loss still gets its PONG through the retry, and two end the request,
-  so a request goes out at most twice (`Node.requestRetries`).
+- A lost datagram: a relay between two nodes drops the first PINGs.
+  After one loss, the retry still gets the PONG. After two losses, the
+  request ends. So the node sends a request at most twice
+  (`Node.requestRetries`).
 
 The conformance runs are outside `lake test`, which stays free of Go
 and Rust tooling:

@@ -30,9 +30,9 @@ shifts the message cache. The recipients are peers of the supplied order
 at or above the gossip threshold that are in neither the mesh nor the
 fanout of the topic. Their count is adaptive: at least `dLazy`, and
 `gossipFactor` percent of the candidates when that is more. A recipient
-that requested partial messages on the topic gets no IHAVE; the
-application gets one `Action.partialGossip` that names all such
-recipients, and offers them its partial messages.
+that requested partial messages on the topic gets no IHAVE. In its
+place, one `Action.partialGossip` names all such recipients to the
+application. The application then offers them its partial messages.
 
 Floodsub peers (`PubsubProto.floodsub`) are a separate forward set
 (`floodTargets`): they join no mesh, take no gossip, and get every
@@ -342,8 +342,8 @@ inductive Action where
   or not (`partial-messages.md`, "Application-Library Interface"). -/
   | partialIn (source : Peer) (msg : Rpc.PartialMessage)
   /-- Offer partial messages on a topic to the gossip targets of the
-  heartbeat that requested them, in place of an IHAVE
-  (`partial-messages.md`, "Partial Message Gossip"). The application
+  heartbeat that requested them. The offer takes the place of an IHAVE
+  (`partial-messages.md`, "Partial Message Gossip"). Only the application
   knows its groups, so it answers through `sendPartial`, as go's
   `OnEmitGossip` does. -/
   | partialGossip (topic : TopicId) (peers : List Peer)
@@ -780,26 +780,29 @@ def settleMesh (p : Params) (s : State) (plans : List TopicPlan) : State :=
           score := s.topics.foldl (fun sc t => Score.prune p.score sc s.now t) e.2.score }
       else e.2)) }
 
-/-- The gossip targets of a topic: the peers of the order at or above the
-gossip threshold, skipping the peers that already sit in the topic's
-mesh or fanout and the floodsub peers. Adaptive gossip
-(`gossipsub-v1.1.md`, lines 165 to 184) takes at least `dLazy` of them,
-and `gossipFactor` percent of them when that is more. -/
+/-- The gossip targets of a topic. A candidate is a peer of the order at
+or above the gossip threshold. The candidates exclude the peers of the
+topic's mesh and fanout, and the floodsub peers. Adaptive gossip
+(`gossipsub-v1.1.md`, lines 165 to 184) takes at least `dLazy`
+candidates. When `gossipFactor` percent of the candidates is more, it
+takes that many. -/
 def gossipTargets (p : Params) (s : State) (order : List Peer) (t : TopicId) : List Peer :=
   let cands := order.filter (fun q =>
     decide (p.thresholds.gossipThreshold ≤ scoreOf p s q) &&
       !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !isFlood s q)
   cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
 
-/-- The gossip actions of each topic of the mesh and the fanout. A target
-that takes partial messages on the topic gets no IHAVE; the application
-gets one `partialGossip` with all such targets in its place
-(`partial-messages.md`, "Partial Message Gossip"). Each other target
-gets the topic's gossip ids. The partial targets are chosen first, from
-the same draw, as go-libp2p-pubsub's `emitGossip` does, and the offer
-goes out even when the cache holds no id, since partial messages never
-enter the cache. The ids come from the cache as it stands, so a
-heartbeat emits gossip before it shifts the cache. -/
+/-- The gossip actions of each topic of the mesh and the fanout. The core
+draws the targets of a topic (`gossipTargets`), then splits them, as
+go-libp2p-pubsub's `emitGossip` does. A target that takes partial
+messages on the topic gets no IHAVE. In its place, one `partialGossip`
+names all such targets (`partial-messages.md`, "Partial Message
+Gossip"). Each other target gets an IHAVE with the gossip ids of the
+topic.
+
+Partial messages never enter the message cache. So the core makes the
+offer also when the cache holds no id. The ids come from the cache as it
+stands, so a heartbeat emits gossip before it shifts the cache. -/
 def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
   let topics := s.mesh.map Prod.fst ++ s.fanout.map Prod.fst
   topics.flatMap fun t =>
@@ -2356,9 +2359,13 @@ theorem mem_gossipActions (p : Params) (s : State) (order : List Peer)
   · split at ht <;> simp at ht
 
 /-- The partial-gossip offer of a heartbeat names only gossip targets that
-requested partial messages on the topic, so it never reaches a mesh or
-fanout peer, a peer below the gossip threshold, or a peer that takes full
-messages (`partial-messages.md`, "Partial Message Gossip"). -/
+requested partial messages on the topic (`partial-messages.md`, "Partial
+Message Gossip"). With `gossipTargets_score` and `gossipTargets_off_mesh`,
+the offer reaches none of these peers:
+
+- a peer of the mesh or the fanout of the topic
+- a peer below the gossip threshold
+- a peer that takes full messages -/
 theorem mem_partialGossip (p : Params) (s : State) (order : List Peer)
     (t : TopicId) (peers : List Peer) (q : Peer)
     (h : Action.partialGossip t peers ∈ gossipActions p s order) (hq : q ∈ peers) :
