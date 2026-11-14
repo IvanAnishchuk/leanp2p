@@ -933,9 +933,12 @@ and most already have a regression test in the spike.
 3. **Half-close follows the muxer spec exactly.** In mplex and yamux,
    close ends the write direction of the closer. The response after our
    FIN must still arrive.
-4. **Unauthenticated phases have a deadline** (`withinDeadline`; 30 s,
-   as in go). A silent dial or listener fails, and no task parks
-   forever. The deadline covers only the unauthenticated phase. An
+4. **Unauthenticated phases have a deadline** (`withinDeadline`; 30 s).
+   go-libp2p v0.50.0 bounds an inbound upgrade and a dial at 15 s
+   (`upgrader.go`, line 31; `swarm.go`, line 29), and Lighthouse bounds
+   its upgrade at 10 s (`service/utils.rs`, lines 59 and 67), so those
+   peers give up first. A silent dial or
+   listener fails, and no task parks forever. The deadline covers only the unauthenticated phase. An
    authenticated connection that sits idle never expires.
 5. **Deterministic shutdown.** The order is: set the closing flag →
    close the listeners → close the pending (unauthenticated)
