@@ -216,6 +216,47 @@ private def scoringChecks (r : Runner) : IO Unit := do
     (params.score.topics ⟨topicOf ⟨#[1, 2, 3, 4]⟩ .beaconBlock⟩).isNone
   r.check "scoring: the score retention is 100 epochs" (params.retainScore == 38400000)
 
+/-! ## The fork schedule -/
+
+private def forkChecks (r : Runner) : IO Unit := do
+  let c0 ← devnetChain
+  -- A Blob-Parameters-Only fork at epoch 10 changes the digest.
+  let c := { c0 with blobSchedule := c0.blobSchedule ++
+    [({ epoch := 10, maxBlobsPerBlock := 99 } : BlobEntry)] }
+  let pre ← expectOk "digest" (c.forkDigest 9)
+  let post ← expectOk "digest" (c.forkDigest 10)
+  let run (st : ForkState) (epoch : Nat) : IO (List ForkAction × ForkState) :=
+    expectOk "step" (st.step c epoch)
+  let isSub (d : ByteArray) : ForkAction → Bool
+    | .subscribe d' => d' == d
+    | _ => false
+  let isSwitch : ForkAction → Bool
+    | .switch o n => o == pre && n == post
+    | _ => false
+  let isUnsub (d : ByteArray) : ForkAction → Bool
+    | .unsubscribe d' => d' == d
+    | _ => false
+  let s0 : ForkState := { current := pre }
+  let (a8, s8) ← run s0 8
+  r.check "forks: two epochs before the fork, nothing is due" a8.isEmpty
+  let (a9, s9) ← run s8 9
+  r.check "forks: one epoch before the fork, the post-fork topics are joined"
+    (a9.length == 1 && a9.all (isSub post) && s9.next == some post)
+  let (a9b, _) ← run s9 9
+  r.check "forks: a second look in the same epoch joins nothing" a9b.isEmpty
+  let (a10, s10) ← run s9 10
+  r.check "forks: at the fork, the digest switches with no second join"
+    (a10.length == 1 && a10.all isSwitch && s10.current == post)
+  let (a11, s11) ← run s10 11
+  r.check "forks: one epoch after the fork, the pre-fork topics stay" a11.isEmpty
+  let (a12, s12) ← run s11 12
+  r.check "forks: two epochs after the fork, the pre-fork topics go"
+    (a12.length == 1 && a12.all (isUnsub pre) && s12.retiring.isNone)
+  let (late, _) ← run s8 10
+  r.check "forks: a fork the loop did not see ahead joins and switches at once"
+    (late.length == 2 && (late.head?.map (isSub post)) == some true &&
+      (late.getLast?.map isSwitch) == some true)
+
 /-! ## The peer table -/
 
 private def peersChecks (r : Runner) : IO Unit := do
@@ -379,13 +420,46 @@ private def serviceChecks (r : Runner) : Async Unit := do
   cs.stop
   a.stop
 
+/-- A fork on a live service: 1 s slots, 2 slots per epoch, and a
+Blob-Parameters-Only fork at epoch 2, 4 s after genesis. The fork loop
+joins the post-fork topic at epoch 1, switches at epoch 2, and leaves the
+pre-fork topic at epoch 4. The run takes about 9 s. -/
+private def liveForkChecks (r : Runner) : Async Unit := do
+  let c0 ← devnetChain ((← wallMs) / 1000)
+  let c := { c0 with slotDurationMs := 1000, slotsPerEpoch := 2
+                     blobSchedule := c0.blobSchedule ++
+                       [({ epoch := 2, maxBlobsPerBlock := 99 } : BlobEntry)] }
+  let pre ← expectOk "digest" (c.forkDigest 0)
+  let post ← expectOk "digest" (c.forkDigest 2)
+  let ev ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let a ← startOn c 4 ev
+  r.check "eth2 fork: the subscribe posts" (← a.subscribe .beaconBlock)
+  let topics (n : Nat) : Async Bool := do
+    match ← a.gossip.stats with
+    | some st => return st.topics == n
+    | none => return false
+  r.check "eth2 fork: ahead of the fork, both digests carry the topic" (← waitUntil (topics 2) 5000)
+  let switched : Async Bool := do
+    return (← (a.base.status.get : BaseIO Status)).forkDigest == post
+  r.check "eth2 fork: at the fork, our Status names the new digest" (← waitUntil switched 5000)
+  r.check "eth2 fork: our record names the new digest"
+    (forkDigest? (← (a.localEnr : BaseIO Enr)) == some post)
+  r.check "eth2 fork: the topic of a kind is the new digest's"
+    ((← (a.topic .beaconBlock : BaseIO Libp2p.Protocols.Gossipsub.TopicId)).name ==
+      topicOf post .beaconBlock)
+  r.check "eth2 fork: two epochs later, the pre-fork topic goes" (← waitUntil (topics 1) 7000)
+  r.check "eth2 fork: the two digests differ" (pre != post)
+  a.stop
+
 def run (r : Runner) : IO Unit := do
   r.section "eth2" "vendor/consensus-specs: specs/*/p2p-interface.md to fulu, fulu beacon-chain.md"
   chainChecks r
   messageIdChecks r
   messageChecks r
   scoringChecks r
+  forkChecks r
   peersChecks r
   Async.run (serviceChecks r)
+  Async.run (liveForkChecks r)
 
 end Tests.Eth2

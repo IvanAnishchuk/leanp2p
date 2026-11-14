@@ -254,9 +254,11 @@ structure Node where
   too. `false` once the node stops, and the callback then stays
   unregistered. -/
   subscribeWait : TopicId → (Message → BaseIO Unit) → Conc.Async Bool
-  /-- Drop every callback of the topic, and leave the topic. `false` under the
-  same conditions as `publish`. -/
-  unsubscribe : TopicId → BaseIO Bool
+  /-- Drop every callback of the topic, and leave the topic. A consensus
+  node leaves about 200 topics at once after a fork, so the post parks
+  while the control queue is full, as `subscribeWait` does. `false` once
+  the node stops. -/
+  unsubscribe : TopicId → Conc.Async Bool
   /-- Tell the loop that a peer joined. The connection notifiee of the host
   is the caller at integration. -/
   peerJoined : Peer → Core.PubsubProto → BaseIO Bool
@@ -1092,9 +1094,11 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
           BaseIO Unit)
         return false
     unsubscribe := fun topic => do
-      if ← closing.get then return false
-      subs.update fun s => { s with entries := s.entries.filter (fun e => e.topic != topic) }
-      post (.unsubscribe topic)
+      if ← (closing.get : BaseIO Bool) then return false
+      (subs.update fun s => { s with entries := s.entries.filter (fun e => e.topic != topic) } :
+        BaseIO Unit)
+      -- Park: the loop's take frees a slot, and `stop` closes the queue.
+      return (← control.send (.event (.unsubscribe topic))) matches .ok _
     peerJoined := fun peer proto => post (.peerJoined peer proto)
     peerLeft := fun peer => post (.peerLeft peer)
     report := fun id source outcome => post (.validated id source outcome)

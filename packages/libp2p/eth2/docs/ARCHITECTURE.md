@@ -33,6 +33,7 @@ and `quic`.
 | `Libp2p/Eth2/Messages.lean` | the req/resp methods with their bounds, and the SSZ of `Status`, `MetaData`, Ping, Goodbye, and the requests |
 | `Libp2p/Eth2/Gossip.lean` | the router parameters of a consensus node |
 | `Libp2p/Eth2/Scoring.lean` | Lighthouse's score profile: the thresholds, the global parameters, and the parameters of each scored topic, from the active validator count and the slot |
+| `Libp2p/Eth2/Forks.lean` | the gossip across a fork: the pure schedule of the post-fork joins, the switch, and the retirement of the pre-fork topics |
 | `Libp2p/Eth2/Peers.lean` | the peer table: the Ping intervals, the known MetaData seq numbers, and the bans, as pure transitions |
 | `Libp2p/Eth2/Service.lean` | the service: the host, gossipsub, discv5, the req/resp handlers, and the peer duties |
 
@@ -51,8 +52,8 @@ and `quic`.
 - `gossipParams`.
 - `Scoring.scoredParams`, `Scoring.dynamicParams`, `Scoring.kindParams`,
   `Scoring.globalParams`, `Scoring.thresholds`.
-- `Peers`.
-- `Service.start`, `subscribe`, `publish`, `report`, `setStatus`,
+- `Peers`, `ForkState`, `ForkAction`.
+- `Service.start`, `subscribe`, `unsubscribe`, `publish`, `report`, `setStatus`,
   `request`, `peers`, `disconnect`, `ban`, `isBanned`, `updateScores`,
   `localEnr`, `stop`, and the client's seams:
   `Config.onEvent` (the `Event` stream) and `Config.serve` (the
@@ -77,7 +78,7 @@ and `quic`.
    (`validateMessages`). Data that does not decompress is rejected at
    once. An unknown topic is rejected at once.
 5. **Every task has an owner.** The service's task set owns the
-   discovery loop, the liveness loop, the dials, the Pings, and the
+   discovery loop, the liveness loop, the fork loop, the dials, the Pings, and the
    `Status` exchanges. `stop` closes the loops' channel, says Goodbye,
    stops gossipsub and discv5, closes
    the host, and joins the set. The host's close removes the notifiee,
@@ -128,6 +129,13 @@ and `quic`.
   lets a client end a connection that does not answer a Ping, and it
   sets no penalties. Penalties are scoring, so the service reports
   (`Event.unresponsive`), and the client calls `disconnect` or `ban`.
+- **The fork loop owns the digest.** altair "Transitioning the gossip"
+  asks for the post-fork topics in advance, no negative score on the
+  pre-fork topics after the fork, and the end of the pre-fork topics two
+  epochs later. The lead is Lighthouse's, one epoch. The loop keeps our
+  digest, and `topic`, `setStatus`, and the record read it, so the three
+  never disagree. The client subscribes by kind once, and the loop
+  carries the kind to each new digest with its score parameters.
 - **A ban works at the gater.** The gater refuses a banned peer at the
   dial and after the handshake, the first point that proves an inbound
   peer's id. Discovery skips a banned peer's records.
@@ -150,6 +158,10 @@ and `quic`.
   context bytes, MetaData, Ping, the MetaData refresh after a Ping,
   Goodbye at stop, and a ban that refuses the peer's redials, on two
   threads and on one.
+- A live fork: a service on a chain of 2 s epochs with a
+  Blob-Parameters-Only fork at epoch 2 joins the post-fork topic ahead,
+  switches its `Status`, record, and topics at the fork, and leaves the
+  pre-fork topic two epochs later.
 - The live gate is the shadow node on the Kurtosis devnet, against
   Lighthouse and Grandine (the package PLAN, unit 3).
 

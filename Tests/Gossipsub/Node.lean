@@ -480,7 +480,7 @@ private def pairChecks (r : Tests.Runner) : Async Unit := do
   r.check "node.pair.hello-reaches-publisher" ((← receive b.receipts).isSome)
   discard (b.node.publish topic (Bytes.ofNatList [1]) : BaseIO Bool)
   r.check "node.pair.publish-delivers" (← delivered a [1])
-  discard (a.node.unsubscribe topic : BaseIO Bool)
+  discard <| a.node.unsubscribe topic
   r.check "node.pair.unsubscribe-barrier" (← barrier a)
   discard (b.node.publish topic (Bytes.ofNatList [2]) : BaseIO Bool)
   r.check "node.pair.publisher-barrier" (← barrier b)
@@ -544,7 +544,7 @@ private def surfaceChecks (r : Tests.Runner) : Async Unit := do
   r.check "node.surface.callbacks-in-registration-order" (first == some 1 && second == some 2)
   r.check "node.surface.other-topic-callback-silent" ((← (tags.tryRecv : BaseIO (Option Nat))).isNone)
   discard (seen.drain : BaseIO (List Seen))
-  discard (f.node.unsubscribe topic : BaseIO Bool)
+  discard <| f.node.unsubscribe topic
   r.check "node.surface.unsubscribe-barrier" (← barrier f)
   let off ← receiveWhere seen (fun s => s.rpc == subOptRpc Core.defaults topic false)
   r.check "node.surface.negative-subscription-record" off.isSome
@@ -703,7 +703,7 @@ private def stalledAndDrops (r : Tests.Runner) : Async Unit := do
   r.check "node.stop.repeated-calls-return" true
   r.check "node.stop.publish-refused" (!(← (n.publish topic (Bytes.ofNatList [1]) : BaseIO Bool)))
   r.check "node.stop.subscribe-refused" (!(← (n.subscribe topic (fun _ => pure ()) : BaseIO Bool)))
-  r.check "node.stop.unsubscribe-refused" (!(← (n.unsubscribe topic : BaseIO Bool)))
+  r.check "node.stop.unsubscribe-refused" (!(← n.unsubscribe topic))
   r.check "node.stop.join-refused" (!(← (n.peerJoined pc .meshsub : BaseIO Bool)))
   r.check "node.stop.leave-refused" (!(← (n.peerLeft pc : BaseIO Bool)))
   stream.close

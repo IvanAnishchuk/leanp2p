@@ -22,6 +22,9 @@ both.
    with the MetaData refresh, and the ban at the gater.
 5. **The score profile.** Lighthouse's parameters (`Scoring`), on by
    default, with `updateScores` for the chain-dependent topics.
+6. **Forks.** The fork schedule (`ForkState`) and the fork loop: the
+   post-fork joins one epoch ahead, the switch, and the retirement two
+   epochs after.
 
 ## Consumers
 
@@ -97,6 +100,15 @@ Unit 5 (`Tests/Eth2.lean`):
 - A topic of our digest is scored. A column topic and a topic of another
   digest are not.
 - Over loopback, `updateScores` posts all 66 topics.
+
+Unit 6 (`Tests/Eth2.lean`):
+- The schedule, around a fork at epoch 10: nothing at 8, the join at 9
+  once, the switch at 10 with no second join, nothing at 11, and the
+  retirement at 12. A fork the loop did not see ahead joins and switches
+  at once.
+- A live service on a chain of 2 s epochs: both digests carry the topic
+  ahead of the fork, then `Status`, the record, and `topic` name the new
+  digest, then the pre-fork topic goes.
 
 Open from the network leg: in a run of 120 s, one Lighthouse node
 ended our session once, and the discovery loop dialed it again. Its

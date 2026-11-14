@@ -20,6 +20,7 @@ import Libp2p.Eth2.Messages
 import Libp2p.Eth2.Gossip
 import Libp2p.Eth2.Peers
 import Libp2p.Eth2.Scoring
+import Libp2p.Eth2.Forks
 
 /-!
 # The consensus network service
@@ -69,6 +70,11 @@ the events.
   `report`. Data that does not decompress gets REJECT at once: "Clients
   MUST reject (fail validation) messages containing an incorrect type,
   or invalid payload".
+* **Forks.** The fork loop follows the schedule (`Forks`). One epoch
+  before a fork, it joins the client's kinds under the next digest. At
+  the fork, our `Status` and our record take the new digest, and the
+  pre-fork topics lose their score parameters. Two epochs later, it
+  leaves the pre-fork topics.
 * **Scoring.** The router scores peers with Lighthouse's profile
   (`Scoring`). The client keeps the chain-dependent topics current with
   `updateScores`.
@@ -76,8 +82,8 @@ the events.
 ## Concurrency
 
 Every task belongs to the service's task set, and `stop` joins it
-(root §4.1). The discovery loop and the liveness loop park on their
-timers and on `stopping`, which `stop` closes. The host notifiee and the gossipsub validation
+(root §4.1). The discovery loop, the liveness loop, and the fork loop
+park on their timers and on `stopping`, which `stop` closes. The host notifiee and the gossipsub validation
 callback run on tasks that must not park. So they call
 `Config.onEvent`, which must not park either, and they spawn the work
 that waits. `stop` closes the host before it joins the set, and the
@@ -403,8 +409,71 @@ structure Service where
   listenAddrs : List Multiaddr
   /-- `stop` closes it. -/
   stopping : Chan Unit
+  /-- Our place in the fork schedule (`ForkState`). The fork loop alone
+  changes it. -/
+  forks : OnceRef ForkState
+  /-- The kinds the client subscribed to. The fork loop carries them to
+  each new digest. -/
+  kinds : OnceRef (List Kind)
+  /-- The active validator count and the slot of the last
+  `updateScores`, for the score parameters of new topics. -/
+  scoreInputs : OnceRef (Nat × Nat)
 
 namespace Service
+
+/-- The topic of a kind under `digest`. -/
+def topicAt (digest : ByteArray) (k : Kind) : TopicId := ⟨topicOf digest k⟩
+
+/-- Join the topic of a kind under `digest`, and give it the profile's
+score parameters. The parameters of the start cover our first digest
+only, so every later digest takes them here. -/
+def join (s : Service) (digest : ByteArray) (k : Kind) : Async Bool := do
+  let ok ← s.gossip.subscribeWait (topicAt digest k) fun _ => pure ()
+  if ok && s.base.config.scoring then
+    let (active, slot) ← (s.scoreInputs.get : BaseIO (Nat × Nat))
+    if let some tp := Scoring.kindParams (Scoring.settings s.base.config.chain) active slot k then
+      discard <| s.gossip.setTopicParams (topicAt digest k) (some tp)
+  return ok
+
+/-- Perform one duty of the fork loop at `epoch`. -/
+def performFork (s : Service) (epoch : Nat) : ForkAction → Async Unit
+  | .subscribe d => do
+    for k in ← (s.kinds.get : BaseIO (List Kind)) do
+      discard <| s.join d k
+  | .switch old new => do
+    let cfg := s.base.config
+    (s.base.status.update fun st => { st with forkDigest := new } : BaseIO Unit)
+    -- The record names the new digest, the next fork, and `nfd`.
+    if let .ok pairs := advertPairs cfg.chain epoch cfg.advert then
+      discard <| (s.disc.updateEnr pairs : BaseIO Bool)
+    -- "Peers who propagate messages on the pre-fork topics MUST NOT be
+    -- scored negatively": the pre-fork topics lose their parameters.
+    for k in ← (s.kinds.get : BaseIO (List Kind)) do
+      discard <| s.gossip.setTopicParams (topicAt old k) none
+  | .unsubscribe d => do
+    for k in ← (s.kinds.get : BaseIO (List Kind)) do
+      discard <| s.gossip.unsubscribe (topicAt d k)
+
+/-- One look of the fork loop at `epoch`: the transition and its duties. -/
+def forkTick (s : Service) (epoch : Nat) : Async Unit := do
+  let chain := s.base.config.chain
+  let acts ← (s.forks.updateGet fun st =>
+    match ForkState.step chain epoch st with
+    | .ok (acts, st') => (acts, st')
+    | .error _ => ([], st) : BaseIO (List ForkAction))
+  for a in acts do s.performFork epoch a
+
+/-- The pause of the fork loop between two looks at the clock. -/
+def forkTickMs : Nat := 1000
+
+/-- The fork loop: each tick, follow the fork schedule at the wall-clock
+epoch. Park: the timer wakes it, and so does `stop`, which closes
+`stopping`. `partial`, as the IO loops are. -/
+partial def forkWatch (s : Service) : Async Unit := do
+  let timer ← (Park.sleep forkTickMs false : BaseIO (Park Bool))
+  if ← select #[Park.recv s.stopping (fun _ => true), timer] then return
+  s.forkTick (s.base.config.chain.epochAt (← (wallMs : IO Nat)))
+  s.forkWatch
 
 /-- Lift an `Except` into `IO`, with the message for a failure. -/
 private def orThrow {ε α : Type} (what : String) : Except ε α → IO α
@@ -494,18 +563,40 @@ def start (cfg : Config) : Async Service := do
   let stopping ← (Chan.new 1 (by decide) : BaseIO (Chan Unit))
   (base.tasks.spawn (base.discover disc stopping) : BaseIO Unit)
   (base.tasks.spawn (base.liveness stopping) : BaseIO Unit)
-  return { base, gossip, disc, listenAddrs, stopping }
+  let s : Service := {
+    base, gossip, disc, listenAddrs, stopping
+    forks := ← OnceRef.new { current := digest }
+    kinds := ← OnceRef.new []
+    scoreInputs := ← OnceRef.new (cfg.chain.slotsPerEpoch, 0) }
+  -- The first look at the schedule runs now, so a fork one epoch away
+  -- finds its topics joined before the first subscribe.
+  s.forkTick epoch
+  (base.tasks.spawn s.forkWatch : BaseIO Unit)
+  return s
 
-/-- The topic of a kind under our digest now. -/
-def topic (s : Service) (k : Kind) : IO TopicId := do
-  return ⟨topicOf (← digestNow s.base.config.chain) k⟩
+/-- The topic of a kind under our digest. -/
+def topic (s : Service) (k : Kind) : BaseIO TopicId := do
+  return topicAt (← s.forks.get).current k
 
-/-- Subscribe to a kind. The messages arrive as `Event.gossip`. The post
-parks while the gossipsub node's control queue is full
+/-- Subscribe to a kind, under our digest, and under the next digest
+once the fork is a lead away. The fork loop carries the kind to each
+later digest. The messages arrive as `Event.gossip`. The post parks
+while the gossipsub node's control queue is full
 (`Node.subscribeWait`), since a consensus node subscribes to about 200
 topics at once. `false` once the node stops. -/
 def subscribe (s : Service) (k : Kind) : Async Bool := do
-  s.gossip.subscribeWait (← s.topic k) fun _ => pure ()
+  (s.kinds.update fun ks => if ks.contains k then ks else ks ++ [k] : BaseIO Unit)
+  let st ← (s.forks.get : BaseIO ForkState)
+  let ok ← s.join st.current k
+  if let some next := st.next then discard <| s.join next k
+  return ok
+
+/-- Leave a kind, under every digest we hold. -/
+def unsubscribe (s : Service) (k : Kind) : Async Bool := do
+  (s.kinds.update (·.filter (· != k)) : BaseIO Unit)
+  let st ← (s.forks.get : BaseIO ForkState)
+  let digests := st.current :: (st.next.toList ++ (st.retiring.map (·.1)).toList)
+  digests.allM fun d => s.gossip.unsubscribe (topicAt d k)
 
 /-- Bring the chain-dependent score parameters up to date: the block, the
 aggregate, and every attestation subnet, for `active` validators at
@@ -513,6 +604,7 @@ aggregate, and every attestation subnet, for `active` validators at
 `false` once the node stops, or with scoring off. -/
 def updateScores (s : Service) (active slot : Nat) : Async Bool := do
   if !s.base.config.scoring then return false
+  (s.scoreInputs.set (active, slot) : BaseIO Unit)
   let st := Scoring.settings s.base.config.chain
   let (block, aggregate, attestation) := Scoring.dynamicParams st active slot
   let kinds : List (Kind × Gossipsub.Score.TopicParams) :=
@@ -531,11 +623,11 @@ def publish (s : Service) (k : Kind) (ssz : ByteArray) : IO Bool := do
   | .ok data => s.gossip.publish (← s.topic k) data
   | .error _ => return false
 
-/-- Our `Status` from the client's chain. The digest is the wall-clock
-one. -/
+/-- Our `Status` from the client's chain. The digest is ours in the fork
+schedule, the one our topics carry. -/
 def setStatus (s : Service) (finalizedRoot : ByteArray) (finalizedEpoch : Nat)
     (headRoot : ByteArray) (headSlot earliestAvailableSlot : Nat) : IO Unit := do
-  let forkDigest ← digestNow s.base.config.chain
+  let forkDigest := (← s.forks.get).current
   s.base.status.set { forkDigest, finalizedRoot, finalizedEpoch, headRoot, headSlot, earliestAvailableSlot }
 
 /-- Send one request to a peer. -/
