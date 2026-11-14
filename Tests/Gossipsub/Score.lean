@@ -104,6 +104,9 @@ private def s6 : PeerState := prune walkParams s5 30000 eth
 /-- Step 8: one decay interval. -/
 private def s7 : PeerState := decay walkParams s6
 
+/-- Step 10: a graft again at time 30000, which starts a new mesh period. -/
+private def s8 : PeerState := graft walkParams s7 30000 eth
+
 /-! ## Strictness fixtures -/
 
 /-- Counters with the peer in the mesh since time 0 and no deliveries. -/
@@ -280,9 +283,12 @@ def run (r : Runner) : IO Unit := do
 
   -- Step 7: prune at 30000. The elapsed time 30000 passes the activation, and the count 3000
   -- is below the threshold 4000, so the failure penalty grows by the square of 1000, 1000.
-  -- P3b = -100 * 1000 = -100000, so the topic score = -890000 and the contribution -890.
-  -- Global P7 = -100. Total = -990.
-  r.check "score.walk.prune" (score walkParams s6 30000 == -990)
+  -- Out of the mesh, P1 and P3 are 0, as in rust's scorer. P2 = 10 * 1000 = 10000, P3b = -100
+  -- * 1000 = -100000, and P4 = -1000000, so the topic score = -1090000 and the contribution
+  -- -1090. Global P7 = -100. Total = -1190: the float64 answer 0.01 - 0.1 - 1 - 0.1.
+  r.check "score.walk.prune" (score walkParams s6 30000 == -1190)
+  -- Out of the mesh, the time adds nothing.
+  r.check "score.walk.pruned-time-adds-nothing" (score walkParams s6 90000 == -1190)
 
   -- Step 8: one decay. Each factor is 500, so a counter c becomes c * 500 / 1000, and a result
   -- below 1000 becomes 0. First deliveries 1000 -> 0, mesh deliveries 3000 -> 1500, failure
@@ -301,11 +307,21 @@ def run (r : Runner) : IO Unit := do
   r.check "score.walk.decay.keeps-mesh-time"
     ((countersOf s7 eth).timeInMesh == 30000 && (countersOf s7 eth).inMesh == false)
 
-  -- Step 9: score after the decay, at 30000. P1 gives 300000, P2 = 0. P3: deficit 4000 - 1500
-  -- = 2500, square 2500 * 2500 / 1000 = 6250, term -625000. P3b = 0, P4 = 0. Topic score =
-  -- -325000. Contribution = -325. Global P7 = 0. Total = -325, the float64 answer of the spec:
-  -- 300 - 100 * 2.5^2.
-  r.check "score.walk.final" (score walkParams s7 30000 == -325)
+  -- Step 9: score after the decay, at 30000. Out of the mesh, P1 and P3 are 0, and the decay
+  -- took P2, P3b, P4, and P7 to 0. Total = 0.
+  r.check "score.walk.decayed-out-of-mesh" (score walkParams s7 30000 == 0)
+
+  -- Step 10: a graft again at 30000 starts the mesh period from 0, as rust and go do.
+  r.check "score.walk.regraft-starts-at-zero"
+    ((countersOf s8 eth).timeInMesh == 0 && (countersOf s8 eth).inMesh &&
+      score walkParams s8 30000 == 0)
+
+  -- Step 11: score at 60000, 30000 ms into the new period. P1 = 30 gives 300000, P2 = 0. P3:
+  -- deficit 4000 - 1500 = 2500, square 2500 * 2500 / 1000 = 6250, term -625000. P3b = 0, P4 =
+  -- 0. Topic score = -325000. Contribution = -325. Global P7 = 0. Total = -325, the float64
+  -- answer of the spec: 300 - 100 * 2.5^2. Whole-event counters would floor 1.5 deliveries
+  -- to 1 and give -600.
+  r.check "score.walk.final" (score walkParams s8 60000 == -325)
 
   -- The P3 activation boundary. At 20000 ms the activation is equal, so the strict comparison
   -- fails and P3 = 0. At 20001 ms the deficit is 4000, square 16000.

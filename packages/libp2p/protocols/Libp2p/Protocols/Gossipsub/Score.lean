@@ -78,8 +78,18 @@ The comparison is strict, as the spec's pseudocode writes it.
 ## Time
 
 `elapsed` computes the mesh time lazily from `timeInMesh`, `graftTime`, and `now`. `Nat`
-subtraction saturates at zero. The caller passes `now >= graftTime`; no theorem consumes that
+subtraction saturates at zero. The caller passes `now >= graftTime`. No theorem consumes that
 precondition.
+
+## The mesh period
+
+`P1` and `P3` count only while the peer is in the mesh, and each graft starts a new mesh period
+from zero. rust-libp2p does this (`peer_score.rs`: `P1` reads `MeshStatus::Active`, `graft`
+sets `MeshStatus::new_active()`, and `prune` clears `mesh_message_deliveries_active`), and
+Lighthouse's score profile runs on that scorer. go-libp2p-pubsub v0.19.0 agrees on `P1` and on
+the reset at graft, and it keeps `P3` after a prune until the next graft (`score.go`, lines 305
+and 675 to 697). The prune moves the deficit into the sticky `P3b`, so the peer does not pay it
+twice.
 
 ## The Boolean validity mirror
 
@@ -286,11 +296,11 @@ theorem GlobalParams.validB_iff (g : GlobalParams) :
 
 /-! ## Peer state -/
 
-/-- The counters of one peer in one topic. `timeInMesh` holds the accrued mesh time, and
-`graftTime` holds the start of the current mesh period. `elapsed` sums the two when `inMesh` is
-true. -/
+/-- The counters of one peer in one topic. `graftTime` holds the start of the current mesh
+period, and `timeInMesh` holds the length of the last period after a prune. A graft sets it to
+zero ("The mesh period" in the module doc). -/
 structure TopicCounters where
-  /-- The mesh time accrued in earlier mesh periods. -/
+  /-- The length of the last mesh period, from the prune that ended it. Zero in the mesh. -/
   timeInMesh : Millis
   /-- The time of the last graft. -/
   graftTime : Millis
@@ -336,24 +346,25 @@ def PeerState.zero : PeerState where
 
 /-! ## Scoring -/
 
-/-- The mesh time of a peer in a topic. The peer accrues time from `graftTime` to `now` while
-`inMesh` is true, and the stored `timeInMesh` holds the earlier periods. The `Nat` subtraction
-saturates at zero. The caller passes `now >= graftTime`. -/
+/-- The mesh time of a peer in a topic: from `graftTime` to `now` while `inMesh` is true, plus
+`timeInMesh`, which a graft sets to zero. Outside the mesh it is the length of the last period.
+The `Nat` subtraction saturates at zero. The caller passes `now >= graftTime`. -/
 def elapsed (now : Millis) (t : TopicCounters) : Millis :=
   t.timeInMesh + (if t.inMesh then now - t.graftTime else 0)
 
-/-- `P1`, the time in mesh: the elapsed time in quanta, capped. -/
+/-- `P1`, the time in mesh: the elapsed time of the current mesh period in quanta, capped, and
+zero outside the mesh. -/
 def p1 (tp : TopicParams) (now : Millis) (t : TopicCounters) : Nat :=
-  min (elapsed now t / tp.timeInMeshQuantum) tp.timeInMeshCap
+  if t.inMesh then min (elapsed now t / tp.timeInMeshQuantum) tp.timeInMeshCap else 0
 
 /-- The square of a value in counter units, in counter units. -/
 def square (c : Nat) : Nat := c * c / counterUnit
 
 /-- `P3`, the mesh message delivery rate: the square of the delivery deficit below the
-threshold, when the activation window has passed. Both comparisons are strict, so equality with
-either bound gives 0. -/
+threshold, for a peer in the mesh whose current period has passed the activation window. Both
+comparisons are strict, so equality with either bound gives 0. -/
 def p3 (tp : TopicParams) (now : Millis) (t : TopicCounters) : Nat :=
-  if tp.meshMessageDeliveriesActivation < elapsed now t ∧
+  if t.inMesh ∧ tp.meshMessageDeliveriesActivation < elapsed now t ∧
       t.meshMessageDeliveries < tp.meshMessageDeliveriesThreshold then
     square (tp.meshMessageDeliveriesThreshold - t.meshMessageDeliveries)
   else 0
@@ -483,8 +494,8 @@ private def setCounters (s : PeerState) (id : TopicId) (t : TopicCounters) : Pee
 
 /-! ## Counter updates -/
 
-/-- The graft update: when the peer is not in the mesh, set `inMesh` and record the graft time.
-A peer that is already in the mesh is unchanged. An unconfigured topic keeps no counters, as in
+/-- The graft update: when the peer is not in the mesh, set `inMesh`, record the graft time,
+and start the mesh period from zero. A peer that is already in the mesh is unchanged. An unconfigured topic keeps no counters, as in
 rust-libp2p, so it is unchanged too: the score reads every counter of the peer, and a counter of
 an unconfigured topic only costs time. -/
 def graft (p : Params) (s : PeerState) (now : Millis) (id : TopicId) : PeerState :=
@@ -493,9 +504,9 @@ def graft (p : Params) (s : PeerState) (now : Millis) (id : TopicId) : PeerState
   | some _ =>
     let t := countersOf s id
     if t.inMesh then s
-    else setCounters s id { t with inMesh := true, graftTime := now }
+    else setCounters s id { t with inMesh := true, graftTime := now, timeInMesh := 0 }
 
-/-- The counter part of a prune: fold the elapsed mesh time into `timeInMesh`, leave the mesh,
+/-- The counter part of a prune: store the length of the mesh period in `timeInMesh`, leave the mesh,
 and add the square of the delivery deficit to the failure penalty when the activation window
 has passed and the delivery count is below the threshold. -/
 private def pruneCounters (p : Params) (now : Millis) (id : TopicId)
