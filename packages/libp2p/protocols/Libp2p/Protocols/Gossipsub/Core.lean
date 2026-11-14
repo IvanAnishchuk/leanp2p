@@ -192,6 +192,18 @@ structure Params where
   maxIhaveMessages : Nat := 10
   maxIhaveLength : Nat := 5000
   gossipRetransmission : Nat := 3
+  /-- The caps on a peer's subscriptions, as rust-libp2p's
+  `MaxCountSubscriptionFilter` sets them (`subscription_filter.rs`):
+  - `maxSubscriptionsPerRpc`: the most subscription options in one RPC
+  - `maxSubscribedTopics`: the most topics one peer may announce
+
+  An RPC past either cap has its subscriptions ignored, and the rest of
+  the RPC stands (`admitSubs`). `none` sets no cap, as go and rust do by
+  default. The table of a peer's topics is a list, so an RPC of `n`
+  options costs `n` times the peer's topic count: a node that faces
+  public peers sets `maxSubscriptionsPerRpc`. -/
+  maxSubscriptionsPerRpc : Option Nat := none
+  maxSubscribedTopics : Option Nat := none
   /-- How long a departed peer's score stays (`gossipsub-v1.1.md`, lines
   212 to 214: "the score is retained for some period of time when a peer
   disconnects"). rust's default is 1 h, and Lighthouse sets 100 epochs. -/
@@ -943,6 +955,21 @@ def applyPartialOpts (ps : List (TopicId × PartialOpts)) (o : Rpc.SubOpts) :
           supports := o.requestsPartial || o.supportsSendingPartial }) :: rest
   else rest
 
+/-- The subscription options of one RPC that the caps admit: all of
+them, or none (`Params.maxSubscriptionsPerRpc`). The count check comes
+first, so an RPC past it costs no pass over the peer's topics. rust
+ignores the subscriptions of such an RPC in the same way
+(`behaviour.rs`, "Subscription filter error"). -/
+def admitSubs (p : Params) (s : State) (sender : Peer) (subs : List Rpc.SubOpts) :
+    List Rpc.SubOpts :=
+  let perRpcOk := match p.maxSubscriptionsPerRpc with
+    | some m => decide (subs.length ≤ m)
+    | none => true
+  if !perRpcOk then []
+  else match p.maxSubscribedTopics, peerOf s sender with
+    | some m, some pd => if (subs.foldl applySubOpts pd.subs).length ≤ m then subs else []
+    | _, _ => subs
+
 /-- Update the announced topics of the sender, and its choices. -/
 def handleSubs (s : State) (sender : Peer) (subs : List Rpc.SubOpts) : State :=
   match peerOf s sender with
@@ -1384,7 +1411,7 @@ def sendPartial (p : Params) (s : State) (q : Peer) (pm : Rpc.PartialMessage) : 
 the Extensions message, and a partial message. -/
 def handleRpc (p : Params) (s : State) (sender : Peer) (rpc : Rpc.RPC) :
     State × List Action :=
-  let s1 := handleSubs s sender rpc.subscriptions
+  let s1 := handleSubs s sender (admitSubs p s sender rpc.subscriptions)
   let (s2, a2) := if p.validateMessages then holdPubs p s1 sender rpc.publish
     else handlePubs p s1 sender rpc.publish
   let (s3, a3) := handleControl p s2 sender rpc.control
@@ -2878,21 +2905,21 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
               rcases hdel with hdl | hdl
               · simp only [List.mem_map] at hdl
                 obtain ⟨m', hm', heq⟩ := hdl
-                have hseen : (handleSubs s sender rpc.subscriptions).seen = s.seen :=
-                  handleSubs_seen s sender rpc.subscriptions
-                have hnow : (handleSubs s sender rpc.subscriptions).now = s.now :=
-                  handleSubs_now s sender rpc.subscriptions
+                have hseen : (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).seen = s.seen :=
+                  handleSubs_seen s sender (admitSubs p s sender rpc.subscriptions)
+                have hnow : (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).now = s.now :=
+                  handleSubs_now s sender (admitSubs p s sender rpc.subscriptions)
                 cases heq
-                have hgate := accept_gate (handleSubs s sender rpc.subscriptions).seen
-                  (handleSubs s sender rpc.subscriptions).now p.msgId []
-                  (handleSubs s sender rpc.subscriptions).seen
+                have hgate := accept_gate (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).seen
+                  (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).now p.msgId []
+                  (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).seen
                   (List.filter (fun m => validationOk p m) rpc.publish) m hm'
                 rwa [hseen, hnow] at hgate
               · exact absurd (mem_dropForPartial hdl)
-                  (forwardPubs_not_deliver p (handleSubs s sender rpc.subscriptions) sender
-                    ((accept (handleSubs s sender rpc.subscriptions).seen
-                        (handleSubs s sender rpc.subscriptions).now p.msgId []
-                        (handleSubs s sender rpc.subscriptions).seen
+                  (forwardPubs_not_deliver p (handleSubs s sender (admitSubs p s sender rpc.subscriptions)) sender
+                    ((accept (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).seen
+                        (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).now p.msgId []
+                        (handleSubs s sender (admitSubs p s sender rpc.subscriptions)).seen
                         (List.filter (fun m => validationOk p m) rpc.publish)).accepted) m)
             · cases hctl : rpc.control with
               | none =>

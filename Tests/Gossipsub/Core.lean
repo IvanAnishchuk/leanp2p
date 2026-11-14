@@ -657,6 +657,30 @@ def run (r : Runner) : IO Unit := do
         [.tick 1000 [pb, pc, pd]] with
      | .ok (_, acts) => ihaveCount acts = 3
      | _ => false)
+  -- The subscription caps (rust's `MaxCountSubscriptionFilter`): an RPC
+  -- past a cap has its subscriptions ignored.
+  let subRpc (names : List String) (on : Bool := true) : Event :=
+    .rpc pa (Pb.encodeMessage ({ subscriptions := names.map fun n => { subscribe := on, topicid := n },
+                                 publish := [], control := none } : Rpc.RPC))
+  let subsOf (s : State) : Nat := ((peerOf s pa).map (·.subs.length)).getD 0
+  let base := subsOf known
+  let perRpc : Params := { baseParams with maxSubscriptionsPerRpc := some 2 }
+  r.check "core.subs.per-rpc-cap"
+    ((match step perRpc known (subRpc ["x1", "x2", "x3"]) with
+      | .ok (s', _) => subsOf s' == base
+      | _ => false) &&
+     (match step perRpc known (subRpc ["x1", "x2"]) with
+      | .ok (s', _) => subsOf s' == base + 2
+      | _ => false))
+  let total : Params := { baseParams with maxSubscribedTopics := some (base + 1) }
+  r.check "core.subs.total-cap"
+    ((match step total known (subRpc ["y1", "y2"]) with
+      | .ok (s', _) => subsOf s' == base
+      | _ => false) &&
+     (match step total known (subRpc ["y1"]) with
+      | .ok (s', _) => subsOf s' == base + 1
+      | _ => false))
+
   -- An unsubscribe prunes with the shorter backoff, 10 s.
   r.check "core.unsubscribe.short-backoff"
     (match step baseParams { known with mesh := [(ta, [pa])] } (.unsubscribe ta) with

@@ -215,6 +215,9 @@ private def scoringChecks (r : Runner) : IO Unit := do
   r.check "scoring: a topic of another digest is not scored"
     (params.score.topics ⟨topicOf ⟨#[1, 2, 3, 4]⟩ .beaconBlock⟩).isNone
   r.check "scoring: the score retention is 100 epochs" (params.retainScore == 38400000)
+  r.check "gossip: the subscription caps are Lighthouse's, for 203 topics a fork"
+    (topicsPerFork == 203 && params.maxSubscriptionsPerRpc == some 406 &&
+      params.maxSubscribedTopics == some 812)
 
 /-! ## The fork schedule -/
 

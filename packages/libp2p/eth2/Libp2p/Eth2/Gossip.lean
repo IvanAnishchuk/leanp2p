@@ -18,6 +18,7 @@ makes and the spec leaves open.
 | the `data` cap | `max_compressed_len(MAX_PAYLOAD_SIZE)` | phase0, "Gossipsub size limits" |
 | the answer later | on | phase0 "Topics and messages" uses ACCEPT, REJECT, and IGNORE |
 | IDONTWANT | at 1000 bytes and more | Lighthouse `config.rs`, `idontwant_message_size_threshold` |
+| the subscription caps | 406 per RPC, 812 per peer | Lighthouse `service/mod.rs`, `MaxCountSubscriptionFilter` |
 
 The message id is `Libp2p.Eth2.messageId`. The node runs the
 `ByteArray` payload path, so the id reads the payload bytes once.
@@ -43,6 +44,19 @@ def seenCapacity : Nat := 262144
 /-- The IDONTWANT threshold. -/
 def idontwantThreshold : Nat := 1000
 
+/-- The topics of one fork from Fulu on: the seven core kinds, and the
+attestation, sync committee, and column subnets. -/
+def topicsPerFork : Nat :=
+  7 + Constants.attestationSubnetCount + Constants.syncCommitteeSubnetCount +
+    Constants.dataColumnSidecarSubnetCount
+
+/-- The subscription caps of Lighthouse's `MaxCountSubscriptionFilter`
+(`service/mod.rs`): one request holds at most the topics of two forks,
+and a peer announces at most the topics of four, since across a fork a
+node holds both digests. -/
+def maxSubscriptionsPerRpc : Nat := topicsPerFork * 2
+def maxSubscribedTopics : Nat := topicsPerFork * 4
+
 /-- The router parameters for a chain. -/
 def gossipParams (c : Chain) : Core.Params :=
   let ttl := max 1 (Constants.seenTtlMs c.slotDurationMs c.slotsPerEpoch)
@@ -59,7 +73,9 @@ def gossipParams (c : Chain) : Core.Params :=
     validateMessages := true
     maxDataSize := some (Libp2p.Protocols.Constants.maxCompressedLen
       Libp2p.Protocols.Constants.maxPayloadSize)
-    idontwantThreshold := some idontwantThreshold }
+    idontwantThreshold := some idontwantThreshold
+    maxSubscriptionsPerRpc := some maxSubscriptionsPerRpc
+    maxSubscribedTopics := some maxSubscribedTopics }
 
 /-- The consensus parameters pass the mesh rule of `Params.Valid`. The
 mesh does not depend on the chain, so the goal reduces to `8 ≤ 12`. -/
