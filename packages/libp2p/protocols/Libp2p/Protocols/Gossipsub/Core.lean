@@ -786,7 +786,7 @@ def applyPlanScores (p : Params) (s : State) (plans : List TopicPlan) : State :=
     { pd with
       score := plans.foldl (fun sc pl =>
         if memB q pl.pruned then Score.prune p.score sc s.now pl.topic
-        else if memB q pl.added then Score.graft sc s.now pl.topic
+        else if memB q pl.added then Score.graft p.score sc s.now pl.topic
         else sc) pd.score })
 
 /-- The actions of the plans: a prune to each pruned peer, with the peer
@@ -902,6 +902,30 @@ actions of the plan, the negative prune, and the gossip. -/
 def heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
     State × List Action :=
   (heartbeatNext p s now order, heartbeatActions p s now order)
+
+/-- The heartbeat in one pass: the fresh state, the plans, and the scored
+state each once. `heartbeat` names them part by part, and the proofs
+reason about the parts. Lean evaluates strictly and hoists no call out
+of a function, so the parts would plan every topic again for each use,
+and `negativeActions` once more for each kept peer of each plan. -/
+def heartbeatOnce (p : Params) (s : State) (now : Millis) (order : List Peer) :
+    State × List Action :=
+  let fresh := freshState p s now
+  let plans := planList p fresh now order
+  let scored := applyPlanScores p fresh plans
+  let next := settleMesh p scored plans
+  let negative := plans.flatMap (fun pl =>
+    (pl.kept.filter (fun q => decide (scoreOf p scored q < 0))).map
+      (fun q => Action.sendRpc q (pruneRpc pl.topic p.pruneBackoff)))
+  (next, plans.flatMap (planActions p fresh) ++ negative ++
+    gossipActions p { next with mcache := s.mcache } order)
+
+/-- The compiled heartbeat is the one pass. Both sides unfold to the same
+terms, and `csimp` makes the compiler run `heartbeatOnce` wherever the
+code says `heartbeat`. -/
+@[csimp] theorem heartbeat_eq_once : @heartbeat = @heartbeatOnce := by
+  funext p s now order
+  rfl
 
 /-! ## The event handlers -/
 
@@ -1153,7 +1177,7 @@ def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List 
       !memB q ps && !(Cache.Backoff.active st.backoff q t now) && !memB q st.explicit &&
         !isFlood st q && decide (median < scoreOf p st q)).take p.opportunisticGraftPeers
     let st := cands.foldl (fun st q =>
-      updateScoreOf (setTopicMesh st t (q :: meshOf st t)) q (fun sc => Score.graft sc now t)) st
+      updateScoreOf (setTopicMesh st t (q :: meshOf st t)) q (fun sc => Score.graft p.score sc now t)) st
     (st, acts ++ cands.map (fun q => Action.sendRpc q (graftRpc t)))) (s, [])
 
 /-- Heartbeat upkeep that the spike runs outside `step` (the loop calls it
@@ -1206,11 +1230,10 @@ def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) 
   -- the core ignores the peer. We ask it for at most `maxIhaveLength`
   -- ids.
   let (count, asked) := s.ihaveSeen.getD sender (0, 0)
-  -- "incoming gossip is ignored" from a peer below `GossipThreshold`
-  -- (`gossipsub-v1.1.md`, the threshold table), and an IHAVE for a topic
-  -- we do not subscribe to asks for nothing, as go's `handleIHave` skips
-  -- a topic with no mesh (`gossipsub.go`, lines 941 and 960).
-  if scoreOf p s sender < p.thresholds.gossipThreshold || !memB (⟨i.topicId⟩ : TopicId) s.topics then
+  -- An IHAVE for a topic we do not subscribe to asks for nothing, as
+  -- go's `handleIHave` skips a topic with no mesh (`gossipsub.go`, line
+  -- 960). The gossip threshold applies to the whole RPC (`gossipOf`).
+  if !memB (⟨i.topicId⟩ : TopicId) s.topics then
     (s, [])
   else if p.maxIhaveMessages ≤ count then (s, [])
   else
@@ -1228,9 +1251,6 @@ def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) 
 the same id, at most `gossipRetransmission` times per peer and id. -/
 def handleIwant (p : Params) (s : State) (sender : Peer) (w : Rpc.ControlIWant) :
     State × List Action :=
-  -- A peer below `GossipThreshold` gets no answer, as in go's
-  -- `handleIWant` (`gossipsub.go`, line 1015).
-  if scoreOf p s sender < p.thresholds.gossipThreshold then (s, []) else
   let answers := w.messageIds.filterMap (fun id =>
     match Cache.MessageIndex.get s.mcache id with
     | some m =>
@@ -1262,7 +1282,7 @@ def handleGraft (p : Params) (s : State) (sender : Peer) (g : Rpc.ControlGraft) 
       match peerOf s sender with
       | some pd =>
           (setPeer (setTopicMesh s ⟨g.topicId⟩ (sender :: meshOf s ⟨g.topicId⟩)) sender
-            { pd with score := Score.graft pd.score s.now ⟨g.topicId⟩ }, [])
+            { pd with score := Score.graft p.score pd.score s.now ⟨g.topicId⟩ }, [])
       | none => (s, [])
   else (s, [])
 
@@ -1368,12 +1388,43 @@ def pxAccept (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) :
       else none
   else []
 
-/-- Handle the control envelope: ihave, iwant, graft, then prune, and
-the peer exchange of the prunes (`pxAccept`). -/
+/-- The control envelope with the sender's gossip dropped when its score
+is below `GossipThreshold`: "incoming gossip is ignored"
+(`gossipsub-v1.1.md`, the threshold table). go reads the score once per
+RPC for its IHAVE and its IWANT (`handleIHave`, `handleIWant`,
+`gossipsub.go`, lines 941 and 1015), and so does this gate. -/
+def gossipOf (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) :
+    Rpc.ControlMessage :=
+  if scoreOf p s sender < p.thresholds.gossipThreshold then { c with ihave := [], iwant := [] }
+  else c
+
+/-- The four control handlers in one pass: each kind runs once, on the
+state the kind before it left. `controlPrunes` and `controlActions`
+state the same answer, one kind at a time (`runControl_eq`), and the
+proofs reason about them. Lean evaluates strictly, so those two would
+each run the handlers before them again, five IHAVE passes per RPC. -/
+def runControl (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) :
+    State × List Action :=
+  let r1 := mapHandlers (fun st b => handleIhave p st sender b) c.ihave s
+  let r2 := mapHandlers (fun st b => handleIwant p st sender b) c.iwant r1.1
+  let r3 := mapHandlers (fun st b => handleGraft p st sender b) c.graft r2.1
+  let r4 := mapHandlers (fun st b => handlePrune p st sender b) c.prune r3.1
+  (r4.1, r1.2 ++ r2.2 ++ r3.2 ++ r4.2)
+
+/-- The one pass gives the state and the actions of the kind-by-kind
+statement. Both sides unfold to the same terms. -/
+theorem runControl_eq (p : Params) (s : State) (sender : Peer) (c : Rpc.ControlMessage) :
+    runControl p s sender c = (controlPrunes p s sender c, controlActions p s sender c) := rfl
+
+/-- Handle the control envelope: the gossip gate, then ihave, iwant,
+graft, and prune, and the peer exchange of the prunes (`pxAccept`). -/
 def handleControl (p : Params) (s : State) (sender : Peer) :
     Option Rpc.ControlMessage → State × List Action
   | none => (s, [])
-  | some c => (controlPrunes p s sender c, controlActions p s sender c ++ pxAccept p s sender c)
+  | some c =>
+    let c := gossipOf p s sender c
+    let r := runControl p s sender c
+    (r.1, r.2 ++ pxAccept p s sender c)
 
 /-- Note the sender's Extensions message. It belongs in the first RPC,
 once. A later one costs a P₇ penalty (`gossipsub-v1.3.md`, "Peer Scoring
@@ -1871,7 +1922,7 @@ private theorem handleGraft_add (p : Params) (s : State) (sender : Peer)
     (hpd : peerOf s sender = some pd) :
     handleGraft p s sender g =
       (setPeer (setTopicMesh s ⟨g.topicId⟩ (sender :: meshOf s ⟨g.topicId⟩)) sender
-        { pd with score := Score.graft pd.score s.now ⟨g.topicId⟩ }, []) := by
+        { pd with score := Score.graft p.score pd.score s.now ⟨g.topicId⟩ }, []) := by
   simp [handleGraft, hsub, hm, hb, hd, he, hpd]
 
 private theorem handleGraft_add_none (p : Params) (s : State) (sender : Peer)
@@ -2055,8 +2106,7 @@ private theorem handleIhave_mesh (p : Params) (s : State) (sender : Peer)
 private theorem handleIwant_mesh (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) (topic : TopicId) :
     meshOf (handleIwant p s sender w).1 topic = meshOf s topic := by
-  unfold handleIwant
-  split <;> simp [meshOf]
+  simp [handleIwant, meshOf]
 
 private theorem handleIhaves_mesh (p : Params) (s : State) (sender : Peer)
     (is : List Rpc.ControlIHave) (topic : TopicId) :
@@ -2096,8 +2146,7 @@ private theorem handleIhave_topics (p : Params) (s : State) (sender : Peer)
 
 private theorem handleIwant_topics (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) : (handleIwant p s sender w).1.topics = s.topics := by
-  unfold handleIwant
-  split <;> simp
+  simp [handleIwant]
 
 private theorem handleGraft_topics (p : Params) (s : State) (sender : Peer)
     (g : Rpc.ControlGraft) : (handleGraft p s sender g).1.topics = s.topics := by
@@ -2224,7 +2273,9 @@ private theorem handleControl_mesh (p : Params) (s : State) (sender : Peer)
     meshOf (handleControl p s sender c).1 topic = meshOf s topic := by
   cases c with
   | none => rfl
-  | some c =>
+  | some c0 =>
+    simp only [handleControl, runControl_eq]
+    generalize gossipOf p s sender c0 = c
     have h1 : meshOf (controlIhaves p s sender c) topic = meshOf s topic := by
       simp only [controlIhaves]
       exact handleIhaves_mesh p s sender c.ihave topic
@@ -2240,7 +2291,6 @@ private theorem handleControl_mesh (p : Params) (s : State) (sender : Peer)
       simp only [controlPrunes]
       rw [handlePrunes_mesh p (controlGrafts p s sender c) sender c.prune topic
         (by rw [h3]; exact hnot), h3]
-    simp only [handleControl]
     exact h4
 
 private theorem handleControl_prune (p : Params) (s : State) (sender : Peer)
@@ -2615,9 +2665,7 @@ private theorem handleIwant_not_deliver (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) (m : Message) :
     Action.deliver m ∉ (handleIwant p s sender w).2 := by
   simp only [handleIwant]
-  split
-  · simp
-  · simp [List.mem_map]
+  simp [List.mem_map]
 
 private theorem handlePrune_not_deliver (p : Params) (s : State) (sender : Peer)
     (q : Rpc.ControlPrune) (m : Message) :
@@ -2956,10 +3004,10 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
                   simp [handleControl] at hdel
               | some c =>
                   rw [hctl] at hdel
-                  simp only [handleControl, List.mem_append] at hdel
+                  simp only [handleControl, runControl_eq, List.mem_append] at hdel
                   rcases hdel with hdel | hdel
-                  · exact absurd hdel (controlActions_not_deliver p _ sender c m)
-                  · exact absurd hdel (pxAccept_not_deliver p _ sender c m)
+                  · exact absurd hdel (controlActions_not_deliver p _ sender _ m)
+                  · exact absurd hdel (pxAccept_not_deliver p _ sender _ m)
             · exact absurd hdel (handlePartialIn_not_deliver p _ sender rpc.partialRpc m)
 
 /-! ## The backoff theorem -/

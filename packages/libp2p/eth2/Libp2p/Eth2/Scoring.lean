@@ -1,3 +1,4 @@
+import Std.Data.HashMap
 import Libp2p.Protocols.Gossipsub.Core
 import Libp2p.Eth2.Constants
 import Libp2p.Eth2.Fork
@@ -231,20 +232,23 @@ def thresholds : Thresholds :=
     opportunisticGraftThreshold := toWeight 5 }
 
 /-- The parameters of a topic kind, for `active` validators at `slot`.
-`none` for a kind the profile does not score. -/
-def kindParams (st : Settings) (active slot : Nat) : Kind → Option Score.TopicParams
-  | .beaconBlock => some (dynamicParams st active slot).1
-  | .beaconAggregateAndProof => some (dynamicParams st active slot).2.1
-  | .beaconAttestation _ => some (dynamicParams st active slot).2.2
-  | .voluntaryExit =>
-    some (topicParams st voluntaryExitWeight (4 / st.slotsPerEpoch.toFloat) (st.epoch * 100) none)
-  | .attesterSlashing =>
-    some (topicParams st attesterSlashingWeight (1 / 5 / st.slotsPerEpoch.toFloat) (st.epoch * 100)
-      none)
-  | .proposerSlashing =>
-    some (topicParams st proposerSlashingWeight (1 / 5 / st.slotsPerEpoch.toFloat) (st.epoch * 100)
-      none)
-  | _ => none
+`none` for a kind the profile does not score. The six values are
+computed once, before the function: the router looks a topic up for
+every score it reads, and the Float powers would run again each time. -/
+def kindParams (st : Settings) (active slot : Nat) : Kind → Option Score.TopicParams :=
+  let (block, aggregate, attestation) := dynamicParams st active slot
+  let rare := 1 / 5 / st.slotsPerEpoch.toFloat
+  let exit := topicParams st voluntaryExitWeight (4 / st.slotsPerEpoch.toFloat) (st.epoch * 100) none
+  let attester := topicParams st attesterSlashingWeight rare (st.epoch * 100) none
+  let proposer := topicParams st proposerSlashingWeight rare (st.epoch * 100) none
+  fun
+    | .beaconBlock => some block
+    | .beaconAggregateAndProof => some aggregate
+    | .beaconAttestation _ => some attestation
+    | .voluntaryExit => some exit
+    | .attesterSlashing => some attester
+    | .proposerSlashing => some proposer
+    | _ => none
 
 /-- The global parameters (`get_peer_score_params`). -/
 def globalParams (st : Settings) : Score.GlobalParams :=
@@ -265,10 +269,15 @@ def globalParams (st : Settings) : Score.GlobalParams :=
 validators at `slot`. A topic of another digest gets none. -/
 def scoreParams (c : Chain) (digest : ByteArray) (active slot : Nat) : Score.Params :=
   let st := settings c
-  { topics := fun t =>
-      match topicParse? t.name with
-      | some (d, k) => if d == digest then kindParams st active slot k else none
-      | none => none
+  let byKind := kindParams st active slot
+  -- The router reads a topic's parameters for every counter of every
+  -- score, so the lookup is one hash of the topic string, built once.
+  let scored : List Kind := [.beaconBlock, .beaconAggregateAndProof, .voluntaryExit,
+    .proposerSlashing, .attesterSlashing] ++
+    (List.range Constants.attestationSubnetCount).map .beaconAttestation
+  let table : Std.HashMap String Score.TopicParams := Std.HashMap.ofList
+    (scored.filterMap fun k => (byKind k).map fun tp => (topicOf digest k, tp))
+  { topics := fun t => table.get? t.name
     global := globalParams st }
 
 /-- The router parameters of a consensus node with Lighthouse's scoring:

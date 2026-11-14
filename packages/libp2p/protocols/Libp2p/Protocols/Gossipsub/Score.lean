@@ -484,11 +484,16 @@ private def setCounters (s : PeerState) (id : TopicId) (t : TopicCounters) : Pee
 /-! ## Counter updates -/
 
 /-- The graft update: when the peer is not in the mesh, set `inMesh` and record the graft time.
-A peer that is already in the mesh is unchanged. -/
-def graft (s : PeerState) (now : Millis) (id : TopicId) : PeerState :=
-  let t := countersOf s id
-  if t.inMesh then s
-  else setCounters s id { t with inMesh := true, graftTime := now }
+A peer that is already in the mesh is unchanged. An unconfigured topic keeps no counters, as in
+rust-libp2p, so it is unchanged too: the score reads every counter of the peer, and a counter of
+an unconfigured topic only costs time. -/
+def graft (p : Params) (s : PeerState) (now : Millis) (id : TopicId) : PeerState :=
+  match p.topics id with
+  | none => s
+  | some _ =>
+    let t := countersOf s id
+    if t.inMesh then s
+    else setCounters s id { t with inMesh := true, graftTime := now }
 
 /-- The counter part of a prune: fold the elapsed mesh time into `timeInMesh`, leave the mesh,
 and add the square of the delivery deficit to the failure penalty when the activation window

@@ -691,8 +691,10 @@ private def stalledAndDrops (r : Tests.Runner) : Async Unit := do
   let stream ← openStream control pb
   discard <| stream.write (frame marker)
   r.check "node.stall.loop-serves-marker" ((← receive receipts).isSome)
+  -- A subscription frame tells the peer our state, so a full queue does
+  -- not drop it: it waits on a task of the node (`enqueueFrame`).
   let drops ← (n.dropped : BaseIO Nat)
-  r.check "node.queue.capacity-32-drops-28" (drops == 28)
+  r.check "node.queue.subscriptions-wait-not-dropped" (drops == 0)
   IO.println s!"node.measure.full-queue drops={drops}"
   let stopped ← withinDeadline Clock.system patience parked.close n.stop
   r.check "node.stall.stop-returns-before-deadline" (match stopped with | .ok () => true | _ => false)

@@ -3,7 +3,7 @@ import Libp2p.Eth2
 /-!
 # `eth2-probe`: the consensus service against a live network
 
-`eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]...`
+`eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]... [--no-scoring]`
 joins the network of a testnet directory with leanp2p's consensus service
 (`Libp2p.Eth2.Service`) and checks what the other clients answer. It needs no chain
 model, so it never validates a message: every held gossip message gets IGNORE, which
@@ -38,9 +38,13 @@ structure Args where
   port : Nat := 9000
   seconds : Nat := 120
   boot : List String := []
+  scoring : Bool := true
+  quic : Bool := true
 
 def parse : List String → Args → Except String Args
   | [], a => if a.dir.isEmpty then throw "the testnet directory is required" else pure a
+  | "--no-quic" :: rest, a => parse rest { a with quic := false }
+  | "--no-scoring" :: rest, a => parse rest { a with scoring := false }
   | "--ip" :: s :: rest, a =>
     let parts := (s.splitOn ".").filterMap (·.toNat?)
     if parts.length == 4 && parts.all (· < 256) then parse rest { a with ip := parts }
@@ -132,8 +136,9 @@ def run (a : Args) : IO UInt32 := do
     | .error _ => throw (IO.userError "the secp256k1 generator failed")
   let events ← (OnceRef.new (#[] : Array Event) : BaseIO _)
   let s ← Async.run (Service.start {
-    chain, key, ip := a.ip, tcpPort := a.port, quicPort := some (a.port + 1), discPort := a.port
-    bootEnrs := boot, advert := { cgc := 128 }
+    chain, key, ip := a.ip, tcpPort := a.port, quicPort := if a.quic then some (a.port + 1) else none
+    discPort := a.port
+    bootEnrs := boot, advert := { cgc := 128 }, scoring := a.scoring
     onEvent := fun e => events.update (·.push e) })
   IO.println s!"eth2-probe: listening on {s.listenAddrs.map toString}"
   IO.println s!"eth2-probe: record {(← s.localEnr).toText}"
@@ -182,8 +187,13 @@ def run (a : Args) : IO UInt32 := do
     if now ≥ nextReport then
       nextReport := now + 10000
       let c ← counts.get
+      let meshed ← match ← Async.run s.gossip.stats with
+        | some st => pure s!"{(st.mesh.filter (·.2 > 0)).length} of {st.topics} topics meshed, \
+            router peers {st.peers}, seen {st.seen}, cached {st.cached}, pending {st.pending}, \
+            dontSend {st.dontSend}, dropped {st.dropped}, v1.2 {st.v12Peers}, v1.3 {st.v13Peers}"
+        | none => pure "no stats"
       IO.println s!"t+{(now - start) / 1000}s: peers {(← s.peers).length}, blocks {c.blocks}, \
-        aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}"
+        aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}, {meshed}"
   Async.run tasks.joinAll
   Async.run s.stop
   let c ← counts.get
@@ -200,5 +210,5 @@ def main (args : List String) : IO UInt32 := do
   | .ok a => Eth2Probe.run a
   | .error e =>
     IO.eprintln s!"eth2-probe: {e}"
-    IO.eprintln "usage: eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]..."
+    IO.eprintln "usage: eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]... [--no-scoring]"
     return 2

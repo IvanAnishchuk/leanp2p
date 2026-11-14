@@ -83,7 +83,7 @@ Each step applies one update to the state of the step before.
 -/
 
 /-- Step 2: the peer is grafted at time 0. -/
-private def s1 : PeerState := graft PeerState.zero 0 eth
+private def s1 : PeerState := graft walkParams PeerState.zero 0 eth
 
 /-- Step 3: one mesh delivery and one first delivery. -/
 private def s2 : PeerState := firstDelivery walkParams (meshDelivery walkParams s1 eth) eth
@@ -244,6 +244,12 @@ example : ¬ Params.Valid { topics := walkParams.topics, global := badIpThreshol
 /-- Run the checks of this module. -/
 def run (r : Runner) : IO Unit := do
   r.section "gossipsub Score" "vendor/specs/pubsub"
+
+  -- A graft on a topic with no parameters keeps no counters: the score
+  -- reads every counter of the peer, and such a counter only costs time.
+  r.check "score.graft.unconfigured-keeps-no-counters"
+    ((graft walkParams PeerState.zero 0 other).topics.isEmpty &&
+      (graft walkParams PeerState.zero 0 eth).topics.length == 1)
 
   -- Step 1: the fresh peer. Every term is 0 and the topic list is empty.
   r.check "score.walk.fresh-peer" (score walkParams PeerState.zero 0 == 0)

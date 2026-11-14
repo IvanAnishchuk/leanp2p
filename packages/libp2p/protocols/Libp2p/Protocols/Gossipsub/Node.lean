@@ -563,7 +563,9 @@ private structure Env where
   pxQueue : Conc.Chan Peer
 
 /-- Encode and offer one RPC to a peer's queue. This operation never parks.
-A full queue drops its frame. Each peer has one writer and one stream. -/
+A full queue drops a frame of gossip or messages. A frame of our state
+waits on a task of its own (`mustArrive` below). Each peer has one
+writer and one stream. -/
 private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Bool := do
   if ← env.closing.get then return true
   -- IDONTWANT goes to a v1.2 or v1.3 peer only (`gossipsub-v1.2.md`).
@@ -625,7 +627,22 @@ private def enqueueFrame (env : Env) (peer : Peer) (rpc0 : Rpc.RPC) : BaseIO Boo
   if ← env.closing.get then
     ob.queue.close
     return true
-  if !(← ob.queue.trySend frame) then env.drops.update (· + 1)
+  -- A frame that tells the peer our state may not be lost: subscriptions,
+  -- GRAFT and PRUNE, and the Extensions message, which goes once. go
+  -- retries such an announcement when the queue is full (`announceRetry`,
+  -- `pubsub.go`). Here a task of the node parks on the queue instead, so
+  -- the loop never parks. Gossip and messages still drop: the peer can
+  -- ask again.
+  let mustArrive := !rpc.subscriptions.isEmpty ||
+    (match rpc.control with
+     | some c => !c.graft.isEmpty || !c.prune.isEmpty || c.extensions.isSome
+     | none => false)
+  if !(← ob.queue.trySend frame) then
+    if mustArrive then
+      -- Park: the writer's take frees a slot, and the peer's removal or
+      -- `stop` closes the queue.
+      env.tasks.spawn (discard <| ob.queue.send frame)
+    else env.drops.update (· + 1)
   return true
 
 /-- Encode and offer one RPC to a peer's queue (`enqueueFrame`). The
