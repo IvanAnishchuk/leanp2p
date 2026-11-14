@@ -258,6 +258,12 @@ srcDir = "packages/cli"
 roots = ["CliHarness", "Demo", "PingNode", "Interop", "GossipsubInterop", "GossipsubSession"]
 globs = ["CliHarness", "Demo", "PingNode", "Interop.*", "GossipsubInterop", "GossipsubSession"]
 
+# The consensus service against a live network (libp2p/eth2 PLAN, unit 3).
+[[lean_exe]]
+name = "eth2-probe"
+srcDir = "packages/cli"
+root = "Eth2Probe"
+
 # The transport-interop harness of root PLAN W5.9.
 [[lean_exe]]
 name = "interop"

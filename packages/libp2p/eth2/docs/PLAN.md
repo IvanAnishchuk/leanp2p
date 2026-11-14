@@ -57,5 +57,19 @@ Unit 2 (`Tests/Eth2.lean`, two services over loopback):
   leave.
 - The suite passes on two threads and on one.
 
-Unit 3: `shadow_node` on the devnet, on leanp2p, with `shadow-node
-check` against the host node.
+Unit 3 has two legs:
+- The network leg: `eth2-probe` (`packages/cli/Eth2Probe.lean`) joins
+  the devnet with the service alone, and needs no chain model. On
+  `devnet/multi.yaml`, two Lighthouse nodes and one Grandine accepted
+  its dials and exchanged `Status`, with our digest. Each answered
+  `BeaconBlocksByRange` with our digest as the context bytes, and Ping
+  and MetaData v3. Gossip arrived on the block, aggregate, attestation,
+  and column topics. A column range at slots 0 and 1 gave no chunks,
+  since those blocks carry no blobs.
+- The model leg: `shadow_node_lean` on the devnet, with `shadow-node
+  check` against the host node.
+
+Open from the network leg: in a run of 120 s, one Lighthouse node
+ended our session once, and the discovery loop dialed it again. Its
+log at the info level names no reason. A run with Lighthouse at the
+debug level finds the cause.

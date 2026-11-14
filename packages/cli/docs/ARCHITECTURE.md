@@ -25,6 +25,7 @@ row 18).
 | `Interop/Config.lean` | the test plan's environment variables, read into a `Config`, and the timing record |
 | `Interop/Resp.lean` | RESP2, pure: the reply header parse with its caps, and the command encoding |
 | `Interop/Redis.lean` | the harness coordination client, private to the `interop` executable: `PING`, `RPUSH`, and `BLPOP` over one connection; the spike's `LeanP2P/Interop/Redis.lean` mapped here |
+| `Eth2Probe.lean` | the `eth2-probe` executable: the consensus service of `libp2p/eth2` against a live network, with no chain model (the eth2 PLAN, unit 3) |
 
 `Demo.lean` and `PingNode.lean` are the executable roots. Each
 `main` checks its arguments with `Cmd.parse`. A usage error exits 2.
