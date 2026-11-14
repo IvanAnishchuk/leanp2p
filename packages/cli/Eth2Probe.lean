@@ -3,11 +3,13 @@ import Libp2p.Eth2
 /-!
 # `eth2-probe`: the consensus service against a live network
 
-`eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]... [--no-scoring]`
-joins the network of a testnet directory with leanp2p's consensus service
-(`Libp2p.Eth2.Service`) and checks what the other clients answer. It needs no chain
-model, so it never validates a message: every held gossip message gets IGNORE, which
-costs the sender nothing.
+`eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]...
+[--no-scoring] [--no-quic]` joins the network of a testnet directory with leanp2p's
+consensus service (`Libp2p.Eth2.Service`) and checks what the other clients answer. It
+needs no chain model, so it never validates a message: every held gossip message gets
+IGNORE, which costs the sender nothing. The probe then forwards nothing, so from one
+epoch on, the peers' mesh delivery term scores it down and they prune it from many
+meshes. `--no-scoring` runs the router unscored, and `--no-quic` leaves QUIC out.
 
 The directory holds `config.yaml` and `genesis.ssz`, and it may hold `boot_enr.yaml` or
 `bootstrap_nodes.txt`. TCP and discv5 listen on `--port` (default 9000), and QUIC on the
@@ -210,5 +212,5 @@ def main (args : List String) : IO UInt32 := do
   | .ok a => Eth2Probe.run a
   | .error e =>
     IO.eprintln s!"eth2-probe: {e}"
-    IO.eprintln "usage: eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]... [--no-scoring]"
+    IO.eprintln "usage: eth2-probe <testnet-dir> [--ip <a.b.c.d>] [--port <p>] [--seconds <n>] [--boot-enr <enr>]... [--no-scoring] [--no-quic]"
     return 2

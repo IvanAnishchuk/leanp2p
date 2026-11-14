@@ -110,7 +110,13 @@ Unit 6 (`Tests/Eth2.lean`):
   ahead of the fork, then `Status`, the record, and `topic` name the new
   digest, then the pre-fork topic goes.
 
-Open from the network leg: in a run of 120 s, one Lighthouse node
-ended our session once, and the discovery loop dialed it again. Its
-log at the info level names no reason. A run with Lighthouse at the
-debug level finds the cause.
+A run of 600 s on the devnet without the spammer and assertoor, with
+Lighthouse at the debug level: three peers stayed connected for the
+whole run, 50 blocks arrived on gossip (one per slot), 235 aggregates,
+and 1650 attestations. No frame dropped, and Lighthouse sent `Status`
+again every 300 s. Before the loop fix of the gossipsub node, the loop
+used one core in full and fell minutes behind, which explains the
+session drop of the 120 s run. From about 384 s on, the peers pruned the
+probe from many meshes. Their mesh delivery term starts one epoch in,
+and the probe answers IGNORE to every message, so it forwards nothing.
+A client that accepts valid messages forwards them.

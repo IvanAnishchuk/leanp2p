@@ -314,6 +314,21 @@ Both spike programs call `Ping.ping`.
   of 0.996 then takes a count of 1 to 0 in one heartbeat, and consensus
   topics decay over hundreds of heartbeats. With the unit, the floor
   costs one thousandth of an event a step.
+- **The compiled code runs each part once.** Lean evaluates strictly and
+  hoists no call out of a function, so a definition that names its
+  parts one by one computes a shared part again for each use. The
+  heartbeat and the control handlers are stated part by part, for the
+  proofs, and each has a one-pass twin (`heartbeatOnce`, `runControl`)
+  equal to it by `rfl`. A `@[csimp]` theorem makes the compiler run
+  `heartbeatOnce`. Without it a consensus node, on about 200 topics,
+  planned every topic again for each kept peer of each plan, and the
+  loop fell minutes behind its peers.
+- **A frame of our state waits; gossip drops.** A full peer queue drops
+  gossip and messages, which the peer can ask for again. A frame with
+  subscriptions, GRAFT, PRUNE, or the Extensions message waits on a
+  task of the node instead, as go retries an announcement
+  (`announceRetry`). A consensus node subscribes to about 200 topics at
+  once, and a dropped subscription leaves the peer unaware of it.
 - **The scores decay once per `decayInterval`.** The spec decays every
   counter each decay interval, and go runs the decay on its own ticker.
   The core decays at the first heartbeat one interval after the last
