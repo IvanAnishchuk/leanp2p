@@ -46,6 +46,17 @@ def attestationSubnetCount : Nat := 64
 /-- `SYNC_COMMITTEE_SUBNET_COUNT` (altair `validator.md`, "Constants"). -/
 def syncCommitteeSubnetCount : Nat := 4
 
+/-- `MAX_COMMITTEES_PER_SLOT` of the mainnet preset (phase0 `beacon-chain.md`,
+"Presets"). -/
+def maxCommitteesPerSlot : Nat := 64
+
+/-- `TARGET_COMMITTEE_SIZE` of the mainnet preset (phase0 `beacon-chain.md`,
+"Presets"). -/
+def targetCommitteeSize : Nat := 128
+
+/-- `TARGET_AGGREGATORS_PER_COMMITTEE` (phase0 `validator.md`, "Constants"). -/
+def targetAggregatorsPerCommittee : Nat := 16
+
 /-- `DATA_COLUMN_SIDECAR_SUBNET_COUNT` (fulu, "Configs"). -/
 def dataColumnSidecarSubnetCount : Nat := 128
 

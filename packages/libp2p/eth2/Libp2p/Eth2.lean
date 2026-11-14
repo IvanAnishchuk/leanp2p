@@ -6,6 +6,7 @@ import Libp2p.Eth2.MessageId
 import Libp2p.Eth2.Enr
 import Libp2p.Eth2.Messages
 import Libp2p.Eth2.Gossip
+import Libp2p.Eth2.Scoring
 import Libp2p.Eth2.Peers
 import Libp2p.Eth2.Service
 

@@ -19,6 +19,7 @@ import Libp2p.Eth2.MessageId
 import Libp2p.Eth2.Messages
 import Libp2p.Eth2.Gossip
 import Libp2p.Eth2.Peers
+import Libp2p.Eth2.Scoring
 
 /-!
 # The consensus network service
@@ -68,6 +69,9 @@ the events.
   `report`. Data that does not decompress gets REJECT at once: "Clients
   MUST reject (fail validation) messages containing an incorrect type,
   or invalid payload".
+* **Scoring.** The router scores peers with Lighthouse's profile
+  (`Scoring`). The client keeps the chain-dependent topics current with
+  `updateScores`.
 
 ## Concurrency
 
@@ -147,6 +151,11 @@ structure Config where
   discoverEveryMs : Nat := 5000
   /-- The deadline of one request: Lighthouse's `RESP_TIMEOUT`, 10 s. -/
   requestTimeoutMs : Nat := 10000
+  /-- Peer scoring with Lighthouse's profile (`Scoring`). The service
+  starts it as Lighthouse does, at `SLOTS_PER_EPOCH` active validators
+  and slot 0, and the client keeps it current (`Service.updateScores`).
+  `false` runs the router unscored. -/
+  scoring : Bool := true
   /-- The events. Must not park. -/
   onEvent : Event → BaseIO Unit := fun _ => pure ()
   /-- The client's answer to a block or column request. It emits the
@@ -456,8 +465,11 @@ def start (cfg : Config) : Async Service := do
     match Snappy.decompress data Constants.maxPayloadSize with
     | .ok ssz => cfg.onEvent (.gossip kind id src ssz)
     | .error _ => discard <| n.report id src .reject
+  let params := if cfg.scoring then
+      Scoring.scoredParams cfg.chain digest cfg.chain.slotsPerEpoch 0
+    else gossipParams cfg.chain
   let gossip ← (Gossipsub.Node.start (Gossipsub.HostSeam.ofHost host)
-    { params := gossipParams cfg.chain
+    { params
       maxRpcSize := Constants.gossipMaxMessageSize
       payloadId := some messageId
       onValidate } : BaseIO _)
@@ -494,6 +506,19 @@ parks while the gossipsub node's control queue is full
 topics at once. `false` once the node stops. -/
 def subscribe (s : Service) (k : Kind) : Async Bool := do
   s.gossip.subscribeWait (← s.topic k) fun _ => pure ()
+
+/-- Bring the chain-dependent score parameters up to date: the block, the
+aggregate, and every attestation subnet, for `active` validators at
+`slot`. Lighthouse calls this every 60 s (`update_gossipsub_parameters`).
+`false` once the node stops, or with scoring off. -/
+def updateScores (s : Service) (active slot : Nat) : Async Bool := do
+  if !s.base.config.scoring then return false
+  let st := Scoring.settings s.base.config.chain
+  let (block, aggregate, attestation) := Scoring.dynamicParams st active slot
+  let kinds : List (Kind × Gossipsub.Score.TopicParams) :=
+    [(.beaconBlock, block), (.beaconAggregateAndProof, aggregate)] ++
+      (List.range Constants.attestationSubnetCount).map fun i => (.beaconAttestation i, attestation)
+  kinds.allM fun (k, tp) => do s.gossip.setTopicParams (← s.topic k) (some tp)
 
 /-- Answer a held message. -/
 def report (s : Service) (id : MessageId) (source : PeerId) (v : Gossipsub.Core.Validation) :

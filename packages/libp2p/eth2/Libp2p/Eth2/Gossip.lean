@@ -22,11 +22,10 @@ makes and the spec leaves open.
 The message id is `Libp2p.Eth2.messageId`. The node runs the
 `ByteArray` payload path, so the id reads the payload bytes once.
 
-Peer scoring stays off: the thresholds and the weights are the zeros of
-`Core.defaults`. The spec says the score parameters "are currently under
-investigation", and each client picks its own. Lighthouse derives its
-values from the validator count at run time (`gossipsub_scoring_parameters.rs`).
-The client sets them through `Node.setTopicParams`.
+These parameters score no peer: the thresholds and the weights are the
+zeros of `Core.defaults`. The spec says the score parameters "are
+currently under investigation", and each client picks its own.
+`Scoring.scoredParams` adds Lighthouse's profile to these parameters.
 
 The seen cache holds 262144 ids. At the TTL of mainnet (768 s), that
 covers 341 messages per second.

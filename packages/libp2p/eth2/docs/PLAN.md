@@ -20,6 +20,8 @@ both.
    its Rust path.
 4. **The peer duties.** The peer table (`Peers`), the liveness loop
    with the MetaData refresh, and the ban at the gater.
+5. **The score profile.** Lighthouse's parameters (`Scoring`), on by
+   default, with `updateScores` for the chain-dependent topics.
 
 ## Consumers
 
@@ -83,6 +85,18 @@ Unit 4 (`Tests/Eth2.lean`):
   an answered Ping raises no `unresponsive` event.
 - A ban says Goodbye with reason 251, and the peer leaves. The gater
   refuses our dial to it, and its redials.
+
+Unit 5 (`Tests/Eth2.lean`):
+- The block, aggregate, attestation, and voluntary exit topics, and the
+  global parameters, equal Lighthouse's formulas in Python's float64,
+  at mainnet timing for 500000 validators at slot 100000.
+- On a young chain, the mesh delivery terms are off, and the failure
+  term stays.
+- Every scored kind and the global parameters pass the validity check,
+  and the router parameters meet the spec's constraints.
+- A topic of our digest is scored. A column topic and a topic of another
+  digest are not.
+- Over loopback, `updateScores` posts all 66 topics.
 
 Open from the network leg: in a run of 120 s, one Lighthouse node
 ended our session once, and the discovery loop dialed it again. Its

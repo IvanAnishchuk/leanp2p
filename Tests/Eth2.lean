@@ -147,6 +147,75 @@ private partial def waitUntil (cond : Async Bool) (ms : Nat) : Async Bool := do
   select #[← (Park.sleep 50 () : BaseIO (Park Unit))]
   waitUntil cond (ms - min ms 50)
 
+/-! ## The score profile
+
+The expected values come from `gossipsub_scoring_parameters.rs` of
+Lighthouse, computed in Python's float64 at mainnet timing (12 s slots,
+32 slots per epoch) for 500000 active validators at slot 100000, then
+scaled by 1000 and rounded half away from zero. -/
+
+private def scoringChecks (r : Runner) : IO Unit := do
+  let c := { (← devnetChain) with slotDurationMs := 12000, slotsPerEpoch := 32 }
+  let st := Scoring.settings c
+  let (block, aggregate, attestation) := Scoring.dynamicParams st 500000 100000
+  r.check "scoring: the block topic equals Lighthouse's"
+    (block.topicWeight == 500 && block.timeInMeshWeight == 33 && block.timeInMeshCap == 300 &&
+      block.timeInMeshQuantum == 12000 &&
+      block.firstMessageDeliveriesWeight == 1147 && block.firstMessageDeliveriesDecay == 993 &&
+      block.firstMessageDeliveriesCap == 34869 &&
+      block.meshMessageDeliveriesWeight == -500 && block.meshMessageDeliveriesDecay == 972 &&
+      block.meshMessageDeliveriesThreshold == 685 && block.meshMessageDeliveriesCap == 2055 &&
+      block.meshMessageDeliveriesActivation == 384000 && block.meshMessageDeliveriesWindow == 2000 &&
+      block.meshFailurePenaltyWeight == -500 &&
+      block.invalidMessageDeliveriesWeight == -215000 && block.invalidMessageDeliveriesDecay == 997)
+  r.check "scoring: the aggregate topic equals Lighthouse's"
+    (aggregate.firstMessageDeliveriesWeight == 21 && aggregate.firstMessageDeliveriesDecay == 866 &&
+      aggregate.firstMessageDeliveriesCap == 1942891 &&
+      aggregate.meshMessageDeliveriesDecay == 931 &&
+      aggregate.meshMessageDeliveriesThreshold == 279238 &&
+      aggregate.meshMessageDeliveriesCap == 1116952)
+  r.check "scoring: an attestation subnet equals Lighthouse's"
+    (attestation.topicWeight == 16 && attestation.firstMessageDeliveriesWeight == 88 &&
+      attestation.firstMessageDeliveriesCap == 455365 &&
+      attestation.meshMessageDeliveriesWeight == -16 &&
+      attestation.meshMessageDeliveriesDecay == 965 &&
+      attestation.meshMessageDeliveriesThreshold == 133290 &&
+      attestation.meshMessageDeliveriesCap == 2132644 &&
+      attestation.meshMessageDeliveriesActivation == 204000 &&
+      attestation.invalidMessageDeliveriesWeight == -6880000)
+  let exit := Scoring.kindParams st 500000 100000 .voluntaryExit
+  r.check "scoring: the voluntary exit topic equals Lighthouse's"
+    (exit.map (fun tp => tp.topicWeight == 50 && tp.firstMessageDeliveriesWeight == 1841 &&
+      tp.firstMessageDeliveriesDecay == 999 && tp.firstMessageDeliveriesCap == 21730 &&
+      tp.meshMessageDeliveriesWeight == 0 && tp.invalidMessageDeliveriesWeight == -2150000) ==
+      some true)
+  let g := Scoring.globalParams st
+  r.check "scoring: the global parameters equal Lighthouse's"
+    (g.behaviourPenaltyWeight == -15879 && g.behaviourPenaltyDecay == 986 &&
+      g.behaviourPenaltyThreshold == 6000 && g.topicScoreCap == 53750 &&
+      g.ipColocationFactorWeight == -53750 && g.ipColocationFactorThreshold == 8 &&
+      g.decayInterval == 12000 && g.decayToZero == 10)
+  let (young, _, _) := Scoring.dynamicParams st 500000 0
+  r.check "scoring: on a young chain the mesh delivery terms are off, the failure term stays"
+    (young.meshMessageDeliveriesWeight == 0 && young.meshMessageDeliveriesThreshold == 0 &&
+      young.meshFailurePenaltyWeight == -500)
+  let kinds : List Kind := [.beaconBlock, .beaconAggregateAndProof, .beaconAttestation 0,
+    .voluntaryExit, .proposerSlashing, .attesterSlashing]
+  r.check "scoring: every scored kind passes the validity check"
+    (kinds.all fun k => (Scoring.kindParams st 500000 100000 k).all (·.validB))
+  r.check "scoring: the global parameters pass the validity check" g.validB
+  let digest ← expectOk "digest" (c.forkDigest 0)
+  let params := Scoring.scoredParams c digest 500000 100000
+  r.check s!"scoring: the router parameters meet the spec's constraints {params.problems}"
+    params.problems.isEmpty
+  let ours (k : Kind) : Libp2p.Protocols.Gossipsub.TopicId := ⟨topicOf digest k⟩
+  r.check "scoring: a topic of our digest is scored, a column topic is not"
+    ((params.score.topics (ours .beaconBlock)).isSome &&
+      (params.score.topics (ours (.dataColumnSidecar 3))).isNone)
+  r.check "scoring: a topic of another digest is not scored"
+    (params.score.topics ⟨topicOf ⟨#[1, 2, 3, 4]⟩ .beaconBlock⟩).isNone
+  r.check "scoring: the score retention is 100 epochs" (params.retainScore == 38400000)
+
 /-! ## The peer table -/
 
 private def peersChecks (r : Runner) : IO Unit := do
@@ -222,6 +291,8 @@ private def serviceChecks (r : Runner) : Async Unit := do
   let burst ← (List.range Constants.dataColumnSidecarSubnetCount).allM fun i =>
     a.subscribe (.dataColumnSidecar i)
   r.check "eth2 service: a burst of 128 subscribes loses none" burst
+  -- 66 score updates, past the 64 slots of the control queue.
+  r.check "eth2 service: the score update posts every topic" (← a.updateScores 500000 100)
   let allTopics : Async Bool := do
     match ← a.gossip.stats with
     | some st => return st.topics == 129
@@ -313,6 +384,7 @@ def run (r : Runner) : IO Unit := do
   chainChecks r
   messageIdChecks r
   messageChecks r
+  scoringChecks r
   peersChecks r
   Async.run (serviceChecks r)
 

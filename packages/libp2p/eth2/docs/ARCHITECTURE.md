@@ -32,6 +32,7 @@ and `quic`.
 | `Libp2p/Eth2/Enr.lean` | the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the fork predicates for discovery |
 | `Libp2p/Eth2/Messages.lean` | the req/resp methods with their bounds, and the SSZ of `Status`, `MetaData`, Ping, Goodbye, and the requests |
 | `Libp2p/Eth2/Gossip.lean` | the router parameters of a consensus node |
+| `Libp2p/Eth2/Scoring.lean` | Lighthouse's score profile: the thresholds, the global parameters, and the parameters of each scored topic, from the active validator count and the slot |
 | `Libp2p/Eth2/Peers.lean` | the peer table: the Ping intervals, the known MetaData seq numbers, and the bans, as pure transitions |
 | `Libp2p/Eth2/Service.lean` | the service: the host, gossipsub, discv5, the req/resp handlers, and the peer duties |
 
@@ -48,10 +49,12 @@ and `quic`.
   and the request encoders.
 - `Status`, `MetaData`.
 - `gossipParams`.
+- `Scoring.scoredParams`, `Scoring.dynamicParams`, `Scoring.kindParams`,
+  `Scoring.globalParams`, `Scoring.thresholds`.
 - `Peers`.
 - `Service.start`, `subscribe`, `publish`, `report`, `setStatus`,
-  `request`, `peers`, `disconnect`, `ban`, `isBanned`, `localEnr`,
-  `stop`, and the client's seams:
+  `request`, `peers`, `disconnect`, `ban`, `isBanned`, `updateScores`,
+  `localEnr`, `stop`, and the client's seams:
   `Config.onEvent` (the `Event` stream) and `Config.serve` (the
   `Inbound` requests with their `Emit`).
 
@@ -103,9 +106,15 @@ and `quic`.
   of the fork, which needs the client's numbers.
 - **Goodbye answers nothing**, as in Lighthouse ("Goodbye request has no
   response"). The requester's read ends at the peer's close.
-- **Scoring stays off.** The spec has no score parameters yet, and
-  Lighthouse derives its own from the validator count. The client sets
-  them through the gossipsub node.
+- **Lighthouse's score profile, on by default.** The spec has no score
+  parameters yet, and each client picks its own. The package already
+  takes Lighthouse's numbers for the other open choices, and the devnet
+  peers are two Lighthouse nodes. The service starts the profile as
+  Lighthouse does, at
+  `SLOTS_PER_EPOCH` active validators and slot 0. The client calls
+  `updateScores` with the chain's numbers, every 60 s in Lighthouse. The
+  rounding to fixed point is in `Scoring.lean`. `Config.scoring := false`
+  runs the router unscored.
 - **The seen cache holds 262144 ids**, which covers 341 messages per
   second at mainnet's TTL of 768 s. The ids are `List Nat` in the
   router, about 480 bytes each, so a larger cache costs memory that the
@@ -132,6 +141,10 @@ and `quic`.
   and `nfd` equal its fields (`Tests/Eth2.lean`).
 - The message id: SHA-256 values that Python's `hashlib` computed from
   the spec's formula, for each snappy domain.
+- The score profile: Lighthouse's formulas in Python's float64, at
+  mainnet timing for 500000 validators, against every scored kind and
+  the global parameters, plus the young-chain rule and the spec's
+  parameter constraints.
 - Two services over loopback: the boot dial, `Status` both ways, gossip
   with the held validation and the consensus id, a block range with its
   context bytes, MetaData, Ping, the MetaData refresh after a Ping,
