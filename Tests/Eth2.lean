@@ -292,7 +292,7 @@ private def peersChecks (r : Runner) : IO Unit := do
 
 /-- A service on loopback with a recorded event list. -/
 private def startOn (c : Chain) (seed : UInt8) (events : OnceRef (List Event))
-    (boot : List Enr := []) (serve : PeerId → Inbound → Emit → Async Unit := fun _ _ _ => pure ()) :
+    (boot : List Enr := []) (serve : PeerId → Inbound → Emit → Async Ending := fun _ _ _ => pure .done) :
     Async Service := do
   let key ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 seed⟩)
   Service.start {
@@ -306,19 +306,28 @@ private def serviceChecks (r : Runner) : Async Unit := do
   let digest ← expectOk "digest" (c.forkDigest 0)
   let evA ← (OnceRef.new ([] : List Event) : BaseIO _)
   let evB ← (OnceRef.new ([] : List Event) : BaseIO _)
-  -- A serves `count` blocks of 404 bytes from `startSlot` on, each with
-  -- our digest as its context.
-  let serve : PeerId → Inbound → Emit → Async Unit := fun _ req emit => do
+  -- A serves blocks of 404 bytes from `startSlot` on, each with our
+  -- digest as its context. It tries two past `count`, and the service's
+  -- cap refuses those two.
+  let refused ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
+  let serve : PeerId → Inbound → Emit → Async Ending := fun _ req emit => do
     match req with
     | .blocksByRange start count =>
-      for i in [0:count] do
-        discard <| emit digest ⟨Array.replicate 404 (start + i).toUInt8⟩
+      for i in [0:count + 2] do
+        if !(← emit digest ⟨Array.replicate 404 (start + i).toUInt8⟩) then
+          (refused.update (· + 1) : BaseIO Unit)
+      return .done
     -- The ancestry of the root, newest first: blocks 9, 8, ... here.
     | .blocksByHead root count =>
       if root.size == 32 then
         for i in [0:count] do
           discard <| emit digest ⟨Array.replicate 404 (9 - i).toUInt8⟩
-    | _ => pure ()
+      return .done
+    -- One column, then the end of what A keeps.
+    | .columnsByRange start _ _ =>
+      discard <| emit digest ⟨Array.replicate 356 start.toUInt8⟩
+      return .resourceUnavailable "pruned"
+    | _ => return .done
   let a ← startOn c 1 evA (serve := serve)
   let b ← startOn c 2 evB [← (a.localEnr : BaseIO Enr)]
   let aPeer := a.base.host.localPeer
@@ -376,7 +385,14 @@ private def serviceChecks (r : Runner) : Async Unit := do
       (chunks.all (·.context == digest))
     r.check "eth2 service: the chunks keep their order"
       (chunks.map (·.payload.get! 0) == [10, 11, 12])
+    r.check "eth2 service: the cap refuses the two chunks past count" ((← refused.get) == 2)
   | .error _ => r.check "eth2 service: the range request answers" false
+  match ← b.request aPeer columnsByRangeMethod (some (columnsByRangeRequest 5 1 [1, 2])) with
+  | .ok chunks =>
+    r.check "eth2 service: a column range ends with ResourceUnavailable after its column"
+      (chunks.map (·.result) == [.success, .resourceUnavailable] &&
+        (chunks.getLast?.map (·.payload)) == some "pruned".toUTF8)
+  | .error _ => r.check "eth2 service: the column range request answers" false
   match ← b.request aPeer blocksByHeadMethod (some (blocksByHeadRequest ⟨Array.replicate 32 1⟩ 3)) with
   | .ok chunks =>
     r.check "eth2 service: the head request gets the ancestry, newest first"

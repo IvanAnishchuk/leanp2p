@@ -132,10 +132,54 @@ inductive Inbound where
   /-- The raw SSZ of a `DataColumnsByRootIdentifiers` list. -/
   | columnsByRoot (ssz : ByteArray)
 
+/-- The most success chunks that the answer to a request may hold,
+below the method's own cap (`Method.maxChunks`). A block range holds
+at most `count` blocks ("The response MUST contain no more than `count`
+blocks", phase0), and a head walk at most `count` blocks (fulu). A root
+list gets a block per root it names. A column range gets a sidecar of
+each requested column at each slot of the range. A column root list has
+only the method's cap. -/
+def Inbound.limit : Inbound → Option Nat
+  | .blocksByRange _ count => some count
+  | .blocksByRoot roots => some roots.length
+  | .blocksByHead _ count => some count
+  | .columnsByRange _ count columns => some (count * columns.length)
+  | .columnsByRoot _ => none
+
 /-- The answer of one chunk to an inbound request: the context bytes,
 the `ForkDigest` of the chunk's epoch, and the SSZ. It answers `false`
-when the stream failed, and the client should stop then. -/
+when the stream failed or the answer holds its most chunks
+(`Inbound.limit`), and the client should stop then. The service never
+sends a chunk past that cap. -/
 abbrev Emit := ByteArray → ByteArray → Async Bool
+
+/-- How the client ends its answer to a block or column request. An
+error ends the answer with one error chunk, after the chunks emitted
+before it ("only the last chunk is allowed to have a non-zero error
+code", phase0). The message goes out cut at the 256 bytes of
+`ErrorMessage`. -/
+inductive Ending where
+  /-- The chunks emitted are the whole answer. -/
+  | done
+  /-- `1: InvalidRequest`: the request parses, and the client finds it
+  invalid. -/
+  | invalidRequest (message : String)
+  /-- `2: ServerError`: the client failed to answer. -/
+  | serverError (message : String)
+  /-- `3: ResourceUnavailable`: the client does not keep the blocks or
+  columns asked for ("SHOULD respond with error code
+  `3: ResourceUnavailable`", phase0 "BeaconBlocksByRange v1"). -/
+  | resourceUnavailable (message : String)
+
+/-- The error chunk that ends an answer, if any. -/
+def Ending.chunk? : Ending → Option Chunk
+  | .done => none
+  | .invalidRequest msg => some (errorChunk .invalidRequest msg)
+  | .serverError msg => some (errorChunk .serverError msg)
+  | .resourceUnavailable msg => some (errorChunk .resourceUnavailable msg)
+where
+  errorChunk (r : ReqResp.Result) (msg : String) : Chunk :=
+    ⟨r, ByteArray.empty, msg.toUTF8.extract 0 Libp2p.Protocols.Constants.errorMessageLimit⟩
 
 /-- The service's configuration. -/
 structure Config where
@@ -168,10 +212,10 @@ structure Config where
   /-- The events. Must not park. -/
   onEvent : Event → BaseIO Unit := fun _ => pure ()
   /-- The client's answer to a block or column request. It emits the
-  chunks it has, in the order the method requires. The default emits
-  none, which the spec allows ("Clients MAY limit the number of blocks
-  in the response"). -/
-  serve : PeerId → Inbound → Emit → Async Unit := fun _ _ _ => pure ()
+  chunks it has, in the order the method requires, and it names how the
+  answer ends. The default emits none, which the spec allows ("Clients
+  MAY limit the number of blocks in the response"). -/
+  serve : PeerId → Inbound → Emit → Async Ending := fun _ _ _ => pure .done
 
 /-- Milliseconds since the Unix epoch. -/
 def wallMs : IO Nat := do
@@ -229,7 +273,8 @@ def successOf : Except ReqResp.Error (List Chunk) → Option ByteArray
     | _ => none
   | _ => none
 
-/-- Say Goodbye with `reason`. The peer answers nothing. -/
+/-- Say Goodbye with `reason`. The answer, zero chunks or one, has no
+use here. -/
 def goodbye (b : Base) (peer : PeerId) (reason : Nat) : Async Unit := do
   discard <| b.request peer goodbyeMethod (some (Chain.le64 reason))
 
@@ -290,8 +335,16 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
     match inboundOf m (payload.getD ByteArray.empty) with
     | none => discard <| emit invalid
     | some req =>
-      b.config.serve peer req fun context ssz => do
+      let cap := min (req.limit.getD m.maxChunks) m.maxChunks
+      let sent ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
+      let ending ← b.config.serve peer req fun context ssz => do
+        -- A slot under the cap, taken in one update: a chunk past the
+        -- cap breaks the spec's bound, so it never goes out.
+        let room ← (sent.updateGet fun n => if n < cap then (true, n + 1) else (false, n) :
+          BaseIO Bool)
+        if !room then return false
         return (← emit ⟨.success, context, ssz⟩) matches .ok _
+      if let some c := ending.chunk? then discard <| emit c
   [b.handlerOf statusMethod fun peer payload emit => do
       discard <| emit (plain (← (b.status.get : BaseIO Status)).encode)
       if let some st := payload.bind Status.decode? then

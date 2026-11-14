@@ -57,7 +57,7 @@ and `quic`.
   `request`, `peers`, `disconnect`, `ban`, `isBanned`, `updateScores`,
   `localEnr`, `stop`, and the client's seams:
   `Config.onEvent` (the `Event` stream) and `Config.serve` (the
-  `Inbound` requests with their `Emit`).
+  `Inbound` requests with their `Emit`, answered by an `Ending`).
 
 ## Owned contracts and how the package keeps them
 
@@ -85,6 +85,11 @@ and `quic`.
    so nothing spawns after the join.
 6. **Callbacks never park.** `Config.onEvent` runs on the gossipsub
    loop and on the host's notifiee, so the client must queue its work.
+7. **An answer stays inside the spec's bounds.** The service counts
+   the chunks that the client emits. It refuses each chunk past the
+   request's bound (`Inbound.limit`) or the method's cap. The client
+   ends an answer in error through `Ending`, and the error chunk goes
+   last.
 
 ## Decisions
 
