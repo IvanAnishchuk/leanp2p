@@ -88,6 +88,16 @@ itself, by the rule above, and the dial throws `timeExpired`. The phases
 after the connect, up to authentication, run under
 `Connection.withinUnauthDeadline` in the layers that own them.
 
+## Small writes
+
+Every connection sets `TCP_NODELAY`, on the dial and on the accept.
+Nagle's algorithm holds a small write until the peer acknowledges the
+last one, and the peer's kernel can delay that acknowledgment by 40 ms.
+A ping or a short frame then waits for the delayed acknowledgment. go's
+`net` package and the TCP transport of the rust reference set the
+option by default (`transports/tcp/src/lib.rs` of the sigp fork,
+`Config::new`; the package ARCHITECTURE names the clone).
+
 ## The address forms
 
 A TCP multiaddr has exactly two components. The `ip4` value is 4 bytes,
@@ -251,8 +261,10 @@ private def finish (sock : Socket) : BaseIO Unit := do
     discard <| IO.mapTask (t := done.result?) fun _ => sock.cancelRecv
   | .error _ => pure ()
 
-/-- The connection over a connected socket. -/
+/-- The connection over a connected socket. The socket sends each write
+at once (`TCP_NODELAY`; the module doc, "Small writes"). -/
 private def connection (sock : Socket) : IO Connection := do
+  sock.noDelay
   let localAddr ← addrOf (← sock.getSockName)
   let remoteAddr ← addrOf (← sock.getPeerName)
   -- From here the socket lives in the cell only: no closure below names

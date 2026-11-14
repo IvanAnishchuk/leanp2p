@@ -249,6 +249,15 @@ The names are §7 row 8's. The types follow §3.1.
 
   The checks: "a TCP read that meets the peer's reset answers EOF" and
   "the reset tore the connection down: the read stays at EOF".
+- **Every TCP connection sets `TCP_NODELAY`**, on the dial and on the
+  accept (`Std.Internal.UV.TCP.Socket.noDelay`). Nagle's algorithm
+  holds a small write until the last one is acknowledged, and the
+  peer's delayed acknowledgment adds up to 40 ms to a ping or a short
+  frame. go's `net` package and rust-libp2p's TCP transport set the
+  option by default (`transports/tcp/src/lib.rs`, `Config::new`, in
+  sigp's fork at `accba72`, the clone `../p2p/sigp-rust-libp2p`). The check: the rust cells of
+  `scripts/interop-matrix.sh`, where a Lean dialer's ping RTT stays
+  near the loopback RTT.
 - **A TCP dial has its own deadline** (§5.4). A connect to an address
   that drops the SYN waits for the kernel timeout, which is minutes
   long. The dial bounds the connect by `unauthDeadlineMs` on the
