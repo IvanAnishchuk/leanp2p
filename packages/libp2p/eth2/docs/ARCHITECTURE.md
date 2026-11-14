@@ -151,7 +151,12 @@ and `quic`.
   peer's id. Discovery skips a banned peer's records.
 - **The discovery predicate** asks for our fork digest, a TCP or QUIC
   address, and a peer that is not connected. Subnet predicates are the
-  client's (`attnets?`, `cgc?`, `bitSet`).
+  client's (`attnets?`, `cgc?`, `bitSet`). phase0 says a client SHOULD
+  connect to peers whose whole `ENRForkID` matches ours, and it MAY
+  connect on the digest alone. Lighthouse takes the digest alone
+  (`discovery/mod.rs`, lines 833 to 840), so a peer that has not yet
+  scheduled the next fork stays reachable. `sameFork`
+  gives the whole match to a client that wants it.
 
 ## Conformance
 
