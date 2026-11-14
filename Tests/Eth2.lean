@@ -254,11 +254,25 @@ private def forkChecks (r : Runner) : IO Unit := do
   r.check "forks: one epoch after the fork, the pre-fork topics stay" a11.isEmpty
   let (a12, s12) ← run s11 12
   r.check "forks: two epochs after the fork, the pre-fork topics go"
-    (a12.length == 1 && a12.all (isUnsub pre) && s12.retiring.isNone)
+    (a12.length == 1 && a12.all (isUnsub pre) && s12.retiring.isEmpty)
   let (late, _) ← run s8 10
   r.check "forks: a fork the loop did not see ahead joins and switches at once"
     (late.length == 2 && (late.head?.map (isSub post)) == some true &&
       (late.getLast?.map isSwitch) == some true)
+  -- Two BPO forks one epoch apart, at 10 and 11: each pre-fork digest
+  -- goes two epochs after its own fork.
+  let c2 := { c with blobSchedule := c.blobSchedule ++
+    [({ epoch := 11, maxBlobsPerBlock := 100 } : BlobEntry)] }
+  let post2 ← expectOk "digest" (c2.forkDigest 11)
+  let run2 (st : ForkState) (epoch : Nat) : IO (List ForkAction × ForkState) :=
+    expectOk "step" (st.step c2 epoch)
+  let (_, t10) ← run2 s9 10
+  let (_, t11) ← run2 t10 11
+  let (b12, t12) ← run2 t11 12
+  let (b13, t13) ← run2 t12 13
+  r.check "forks: two forks an epoch apart, each pre-fork digest goes in its turn"
+    (t11.current == post2 && b12.length == 1 && b12.all (isUnsub pre) &&
+      b13.length == 1 && b13.all (isUnsub post) && t13.retiring.isEmpty)
 
 /-! ## The peer table -/
 

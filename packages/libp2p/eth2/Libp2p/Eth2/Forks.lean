@@ -46,8 +46,10 @@ structure ForkState where
   /-- The post-fork digest whose topics we already joined, ahead of the
   fork. -/
   next : Option ByteArray := none
-  /-- The pre-fork digest, and the epoch at which its topics go. -/
-  retiring : Option (ByteArray × Nat) := none
+  /-- The pre-fork digests, each with the epoch at which its topics go.
+  A list, since two forks may come within `unsubscribeDelayEpochs` of
+  each other, as Blob-Parameters-Only forks can. -/
+  retiring : List (ByteArray × Nat) := []
 
 /-- One duty of the fork loop. -/
 inductive ForkAction where
@@ -72,7 +74,7 @@ def step (c : Chain) (epoch : Nat) (st : ForkState) :
     if st.next != some digest then acts := acts ++ [.subscribe digest]
     acts := acts ++ [.switch st.current digest]
     st := { current := digest, next := none,
-            retiring := some (st.current, epoch + unsubscribeDelayEpochs) }
+            retiring := st.retiring ++ [(st.current, epoch + unsubscribeDelayEpochs)] }
   -- The lead: the next fork is at most `subscribeLeadEpochs` away.
   let nextEpoch := c.nextForkEpoch epoch
   if nextEpoch != Constants.farFutureEpoch && nextEpoch ≤ epoch + subscribeLeadEpochs then
@@ -81,10 +83,9 @@ def step (c : Chain) (epoch : Nat) (st : ForkState) :
       acts := acts ++ [.subscribe nextDigest]
       st := { st with next := some nextDigest }
   -- The retirement of the pre-fork topics.
-  if let some (old, at') := st.retiring then
-    if at' ≤ epoch then
-      acts := acts ++ [.unsubscribe old]
-      st := { st with retiring := none }
+  let (due, kept) := st.retiring.partition (·.2 ≤ epoch)
+  acts := acts ++ due.map (.unsubscribe ·.1)
+  st := { st with retiring := kept }
   return (acts, st)
 
 end ForkState

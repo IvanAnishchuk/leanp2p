@@ -680,7 +680,7 @@ def subscribe (s : Service) (k : Kind) : Async Bool := do
 def unsubscribe (s : Service) (k : Kind) : Async Bool := do
   (s.kinds.update (·.filter (· != k)) : BaseIO Unit)
   let st ← (s.forks.get : BaseIO ForkState)
-  let digests := st.current :: (st.next.toList ++ (st.retiring.map (·.1)).toList)
+  let digests := st.current :: (st.next.toList ++ st.retiring.map (·.1))
   digests.allM fun d => s.gossip.unsubscribe (topicAt d k)
 
 /-- Bring the chain-dependent score parameters up to date: the block, the
