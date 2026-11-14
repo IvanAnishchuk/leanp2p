@@ -18,6 +18,8 @@ both.
    devnet of `etheorem-shadow-node` (`devnet/multi.yaml`: two
    Lighthouse nodes and one Grandine), against the same agreement as
    its Rust path.
+4. **The peer duties.** The peer table (`Peers`), the liveness loop
+   with the MetaData refresh, and the ban at the gater.
 
 ## Consumers
 
@@ -66,8 +68,21 @@ Unit 3 has two legs:
   and MetaData v3. Gossip arrived on the block, aggregate, attestation,
   and column topics. A column range at slots 0 and 1 gave no chunks,
   since those blocks carry no blobs.
-- The model leg: `shadow_node_lean` on the devnet, with `shadow-node
-  check` against the host node.
+- The model leg: the shadow node over this service on the devnet, with
+  `shadow-node check` against the host node. The adapter belongs to
+  `etheorem-shadow-node`, so this leg runs there.
+
+Unit 4 (`Tests/Eth2.lean`):
+- The table: an outbound peer is due for a Ping at 15 s and an inbound
+  one at 20 s. A peer taken as due is not due again at once, and an
+  inbound Ping counts as our check.
+- An unknown or higher seq number is news, and a known one is not.
+- A ban holds until its end, a second ban keeps the later end, and the
+  table stays at 1000 bans.
+- Over loopback: the first Ping of a peer brings its MetaData once, and
+  an answered Ping raises no `unresponsive` event.
+- A ban says Goodbye with reason 251, and the peer leaves. The gater
+  refuses our dial to it, and its redials.
 
 Open from the network leg: in a run of 120 s, one Lighthouse node
 ended our session once, and the discovery loop dialed it again. Its

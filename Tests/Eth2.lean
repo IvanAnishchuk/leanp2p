@@ -147,6 +147,36 @@ private partial def waitUntil (cond : Async Bool) (ms : Nat) : Async Bool := do
   select #[← (Park.sleep 50 () : BaseIO (Park Unit))]
   waitUntil cond (ms - min ms 50)
 
+/-! ## The peer table -/
+
+private def peersChecks (r : Runner) : IO Unit := do
+  let key (seed : UInt8) : IO PeerId := do
+    let k ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 seed⟩)
+    let pub ← expectOk "public key" k.toPublic
+    expectOk "peer id" (PeerId.ofPubKey pub)
+  let p ← key 1
+  let q ← key 2
+  let t := ({} : Peers).connect p true 0 |>.connect q false 0
+  r.check "peers: no Ping is due before the interval"
+    ((t.takeDue 14999).1 == [])
+  r.check "peers: an outbound peer is due at 15 s, an inbound one at 20 s"
+    ((t.takeDue 15000).1 == [p] && (t.takeDue 20000).1 == [p, q])
+  let (_, t1) := t.takeDue 15000
+  r.check "peers: a peer taken as due is not due again at once" ((t1.takeDue 16000).1 == [])
+  r.check "peers: an inbound Ping counts as our check"
+    (((t.pinged q 10000).takeDue 20000).1 == [p])
+  r.check "peers: an unknown seq number is news" (t.seqNews p 0)
+  r.check "peers: a known seq number is not news, a higher one is"
+    (!(t.setMeta p 3).seqNews p 3 && (t.setMeta p 3).seqNews p 4)
+  r.check "peers: a peer not in the table is no news" (!(t.disconnect p).seqNews p 9)
+  let b := t.ban p 0 100
+  r.check "peers: a ban holds until its end" (b.banned p 99 && !b.banned p 100 && !b.banned q 50)
+  r.check "peers: a second ban keeps the later end" ((b.ban p 10 50).banned p 99)
+  let full := (List.range (Constants.maxBans + 5)).foldl
+    (fun (acc : Peers) i => { acc with bans := acc.bans ++ [(p, 1000 + i)] }) {}
+  r.check "peers: a new ban keeps the table at the cap"
+    ((full.ban q 0 5000).bans.length == Constants.maxBans && (full.ban q 0 5000).banned q 10)
+
 /-- A service on loopback with a recorded event list. -/
 private def startOn (c : Chain) (seed : UInt8) (events : OnceRef (List Event))
     (boot : List Enr := []) (serve : PeerId → Inbound → Emit → Async Unit := fun _ _ _ => pure ()) :
@@ -235,12 +265,47 @@ private def serviceChecks (r : Runner) : Async Unit := do
   match ← b.request aPeer pingMethod (some (Chain.le64 0)) with
   | .ok [p] => r.check "eth2 service: Ping answers the seq number" (p.payload == Chain.le64 0)
   | _ => r.check "eth2 service: Ping answers" false
+  -- Liveness: the first Ping of a peer brings its MetaData, since we
+  -- know none of it yet. The second finds the same seq number.
+  b.base.ping aPeer
+  b.base.ping aPeer
+  let metas := (← (evB.get : BaseIO (List Event))).filter fun
+    | .metaData p _ => p == aPeer
+    | _ => false
+  r.check "eth2 service: a Ping with a new seq number brings MetaData once"
+    (match metas with
+     | [.metaData _ md] => md.custodyGroupCount == 4
+     | _ => false)
+  r.check "eth2 service: an answered Ping is no unresponsive event"
+    (!(← has evB fun | .unresponsive _ => true | _ => false))
   -- Goodbye at stop.
   b.stop
   r.check "eth2 service: the stop says Goodbye with reason 1"
     (← waitUntil (has evA fun | .goodbye p 1 => p == bPeer | _ => false) 5000)
   r.check "eth2 service: the listener sees the peer leave"
     (← waitUntil (has evA fun | .disconnected p => p == bPeer | _ => false) 5000)
+  -- A ban: C connects, A bans it, and C's discovery redials every 500 ms.
+  let evC ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let cs ← startOn c 3 evC [← (a.localEnr : BaseIO Enr)]
+  let cPeer := cs.base.host.localPeer
+  r.check "eth2 service: the third peer connects"
+    (← waitUntil (has evA fun | .connected p false => p == cPeer | _ => false) 5000)
+  a.ban cPeer
+  r.check "eth2 service: a ban says Goodbye with reason 251"
+    (← waitUntil (has evC fun | .goodbye p 251 => p == aPeer | _ => false) 5000)
+  r.check "eth2 service: the banned peer leaves"
+    (← waitUntil (has evA fun | .disconnected p => p == cPeer | _ => false) 5000)
+  r.check "eth2 service: the peer is banned" (← (a.isBanned cPeer : BaseIO Bool))
+  -- With C's listen addresses in the peerstore, only the gater can refuse.
+  (a.base.host.addAddrs cPeer cs.listenAddrs : BaseIO Unit)
+  r.check "eth2 service: the gater refuses our dial to a banned peer"
+    (match ← a.base.host.dialPeer cPeer with | .error _ => true | .ok _ => false)
+  IO.sleep 2000
+  let connects := (← (evA.get : BaseIO (List Event))).filter fun
+    | .connected p _ => p == cPeer
+    | _ => false
+  r.check "eth2 service: the gater refuses the banned peer's redials" (connects.length == 1)
+  cs.stop
   a.stop
 
 def run (r : Runner) : IO Unit := do
@@ -248,6 +313,7 @@ def run (r : Runner) : IO Unit := do
   chainChecks r
   messageIdChecks r
   messageChecks r
+  peersChecks r
   Async.run (serviceChecks r)
 
 end Tests.Eth2

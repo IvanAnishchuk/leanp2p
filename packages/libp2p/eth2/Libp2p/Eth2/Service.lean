@@ -18,6 +18,7 @@ import Libp2p.Eth2.Topic
 import Libp2p.Eth2.MessageId
 import Libp2p.Eth2.Messages
 import Libp2p.Eth2.Gossip
+import Libp2p.Eth2.Peers
 
 /-!
 # The consensus network service
@@ -46,6 +47,14 @@ the events.
   `MetaData.seq_number`, and MetaData v3 and v2 with ours. Each Goodbye
   of a peer becomes an event. At `stop`, the service says Goodbye with
   reason 1 to every peer.
+* **Liveness.** The service pings each peer on Lighthouse's intervals
+  (`Peers`). A newer `seq_number` in the answer brings a MetaData
+  request, and the answer becomes `Event.metaData`. A peer that does not
+  answer becomes `Event.unresponsive`. The spec lets a client end that
+  connection, and the client decides (`disconnect`).
+* **Bans.** `ban` sends Goodbye with reason 251 and ends the peer's
+  connections. The host's gater then refuses the peer until the ban
+  ends, and discovery skips it. The client decides who earns a ban.
 * **Discovery.** discv5 runs on its own UDP port, with the consensus
   fields in our record. Every `discoverEveryMs`, while the host has
   fewer than `targetPeers` peers, a lookup finds records with our fork
@@ -63,8 +72,8 @@ the events.
 ## Concurrency
 
 Every task belongs to the service's task set, and `stop` joins it
-(root §4.1). The discovery loop parks on its timer and on `stopping`,
-which `stop` closes. The host notifiee and the gossipsub validation
+(root §4.1). The discovery loop and the liveness loop park on their
+timers and on `stopping`, which `stop` closes. The host notifiee and the gossipsub validation
 callback run on tasks that must not park. So they call
 `Config.onEvent`, which must not park either, and they spawn the work
 that waits. `stop` closes the host before it joins the set, and the
@@ -94,6 +103,13 @@ inductive Event where
   | gossip (kind : Kind) (id : MessageId) (source : PeerId) (ssz : ByteArray)
   /-- A peer said Goodbye. -/
   | goodbye (peer : PeerId) (reason : Nat)
+  /-- A peer's Ping answer named a newer `seq_number`, and its MetaData v3
+  arrived. -/
+  | metaData (peer : PeerId) (md : MetaData)
+  /-- A peer did not answer our Ping. The spec lets the client end the
+  connection ("MAY disconnect"); the service leaves that to the client
+  (`Service.disconnect`). -/
+  | unresponsive (peer : PeerId)
 
 /-- A block or column request that a peer sent us. -/
 inductive Inbound where
@@ -160,6 +176,9 @@ structure Base where
   /-- The request slots of each peer: `MAX_CONCURRENT_REQUESTS` per
   protocol id (`Limiter`). -/
   limiters : OnceRef (List (PeerId × Limiter))
+  /-- The Ping state of each peer, and the bans (`Peers`). Its clock is
+  `IO.monoMsNow`. -/
+  peers : OnceRef Peers
   tasks : TaskSet
 
 namespace Base
@@ -184,6 +203,14 @@ def request (b : Base) (peer : PeerId) (m : Method) (payload : Option ByteArray)
   | .error e => return .error e
   | .ok () => return .ok (← (acc.get : BaseIO _)).reverse
 
+/-- The payload of an answer of one success chunk. -/
+def successOf : Except ReqResp.Error (List Chunk) → Option ByteArray
+  | .ok [c] =>
+    match c.result with
+    | .success => some c.payload
+    | _ => none
+  | _ => none
+
 /-- Say Goodbye with `reason`. The peer answers nothing. -/
 def goodbye (b : Base) (peer : PeerId) (reason : Nat) : Async Unit := do
   discard <| b.request peer goodbyeMethod (some (Chain.le64 reason))
@@ -200,12 +227,8 @@ def onStatus (b : Base) (peer : PeerId) (st : Status) : Async Unit := do
 /-- Send our `Status`, the dialer's duty. -/
 def sendStatus (b : Base) (peer : PeerId) : Async Unit := do
   let ours ← (b.status.get : BaseIO Status)
-  match ← b.request peer statusMethod (some ours.encode) with
-  | .ok [c] =>
-    match c.result with
-    | .success => if let some st := Status.decode? c.payload then b.onStatus peer st
-    | _ => pure ()
-  | _ => pure ()
+  let answer ← b.request peer statusMethod (some ours.encode)
+  if let some st := (successOf answer).bind Status.decode? then b.onStatus peer st
 
 /-- Our `MetaData`. -/
 def metaData (b : Base) : BaseIO MetaData := do
@@ -255,7 +278,10 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
         -- The answer goes first, so a Goodbye after it finds a peer
         -- that has our Status.
         (b.tasks.spawn (b.onStatus peer st) : BaseIO Unit),
-   b.handlerOf pingMethod fun _ _ emit => do
+   b.handlerOf pingMethod fun peer _ emit => do
+      -- A Ping of the peer counts as our check of it too.
+      let now ← (IO.monoMsNow : BaseIO Nat)
+      (b.peers.update (·.pinged peer now) : BaseIO Unit)
       discard <| emit (plain (Chain.le64 (← (b.metaSeq.get : BaseIO Nat)))),
    b.handlerOf metadataV3Method fun _ _ emit => do
       discard <| emit (plain (← b.metaData).encodeV3),
@@ -287,11 +313,14 @@ def watchPeers (b : Base) : BaseIO Unit :=
       let outbound := match role with
         | .initiator => true
         | .responder => false
+      let now ← IO.monoMsNow
+      b.peers.update (·.connect peer outbound now)
       b.config.onEvent (.connected peer outbound)
       if outbound then b.tasks.spawn (b.sendStatus peer)
     | .disconnected peer _ => do
       if !(← b.host.connected peer) then
         b.limiters.update (·.filter (·.1 != peer))
+        b.peers.update (·.disconnect peer)
         b.config.onEvent (.disconnected peer)
 
 /-- Dial the peer of a record, through its consensus addresses. -/
@@ -311,13 +340,48 @@ partial def discover (b : Base) (disc : Discv5.Node) (stopping : Chan Unit) : As
   if peers.length < b.config.targetPeers then
     let epoch := b.config.chain.epochAt (← (wallMs : IO Nat))
     let me := b.host.localPeer
+    let table ← (b.peers.get : BaseIO Peers)
+    let mono ← (IO.monoMsNow : BaseIO Nat)
     let wanted (r : Enr) : Bool :=
       sameDigest b.config.chain epoch r &&
         (match r.dialAddrs with | .ok (_ :: _) => true | _ => false) &&
-        (match r.peerId with | .ok p => p != me && !peers.contains p | .error _ => false)
+        (match r.peerId with
+         | .ok p => p != me && !peers.contains p && !table.banned p mono
+         | .error _ => false)
     for r in ← disc.findPeers wanted (b.config.targetPeers - peers.length) do
       (b.dialRecord r : BaseIO Unit)
   b.discover disc stopping
+
+/-- Ping one peer. A `seq_number` above the one we know brings a
+MetaData v3 request, and its answer becomes `Event.metaData`. No
+answer, or one that is not 8 bytes, becomes `Event.unresponsive`. -/
+def ping (b : Base) (peer : PeerId) : Async Unit := do
+  let ours ← (b.metaSeq.get : BaseIO Nat)
+  let some seq := (successOf (← b.request peer pingMethod (some (Chain.le64 ours)))).bind
+      fun p => if p.size == 8 then some (le64At p 0) else none
+    | (b.config.onEvent (.unresponsive peer) : BaseIO Unit)
+  unless (← (b.peers.get : BaseIO Peers)).seqNews peer seq do return
+  let some md := (successOf (← b.request peer metadataV3Method none)).bind MetaData.decodeV3?
+    | return
+  (b.peers.update (·.setMeta peer md.seqNumber) : BaseIO Unit)
+  (b.config.onEvent (.metaData peer md) : BaseIO Unit)
+
+/-- The pause of the liveness loop between two looks at the table. The
+intervals are 15 s and 20 s, so a look each second keeps a Ping within
+one second of its time. -/
+def livenessTickMs : Nat := 1000
+
+/-- The liveness loop: each tick, ping every peer that is due. Park: the
+timer wakes it, and so does `stop`, which closes `stopping`. `partial`,
+as the IO loops are. -/
+partial def liveness (b : Base) (stopping : Chan Unit) : Async Unit := do
+  let timer ← (Park.sleep livenessTickMs false : BaseIO (Park Bool))
+  if ← select #[Park.recv stopping (fun _ => true), timer] then return
+  let now ← (IO.monoMsNow : BaseIO Nat)
+  let due ← (b.peers.updateGet (·.takeDue now) : BaseIO (List PeerId))
+  for p in due do
+    (b.tasks.spawn (b.ping p) : BaseIO Unit)
+  b.liveness stopping
 
 end Base
 
@@ -346,8 +410,20 @@ def start (cfg : Config) : Async Service := do
     else throw (IO.userError "eth2: the key must be secp256k1, the key of ENR scheme v4")
   let noise ← orThrow "the Noise key does not generate" (← (Security.Noise.Config.generate cfg.key).run)
   let tls ← orThrow "the TLS certificate does not generate" (← Security.Tls.Config.generate cfg.key)
+  -- The gater refuses a banned peer: at the dial, when the dial names it,
+  -- and after the handshake, which proves an inbound peer's id.
+  let peers ← (OnceRef.new ({} : Peers) : BaseIO _)
+  let allowed (p : PeerId) : BaseIO Bool := do
+    return !(← peers.get).banned p (← IO.monoMsNow)
+  let gater : Libp2p.Core.ConnectionGater := {
+    allowDial := fun p _ => match p with
+      | some p => allowed p
+      | none => pure true
+    allowInbound := fun _ _ => pure true
+    allowSecured := fun _ p _ _ => allowed p }
   let hostCfg : Libp2p.Host.Config := {
     identity := cfg.key
+    gater
     transports := [Streams.Tcp.transport]
     securedTransports := if cfg.quicPort.isSome then [Libp2p.Quic.transport tls] else []
     security := [Security.Noise.securityProtocol noise]
@@ -363,6 +439,7 @@ def start (cfg : Config) : Async Service := do
     status := ← OnceRef.new ⟨digest, zero, 0, zero, 0, 0⟩
     metaSeq := ← OnceRef.new 0
     limiters := ← OnceRef.new []
+    peers
     tasks := ← TaskSet.new }
   for h in base.handlers do (host.setHandler h : BaseIO Unit)
   (host.setHandler (Identify.respondHandler pub [] Base.servedIds "leanp2p") : BaseIO Unit)
@@ -404,6 +481,7 @@ def start (cfg : Config) : Async Service := do
     (base.dialRecord r : BaseIO Unit)
   let stopping ← (Chan.new 1 (by decide) : BaseIO (Chan Unit))
   (base.tasks.spawn (base.discover disc stopping) : BaseIO Unit)
+  (base.tasks.spawn (base.liveness stopping) : BaseIO Unit)
   return { base, gossip, disc, listenAddrs, stopping }
 
 /-- The topic of a kind under our digest now. -/
@@ -443,10 +521,30 @@ def request (s : Service) (peer : PeerId) (m : Method) (payload : Option ByteArr
 /-- The connected peers. -/
 def peers (s : Service) : BaseIO (List PeerId) := s.base.host.peers
 
+/-- Say Goodbye with `reason`, and end the peer's connections. -/
+def disconnect (s : Service) (peer : PeerId) (reason : Nat) : Async Unit := do
+  s.base.goodbye peer reason
+  discard <| (s.base.host.closePeer peer : BaseIO Bool)
+
+/-- Ban a peer for `ms` milliseconds, `Constants.banMs` by default. The
+ban comes first, so a redial in the meantime meets the gater. Then the
+peer gets Goodbye with `Constants.goodbyeBanned`, and its connections
+end. The gater refuses its dials and its handshakes until the ban ends.
+Whether a peer earns a ban is the client's choice: penalties are
+scoring, and they stay with the client. -/
+def ban (s : Service) (peer : PeerId) (ms : Nat := Constants.banMs) : Async Unit := do
+  let now ← (IO.monoMsNow : BaseIO Nat)
+  (s.base.peers.update (·.ban peer now (now + ms)) : BaseIO Unit)
+  s.disconnect peer Constants.goodbyeBanned
+
+/-- Whether a peer is banned now. -/
+def isBanned (s : Service) (peer : PeerId) : BaseIO Bool := do
+  return (← s.base.peers.get).banned peer (← IO.monoMsNow)
+
 /-- Our record. -/
 def localEnr (s : Service) : BaseIO Enr := s.disc.localEnr
 
-/-- Stop: Goodbye with reason 1 to every peer, then the loop, the
+/-- Stop: Goodbye with reason 1 to every peer, then the loops, the
 gossipsub node, discv5, the host, and the task set, in that order. -/
 def stop (s : Service) : Async Unit := do
   (s.stopping.close : BaseIO Unit)

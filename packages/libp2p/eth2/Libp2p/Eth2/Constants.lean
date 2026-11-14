@@ -89,6 +89,33 @@ def goodbyeClientShutdown : Nat := 1
 def goodbyeIrrelevantNetwork : Nat := 2
 def goodbyeFault : Nat := 3
 
+/-- The Goodbye reason of a ban: Lighthouse's `GoodbyeReason::Banned`
+(`rpc/methods.rs`). phase0 allows codes from 128 up for "alternative,
+erroneous" reasons. -/
+def goodbyeBanned : Nat := 251
+
+/-! ## Peer policy
+
+Client policy with Lighthouse's numbers. The spec sets none of them. -/
+
+/-- The Ping interval of a peer we dialed: `DEFAULT_PING_INTERVAL_OUTBOUND`,
+15 s (`peer_manager/config.rs`). -/
+def pingIntervalOutboundMs : Nat := 15000
+
+/-- The Ping interval of a peer that dialed us:
+`DEFAULT_PING_INTERVAL_INBOUND`, 20 s. The two intervals differ, so two
+peers do not ping each other at the same time. -/
+def pingIntervalInboundMs : Nat := 20000
+
+/-- The length of a ban: `BANNED_BEFORE_DECAY`, 12 h
+(`peer_manager/peerdb/score.rs`). -/
+def banMs : Nat := 12 * 3600 * 1000
+
+/-- The bans the service holds: `MAX_BANNED_PEERS`, 1000
+(`peer_manager/peerdb.rs`). A new ban past the cap drops the ban that
+ends first. -/
+def maxBans : Nat := 1000
+
 /-! ## Epochs and the ENR -/
 
 /-- `FAR_FUTURE_EPOCH`: `2**64 - 1`. -/

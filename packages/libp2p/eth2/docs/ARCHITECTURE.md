@@ -32,6 +32,7 @@ and `quic`.
 | `Libp2p/Eth2/Enr.lean` | the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the fork predicates for discovery |
 | `Libp2p/Eth2/Messages.lean` | the req/resp methods with their bounds, and the SSZ of `Status`, `MetaData`, Ping, Goodbye, and the requests |
 | `Libp2p/Eth2/Gossip.lean` | the router parameters of a consensus node |
+| `Libp2p/Eth2/Peers.lean` | the peer table: the Ping intervals, the known MetaData seq numbers, and the bans, as pure transitions |
 | `Libp2p/Eth2/Service.lean` | the service: the host, gossipsub, discv5, the req/resp handlers, and the peer duties |
 
 ## Public surface
@@ -47,8 +48,10 @@ and `quic`.
   and the request encoders.
 - `Status`, `MetaData`.
 - `gossipParams`.
+- `Peers`.
 - `Service.start`, `subscribe`, `publish`, `report`, `setStatus`,
-  `request`, `peers`, `localEnr`, `stop`, and the client's seams:
+  `request`, `peers`, `disconnect`, `ban`, `isBanned`, `localEnr`,
+  `stop`, and the client's seams:
   `Config.onEvent` (the `Event` stream) and `Config.serve` (the
   `Inbound` requests with their `Emit`).
 
@@ -71,8 +74,9 @@ and `quic`.
    (`validateMessages`). Data that does not decompress is rejected at
    once. An unknown topic is rejected at once.
 5. **Every task has an owner.** The service's task set owns the
-   discovery loop, the dials, and the `Status` exchanges. `stop` closes
-   the loop's channel, says Goodbye, stops gossipsub and discv5, closes
+   discovery loop, the liveness loop, the dials, the Pings, and the
+   `Status` exchanges. `stop` closes the loops' channel, says Goodbye,
+   stops gossipsub and discv5, closes
    the host, and joins the set. The host's close removes the notifiee,
    so nothing spawns after the join.
 6. **Callbacks never park.** `Config.onEvent` runs on the gossipsub
@@ -106,9 +110,18 @@ and `quic`.
   second at mainnet's TTL of 768 s. The ids are `List Nat` in the
   router, about 480 bytes each, so a larger cache costs memory that the
   router's id type must shrink first.
-- **`MessageId` is pure.** The node's `payloadId` seam is a pure
-  function. A fault of the OpenSSL SHA-256 gives the empty id, which
-  the seen cache treats as one id.
+- **`MessageId` can fail.** The node's `payloadId` seam is a pure
+  function that answers `Option`. A fault of the OpenSSL SHA-256 gives
+  `none`, and the node drops the message.
+- **The service pings, and the client judges.** Ping, the MetaData
+  refresh, and the ban are mechanism, with Lighthouse's numbers: 15 s
+  and 20 s between Pings, a 12 h ban, and at most 1000 bans. The spec
+  lets a client end a connection that does not answer a Ping, and it
+  sets no penalties. Penalties are scoring, so the service reports
+  (`Event.unresponsive`), and the client calls `disconnect` or `ban`.
+- **A ban works at the gater.** The gater refuses a banned peer at the
+  dial and after the handshake, the first point that proves an inbound
+  peer's id. Discovery skips a banned peer's records.
 - **The discovery predicate** asks for our fork digest, a TCP or QUIC
   address, and a peer that is not connected. Subnet predicates are the
   client's (`attnets?`, `cgc?`, `bitSet`).
@@ -121,8 +134,9 @@ and `quic`.
   the spec's formula, for each snappy domain.
 - Two services over loopback: the boot dial, `Status` both ways, gossip
   with the held validation and the consensus id, a block range with its
-  context bytes, MetaData, Ping, and Goodbye at stop, on two threads and
-  on one.
+  context bytes, MetaData, Ping, the MetaData refresh after a Ping,
+  Goodbye at stop, and a ban that refuses the peer's redials, on two
+  threads and on one.
 - The live gate is the shadow node on the Kurtosis devnet, against
   Lighthouse and Grandine (the package PLAN, unit 3).
 
