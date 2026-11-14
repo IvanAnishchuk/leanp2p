@@ -1206,7 +1206,13 @@ def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) 
   -- the core ignores the peer. We ask it for at most `maxIhaveLength`
   -- ids.
   let (count, asked) := s.ihaveSeen.getD sender (0, 0)
-  if p.maxIhaveMessages ≤ count then (s, [])
+  -- "incoming gossip is ignored" from a peer below `GossipThreshold`
+  -- (`gossipsub-v1.1.md`, the threshold table), and an IHAVE for a topic
+  -- we do not subscribe to asks for nothing, as go's `handleIHave` skips
+  -- a topic with no mesh (`gossipsub.go`, lines 941 and 960).
+  if scoreOf p s sender < p.thresholds.gossipThreshold || !memB (⟨i.topicId⟩ : TopicId) s.topics then
+    (s, [])
+  else if p.maxIhaveMessages ≤ count then (s, [])
   else
   let wanted := (i.messageIds.filter (fun id =>
     !(s.seen.contains id s.now) && (Cache.MessageIndex.get s.mcache id).isNone &&
@@ -1222,6 +1228,9 @@ def handleIhave (p : Params) (s : State) (sender : Peer) (i : Rpc.ControlIHave) 
 the same id, at most `gossipRetransmission` times per peer and id. -/
 def handleIwant (p : Params) (s : State) (sender : Peer) (w : Rpc.ControlIWant) :
     State × List Action :=
+  -- A peer below `GossipThreshold` gets no answer, as in go's
+  -- `handleIWant` (`gossipsub.go`, line 1015).
+  if scoreOf p s sender < p.thresholds.gossipThreshold then (s, []) else
   let answers := w.messageIds.filterMap (fun id =>
     match Cache.MessageIndex.get s.mcache id with
     | some m =>
@@ -1257,13 +1266,20 @@ def handleGraft (p : Params) (s : State) (sender : Peer) (g : Rpc.ControlGraft) 
       | none => (s, [])
   else (s, [])
 
-/-- The state after a prune records the backoff pair. -/
+/-- The state after a prune records the backoff pair, for a topic we
+subscribe to. A prune for any other topic changes nothing, as go's
+`handlePrune` skips a topic with no mesh (`gossipsub.go`, line 1163).
+Otherwise a peer could add one pair per prune, for topics of its
+choosing and with a backoff of its choosing, and the table would grow
+without bound. -/
 def pruneState (p : Params) (s : State) (sender : Peer) (q : Rpc.ControlPrune) : State :=
-  { s with
-    backoff := Cache.Backoff.add s.backoff sender ⟨q.topicId⟩
-      (match q.backoff with
-        | some sec => sec * 1000
-        | none => p.pruneBackoff) s.now }
+  if memB (⟨q.topicId⟩ : TopicId) s.topics then
+    { s with
+      backoff := Cache.Backoff.add s.backoff sender ⟨q.topicId⟩
+        (match q.backoff with
+          | some sec => sec * 1000
+          | none => p.pruneBackoff) s.now }
+  else s
 
 /-- Handle one PRUNE: record the backoff pair, and remove the sender
 from the topic mesh with the prune score update. -/
@@ -1963,7 +1979,8 @@ private theorem filter_ne_self (l : List Peer) (sender : Peer) (h : memB sender 
 private theorem meshOf_pruneState (p : Params) (s : State) (sender : Peer)
     (q : Rpc.ControlPrune) (topic : TopicId) :
     meshOf (pruneState p s sender q) topic = meshOf s topic := by
-  simp [pruneState, meshOf]
+  unfold pruneState
+  split <;> simp [meshOf]
 
 private theorem meshOf_setPeer (s : State) (q : Peer) (pd : PeerData) (topic : TopicId) :
     meshOf (setPeer s q pd) topic = meshOf s topic := by
@@ -2031,12 +2048,15 @@ private theorem handleIhave_mesh (p : Params) (s : State) (sender : Peer)
     meshOf (handleIhave p s sender i).1 topic = meshOf s topic := by
   unfold handleIhave
   split
-  split <;> simp [meshOf]
+  split
+  · simp [meshOf]
+  · split <;> simp [meshOf]
 
 private theorem handleIwant_mesh (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) (topic : TopicId) :
     meshOf (handleIwant p s sender w).1 topic = meshOf s topic := by
-  simp [handleIwant, meshOf]
+  unfold handleIwant
+  split <;> simp [meshOf]
 
 private theorem handleIhaves_mesh (p : Params) (s : State) (sender : Peer)
     (is : List Rpc.ControlIHave) (topic : TopicId) :
@@ -2070,11 +2090,14 @@ private theorem handleIhave_topics (p : Params) (s : State) (sender : Peer)
     (i : Rpc.ControlIHave) : (handleIhave p s sender i).1.topics = s.topics := by
   unfold handleIhave
   split
-  split <;> simp
+  split
+  · simp
+  · split <;> simp
 
 private theorem handleIwant_topics (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) : (handleIwant p s sender w).1.topics = s.topics := by
-  simp [handleIwant]
+  unfold handleIwant
+  split <;> simp
 
 private theorem handleGraft_topics (p : Params) (s : State) (sender : Peer)
     (g : Rpc.ControlGraft) : (handleGraft p s sender g).1.topics = s.topics := by
@@ -2093,7 +2116,8 @@ private theorem handleGraft_topics (p : Params) (s : State) (sender : Peer)
 
 private theorem pruneState_topics (p : Params) (s : State) (sender : Peer)
     (q : Rpc.ControlPrune) : (pruneState p s sender q).topics = s.topics := by
-  simp [pruneState]
+  unfold pruneState
+  split <;> rfl
 
 private theorem handlePrune_topics (p : Params) (s : State) (sender : Peer)
     (q : Rpc.ControlPrune) : (handlePrune p s sender q).1.topics = s.topics := by
@@ -2104,7 +2128,8 @@ private theorem handlePrune_topics (p : Params) (s : State) (sender : Peer)
         exact pruneState_topics p s sender q
     | some pd =>
         simp only [handlePrune, hm, ite_true, hpd]
-        simp [setPeer, setTopicMesh, pruneState]
+        simp only [setPeer, setTopicMesh]
+        exact pruneState_topics p s sender q
   · simp only [handlePrune, hm]
     exact pruneState_topics p s sender q
 
@@ -2582,13 +2607,17 @@ private theorem handleIhave_not_deliver (p : Params) (s : State) (sender : Peer)
     (i : Rpc.ControlIHave) (m : Message) :
     Action.deliver m ∉ (handleIhave p s sender i).2 := by
   simp only [handleIhave]
-  split <;> simp
+  split
+  · simp
+  · split <;> simp
 
 private theorem handleIwant_not_deliver (p : Params) (s : State) (sender : Peer)
     (w : Rpc.ControlIWant) (m : Message) :
     Action.deliver m ∉ (handleIwant p s sender w).2 := by
   simp only [handleIwant]
-  simp [List.mem_map]
+  split
+  · simp
+  · simp [List.mem_map]
 
 private theorem handlePrune_not_deliver (p : Params) (s : State) (sender : Peer)
     (q : Rpc.ControlPrune) (m : Message) :

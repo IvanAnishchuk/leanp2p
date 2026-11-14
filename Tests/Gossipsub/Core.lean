@@ -681,6 +681,43 @@ def run (r : Runner) : IO Unit := do
       | .ok (s', _) => subsOf s' == base + 1
       | _ => false))
 
+  -- A prune for a topic we do not subscribe to records no backoff, as go
+  -- skips it; a prune for our topic records one.
+  let pruneOf (t : String) : Event :=
+    .rpc pa (Pb.encodeMessage (rpcOfControl
+      { ihave := [], iwant := [], graft := [],
+        prune := [{ topicId := t, peers := [], backoff := some 4000000000 }] }))
+  r.check "core.prune.foreign-topic-no-backoff"
+    (match step baseParams known (pruneOf "not-ours") with
+     | .ok (s', _) => s'.backoff.length == known.backoff.length
+     | _ => false)
+  r.check "core.prune.own-topic-backoff"
+    (match step baseParams known (pruneOf ta.name) with
+     | .ok (s', _) => s'.backoff.length == known.backoff.length + 1
+     | _ => false)
+
+  -- IHAVE asks only for our topics, and only of a peer at or above the
+  -- gossip threshold. IWANT gets no answer below it either.
+  let ihaveFor (t : String) : Event :=
+    .rpc pa (Pb.encodeMessage (rpcOfControl
+      { ihave := [{ topicId := t, messageIds := [⟨[200]⟩] }], iwant := [], graft := [], prune := [] }))
+  r.check "core.ihave.own-topic-asks"
+    (match step baseParams known (ihaveFor ta.name) with
+     | .ok (_, acts) => sendsTo pa acts = 1
+     | _ => false)
+  r.check "core.ihave.foreign-topic-ignored"
+    (match step baseParams known (ihaveFor "not-ours") with
+     | .ok (_, acts) => sendsTo pa acts = 0
+     | _ => false)
+  r.check "core.ihave.below-gossip-threshold-ignored"
+    (match step gossipParams known (ihaveFor ta.name) with
+     | .ok (_, acts) => sendsTo pa acts = 0
+     | _ => false)
+  r.check "core.iwant.below-gossip-threshold-unanswered"
+    (match Libp2p.Protocols.Gossipsub.Core.run gossipParams cachedState [iwant7] with
+     | .ok (_, acts) => publishCount acts = 0
+     | _ => false)
+
   -- An unsubscribe prunes with the shorter backoff, 10 s.
   r.check "core.unsubscribe.short-backoff"
     (match step baseParams { known with mesh := [(ta, [pa])] } (.unsubscribe ta) with
