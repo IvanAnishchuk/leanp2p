@@ -790,6 +790,56 @@ private def handOverChecks (r : Runner) : Async Unit := do
   a.close
   tc.close
 
+/-- Move the test clock a second at a time, with a short real pause
+between steps, until `cond` holds or the rounds run out. -/
+private partial def advanceUntil (tc : TestClock) (cond : BaseIO Bool) (rounds : Nat) :
+    Async Bool := do
+  if ← cond then return true
+  if rounds == 0 then return false
+  tc.advance 1000
+  select #[← (Park.sleep 20 () : BaseIO (Park Unit))]
+  advanceUntil tc cond (rounds - 1)
+
+/-- A silent stream: the peer opens a stream, sends one byte of a
+multistream message, and goes silent. The host resets the stream at
+its negotiation deadline (`streamNegotiationMs`), as go's stream
+handler does, and the session stays. -/
+private def silentStreamChecks (r : Runner) : Async Unit := do
+  let net ← Sim.Net.new
+  let tc ← TestClock.new
+  let (a, _) ← mkHost net 15 tc
+  let addrA ← listenOn a "/memory/171"
+  let noise ← noiseOf 16
+  let some conn ← net.transport.dial addrA | throw <| IO.userError "dial failed"
+  match ← (Libp2p.Negotiate.upgradeWith tc.clock .initiator conn .empty (some a.localPeer)
+      [noise] [Libp2p.Mux.yamux]).run with
+  | .error e => r.check s!"host: a silent stream's peer upgrades ({e})" false
+  | .ok (session, _) =>
+    match ← (session.openStream echoId).run with
+    | .error e => r.check s!"host: the silent stream opens ({e})" false
+    | .ok s =>
+      discard <| s.write (ByteArray.mk #[0x13])
+      let reset : OnceRef Bool ← OnceRef.new false
+      let owner ← TaskSet.new
+      -- The host may send its own header first, so the reader takes the
+      -- data until the stream ends.
+      owner.spawn do
+        repeat
+          match ← s.read with
+          | .ok (some _) => pure ()
+          | .error .reset => reset.set true; break
+          | _ => break
+      let ended ← advanceUntil tc reset.get 40
+      -- On a failure, our own reset ends the reader, so the join returns.
+      unless ended do s.reset
+      owner.joinAll
+      r.check "host: a silent stream ends at the negotiation deadline" ended
+      r.check "host: the session outlives the silent stream" ((← a.peers).length == 1)
+    discard session.close.toBaseIO
+    discard session.join.run
+  a.close
+  tc.close
+
 /-- The second muxer of the host (root PLAN W5.10). A peer that
 offers mplex alone gets mplex from the host, which offers yamux first,
 and a stream carries bytes over it. -/
@@ -988,7 +1038,7 @@ def Host.run (r : Runner) : IO Unit := do
       ("policy", policyChecks r), ("silent peer", silentPeerChecks r),
       ("shutdown", shutdownChecks r), ("events", eventChecks r),
       ("limits", limitedHostChecks r), ("probe", probeChecks r),
-      ("hand-over", handOverChecks r),
+      ("hand-over", handOverChecks r), ("silent stream", silentStreamChecks r),
       ("mplex", mplexChecks r), ("secured", securedChecks r),
       ("secured policy", securedPolicyChecks r),
       ("secured shutdown", securedShutdownChecks r)] do

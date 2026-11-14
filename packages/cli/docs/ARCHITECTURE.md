@@ -425,8 +425,9 @@ https://github.com/etheorem/leanp2p/issues/22#issuecomment-6805941244.
 During negotiation the caller holds no stream. The stream returns
 only after `negotiateStream` finishes, and that read parks while an
 authenticated peer stays silent
-(`Libp2p/Host/StreamSelect.lean`). `Host.close` closes the session
-and wakes parked stream reads.
+(`Libp2p/Host/StreamSelect.lean`), up to the host's negotiation
+deadline of 10 s (`Host.streamNegotiationMs`). `Host.close` closes the
+session and wakes parked stream reads.
 
 One-shot `pingnode dial` and `demo` apply `Streams.unauthDeadlineMs`
 (30 seconds) around `Host.newStream`. Expiry fails the command and
@@ -477,13 +478,15 @@ cleanup failure exits 1. Every host `openHost` returns reaches
 `Tests/CliLive.lean` covers a successful dial, a port the test
 bound and then closed, an expected-peer mismatch, a peer that stays
 silent during protocol selection, and a peer that reads the payload
-and writes no echo. The two silent peers run until the command
-budget. The capture bound is 50 seconds, and the command exits
-inside it. Stdout is empty on each failure before a successful ping.
+and writes no echo. The host ends the silent selection at its
+negotiation deadline (`Host.streamNegotiationMs`, 10 s), before the
+command budget. The missing echo runs until the command budget. The
+capture bound is 50 seconds, and the command exits inside it. Stdout is empty on each failure before a successful ping.
 The refused dial prints `nobody listens at <addr>`. The mismatch
 prints `upgrade failed: authentication failure: remote peer id
 differs from the expected peer id`. The silent selection prints
-`stream failed: timeout: the stream opening deadline expired`. The
+`stream failed: timeout: multistream: the stream negotiation passed its
+deadline`. The
 missing echo prints `stream failed: timeout: the ping exchange
 deadline expired`.
 

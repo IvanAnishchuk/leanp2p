@@ -433,6 +433,19 @@ private def upgradeConn (h : Host) (role : Role) (conn : Connection) (expected :
 
 /-! ## Serving -/
 
+/-- Negotiate the protocol of a stream under `streamNegotiationMs`. The
+expiry resets the stream, and the reset wakes the parked read. The reset
+task lives in a set this call owns and joins. -/
+private def negotiateWithin (h : Host) (role : Role) (s : Stream) (ids : List ProtocolId) :
+    Async (Except Libp2p.Core.Error (ProtocolId × Stream)) := do
+  let owner ← TaskSet.new
+  let r ← Conc.withinDeadline h.config.clock streamNegotiationMs (owner.spawn s.reset)
+    (negotiateStream role s ids).run
+  owner.joinAll
+  match r with
+  | .ok a => return a
+  | .error _ => return .error (.timeout "multistream: the stream negotiation passed its deadline")
+
 /-- Serve one inbound stream: admit it, negotiate its protocol against
 the handler table, and run the handler. A refused admission, a failed
 negotiation, an id with no handler, and a failed handler each reset
@@ -444,7 +457,7 @@ private def serveStream (h : Host) (ctx : StreamContext) (scope : ConnectionScop
   let some share ← (scope.reserveStream : BaseIO (Option Reservation))
     | s.reset
   let ids := Handlers.ids (← (h.handlers.get : BaseIO Handlers))
-  match ← (negotiateStream .responder s ids).run with
+  match ← h.negotiateWithin .responder s ids with
   | .error e =>
     s.reset
     share.release
@@ -795,7 +808,7 @@ def newStream (h : Host) (peer : PeerId) (protocols : List ProtocolId) :
     share.release
     return .error (.stream err)
   | .ok s =>
-    match ← (negotiateStream .initiator s protocols).run with
+    match ← h.negotiateWithin .initiator s protocols with
     | .error err =>
       s.reset
       share.release

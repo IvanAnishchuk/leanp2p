@@ -323,7 +323,11 @@ fixes them as follows.
   resets a stream whose negotiation fails in the same place
   (`vendor/go-libp2p/p2p/host/basic/basic_host.go`, line 347). A
   stream the peer ends before it picks a protocol is an orderly end,
-  and no failure.
+  and no failure. The negotiation runs under `streamNegotiationMs`
+  (10 s) in both directions, go-libp2p's `DefaultNegotiationTimeout`,
+  which its stream handler sets on each inbound stream and `NewStream`
+  sets when the caller gives none. The expiry resets the stream, so a
+  silent peer holds no stream reservation past it.
 - **Outbound streams.** `newStream` dials the peer through the
   peerstore when no session is live, as go-libp2p's `NewStream` calls
   `Connect` first (`basic_host.go`, line 452). It opens a stream,

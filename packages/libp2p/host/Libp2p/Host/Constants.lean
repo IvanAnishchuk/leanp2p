@@ -20,4 +20,12 @@ standing session keeps its place. Each side measures with its own
 `Clock`. -/
 def simulWindowMs : Nat := 30000
 
+/-- The deadline of the protocol negotiation on one stream, in
+milliseconds, both ways: go-libp2p's `DefaultNegotiationTimeout` of
+10 s (`p2p/host/basic/basic_host.go`), which its stream handler sets on
+each inbound stream, and `NewStream` sets when the caller gives none. A
+peer that opens a stream and stays silent would hold its stream
+reservation until the session ends. The expiry resets the stream. -/
+def streamNegotiationMs : Nat := 10000
+
 end Libp2p.Host
