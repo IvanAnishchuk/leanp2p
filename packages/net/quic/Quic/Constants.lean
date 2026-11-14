@@ -65,7 +65,7 @@ def maxDatagram : Nat := 65527
 
 /-- The bytes of a connection that the peer has not acknowledged, past
 which a write parks: 10,000,000, the default `send_window` of quinn
-0.11, which rust-libp2p's QUIC transport keeps (quinn-proto
+0.11, which the rust reference's QUIC transport keeps (quinn-proto
 `config/transport.rs`, `TransportConfig::default`: 8 times a stream
 window of 1,250,000 bytes). The shim keeps every unacknowledged byte,
 since QUIC may send it again (RFC 9000 §13.3). So this cap bounds the
