@@ -510,23 +510,65 @@ def exchangeChecks (r : Runner) : Async Unit := do
     r.check "a silent requester: the responder fails at its deadline"
       ((← res.get).any (failsWith .timeout))
     tc.close
-  -- A requester that stops at its last chunk resets a stream the peer
-  -- left open, since the rest is no longer relevant.
+  -- A requester at its last chunk waits for the peer's close, and
+  -- sends no reset when the close comes.
+  do
+    let tc ← TestClock.new
+    let one := method (maxChunks := 1)
+    let (a, b) ← pair
+    let owner ← TaskSet.new
+    let closed : OnceRef Bool ← OnceRef.new false
+    owner.spawn do
+      -- Read the request to its end, answer one chunk, then close.
+      discard <| pump b (requestReader one) fun _ => pure ()
+      discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩)
+      closed.set true
+      b.close
+    let got ← requestAll a one tc.clock 1000 (some (noise 1 4))
+    owner.joinAll
+    r.check "the last chunk, then the peer's close: the chunk arrives"
+      (match got with | .ok [c] => c.payload == noise 2 8 | _ => false)
+    r.check "the last chunk, then the peer's close: the requester waited for the close"
+      (← closed.get)
+    -- The requester has returned, so a reset would have come before
+    -- this read.
+    r.check "the last chunk, then the peer's close: the peer sees no reset"
+      (match ← b.read with | .ok none => true | _ => false)
+    tc.close
+  -- A peer that stays open after the last chunk: the second deadline
+  -- resets the stream, and the chunk is still the answer.
+  do
+    let tc ← TestClock.new
+    let one := method (maxChunks := 1)
+    let (a, b) ← pair
+    let owner ← TaskSet.new
+    let res : OnceRef (Option (Except Error (List Chunk))) ← OnceRef.new none
+    owner.spawn do res.set (some (← requestAll a one tc.clock 1000 (some (noise 1 4))))
+    discard <| pump b (requestReader one) fun _ => pure ()
+    discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩)
+    r.check "the last chunk, the peer open: the request deadline arms" (← tc.nextTimer)
+    r.check "the last chunk, the peer open: the wait for the close arms" (← tc.nextTimer)
+    tc.advance 1000
+    owner.joinAll
+    r.check "the last chunk, the peer open: the chunk is the answer"
+      (match ← res.get with | some (.ok [c]) => c.payload == noise 2 8 | _ => false)
+    r.check "the last chunk, the peer open: the peer sees the reset"
+      (match ← b.read with | .error .reset => true | _ => false)
+    tc.close
+  -- A byte after the last chunk resets the stream at once.
   do
     let tc ← TestClock.new
     let one := method (maxChunks := 1)
     let (a, b) ← pair
     let owner ← TaskSet.new
     owner.spawn do
-      -- Read the request to its end, answer one chunk, and stay open.
       discard <| pump b (requestReader one) fun _ => pure ()
-      discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩)
+      discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩ ++ bs [0])
     let got ← requestAll a one tc.clock 1000 (some (noise 1 4))
     owner.joinAll
-    r.check "a stop before the peer's close: the chunk arrives"
+    r.check "a byte after the last chunk: the chunk is the answer"
       (match got with | .ok [c] => c.payload == noise 2 8 | _ => false)
-    -- The requester has returned, so its reset came before this read.
-    r.check "a stop before the peer's close: the peer sees the reset"
+    r.check "a byte after the last chunk: the peer sees the reset"
       (match ← b.read with | .error .reset => true | _ => false)
     tc.close
   -- The handler value maps the error once, at the seam.
