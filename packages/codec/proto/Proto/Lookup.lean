@@ -6,6 +6,12 @@ import Proto.Core
 The wire list retains all entries. Singular accessors inspect its last
 occurrence of the requested number. Repeated accessors keep wire order.
 Nested parsing reports malformed payloads through the wire error type.
+
+The strict readers (`bytesField?`, `strField?`, `varintField?`) are the
+one home of the rule every message table of the stack follows: a
+present singular field of the wrong wire type, or a string that is not
+UTF-8, is `badField`, gated by `hasField`, and a missing field is
+`none`.
 -/
 
 set_option autoImplicit false
@@ -59,6 +65,33 @@ def getAllStrs (num : Nat) (fs : Fields) : List String :=
 /-- Presence does not depend on the entry's wire type or payload length. -/
 def hasField (num : Nat) (fs : Fields) : Bool :=
   fs.entries.any fun e => e.1 == num
+
+/-- A strict singular payload: a present field must be length-delimited,
+else `badField`; a miss is `none`. -/
+def bytesField? (num : Nat) (fs : Fields) : Except Error (Option (List Nat)) :=
+  if hasField num fs then
+    match getBytes? num fs with
+    | some bs => .ok (some bs)
+    | none => .error .badField
+  else .ok none
+
+/-- A strict singular string: a present field must be length-delimited
+and valid UTF-8, else `badField`; a miss is `none`. -/
+def strField? (num : Nat) (fs : Fields) : Except Error (Option String) :=
+  if hasField num fs then
+    match (getBytes? num fs).bind (fun bs => Bytes.toString? (Bytes.ofNatList bs)) with
+    | some s => .ok (some s)
+    | none => .error .badField
+  else .ok none
+
+/-- A strict singular integer: a present field must be a varint, else
+`badField`; a miss is `none`. -/
+def varintField? (num : Nat) (fs : Fields) : Except Error (Option Nat) :=
+  if hasField num fs then
+    match getVarint? num fs with
+    | some n => .ok (some n)
+    | none => .error .badField
+  else .ok none
 
 /-- Appending an occurrence makes it the singular lookup result. -/
 theorem lookupLastAppend (num : Nat) (v : Value) (entries : List Entry) :

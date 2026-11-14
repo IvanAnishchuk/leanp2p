@@ -33,7 +33,8 @@ The strings read back through `Bytes.toString?`.
 
 The handlers read the connection from their `StreamContext`. The push
 handler checks the pushed key against `remotePeer`, and it stores the
-addresses under that peer in the host's peerstore. The responder writes
+addresses under that peer in the host's peerstore, with the signed peer
+record when one verifies (`store`, RFC 0003). The responder writes
 `remoteAddr` as the observed address. go-libp2p reads both from
 `s.Conn()` (`vendor/go-libp2p/p2p/protocol/identify/id.go`).
 
@@ -89,32 +90,15 @@ a premise. A payload of `List Nat` and a `String` carry no bound, so
 def toFields (m : Identify) : Pb.Fields :=
   if h : ∀ e ∈ m.entries, e.Valid then ⟨m.entries, h⟩ else Pb.Fields.empty
 
-/-- A present singular payload must be length-delimited. A miss means
-absent. -/
-private def bytesField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error (Option (List Nat)) :=
-  if Pb.hasField num fs then
-    match Pb.getBytes? num fs with
-    | some bs => .ok (some bs)
-    | none => .error .badField
-  else .ok none
-
-/-- A present singular string must be length-delimited and valid
-UTF-8. A miss means absent. -/
-private def strField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error (Option String) :=
-  if Pb.hasField num fs then
-    match (Pb.getBytes? num fs).bind (fun bs => Bytes.toString? (Bytes.ofNatList bs)) with
-    | some s => .ok (some s)
-    | none => .error .badField
-  else .ok none
-
-/-- The field table: strict singular fields, permissive repeated
+/-- The field table: strict singular fields through the shared readers
+of `codec/proto` (`Pb.bytesField?`, `Pb.strField?`), permissive repeated
 fields. Unknown fields stay untouched in the wire view. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error Identify := do
-  let publicKey ← bytesField? 1 fs
-  let observedAddr ← bytesField? 4 fs
-  let protocolVersion ← strField? 5 fs
-  let agentVersion ← strField? 6 fs
-  let signedPeerRecord ← bytesField? 8 fs
+  let publicKey ← Pb.bytesField? 1 fs
+  let observedAddr ← Pb.bytesField? 4 fs
+  let protocolVersion ← Pb.strField? 5 fs
+  let agentVersion ← Pb.strField? 6 fs
+  let signedPeerRecord ← Pb.bytesField? 8 fs
   .ok { publicKey,
         listenAddrs := Pb.getAllBytes 2 fs,
         protocols := (Pb.getAllBytes 3 fs).filterMap
@@ -154,7 +138,7 @@ theorem ofFieldsToFields (m : Identify) (h : ∀ e ∈ m.entries, e.Valid) :
   change ofFields? (toFields m) = .ok m
   rw [toFields, dite_eq_left h]
   obtain ⟨pk, la, ps, oa, pv, av, spr⟩ := m
-  simp only [ofFields?, bytesField?, strField?, Pb.hasField, Pb.getBytes?, Pb.getAllBytes,
+  simp only [ofFields?, Pb.bytesField?, Pb.strField?, Pb.hasField, Pb.getBytes?, Pb.getAllBytes,
     Pb.lookupLast]
   cases pk <;> cases oa <;> cases pv <;> cases av <;> cases spr <;>
     simp [entries, List.lookup_append, List.reverse_append, List.filterMap_append,
@@ -505,11 +489,20 @@ def mapIdentifyError : Error → Libp2p.Core.Error
 private def listenMultiaddrs (m : Identify) : List Multiformats.Multiaddr :=
   m.listenAddrs.filterMap fun a => (Multiformats.Multiaddr.ofBytes? a).toOption
 
+/-- Store what a validated message says about `pid`: its listen
+addresses, and its signed peer record when the record verifies and names
+`pid` (`Host.consumeRecord`). go-libp2p's `consumeMessage` keeps the
+record in its certified address book the same way; a record that fails
+the check is dropped and the listen addresses stay. -/
+def store (h : Libp2p.Host.Host) (m : Identify) (pid : Libp2p.Identity.PeerId) : BaseIO Unit := do
+  h.addAddrs pid (listenMultiaddrs m)
+  if let some spr := m.signedPeerRecord then
+    discard <| h.consumeRecord (Bytes.ofNatList spr) (some pid)
+
 /-- Handle one pushed message from `peer`: validate it against `peer`,
-then add its listen addresses to the host's peerstore. An empty read
-leaves the peerstore unchanged. This is a delta from go, whose
-`consumeMessage` runs on the empty message and clears the peer's
-protocols. -/
+then store it (`store`). An empty read leaves the peerstore unchanged.
+This is a delta from go, whose `consumeMessage` runs on the empty
+message and clears the peer's protocols. -/
 def push (h : Libp2p.Host.Host) (peer : Libp2p.Identity.PeerId)
     (clock : Conc.Clock) (timeoutMs : Nat) (s : Streams.Stream) :
     Conc.Async (Except Error Unit) := do
@@ -520,8 +513,27 @@ def push (h : Libp2p.Host.Host) (peer : Libp2p.Identity.PeerId)
       match validate payload (some peer) with
       | .error e => return .error e
       | .ok (m, pid) =>
-          h.addAddrs pid (listenMultiaddrs m)
+          store h m pid
           return .ok ()
+
+/-- Ask a connected `peer` for its identify message on a new stream,
+check it against `peer`, and store it (`store`): its listen addresses
+and its signed peer record. go-libp2p's identify service does this for
+every new connection (`IdentifyConn`); the owner of a host calls it from
+its connection notifiee, on a task of its own. -/
+def request (h : Libp2p.Host.Host) (peer : Libp2p.Identity.PeerId) (clock : Conc.Clock)
+    (timeoutMs : Nat) : Conc.Async (Except String Unit) := do
+  match ← h.newStream peer [protocolId] with
+  | .error e => return .error e.render
+  | .ok (_, s) =>
+    let answer ← client s clock timeoutMs (some peer)
+    discard s.close
+    match answer with
+    | .error e => return .error (toString (repr e))
+    | .ok none => return .error "identify: the stream ended with no message"
+    | .ok (some (m, pid)) =>
+      store h m pid
+      return .ok ()
 
 /-- The push handler value. Each stream checks the push against the
 peer of its own connection, from the `StreamContext`. -/

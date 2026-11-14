@@ -45,6 +45,16 @@ inductive Error where
   nor sha2-256 with a 32-byte digest
   (`Multiformats.Multiaddr.validPeerHash`). -/
   | notPeerShape
+  /-- A signed envelope whose signature does not verify under its key for
+  the expected domain (RFC 0003: "If the signature is invalid, the
+  envelope MUST be discarded"). -/
+  | badSignature
+  /-- A signed envelope whose payload type is not the one the caller
+  reads. -/
+  | payloadType
+  /-- A peer record whose `peer_id` is not the peer id of the envelope's
+  key (RFC 0003: "the `RoutingState` MUST be discarded"). -/
+  | recordPeer
   deriving DecidableEq, Repr, BEq
 
 end Libp2p.Identity

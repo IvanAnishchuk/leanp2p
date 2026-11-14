@@ -5,6 +5,7 @@ import Libp2p.Identity.Marshal
 import Libp2p.Identity.Keys
 import Libp2p.Identity.Unmarshal
 import Libp2p.Identity.PeerId
+import Libp2p.Identity.Record
 import Libp2p.Identity.Rlp
 import Libp2p.Identity.Rlp.Bytes
 import Libp2p.Identity.Enr

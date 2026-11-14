@@ -17,6 +17,7 @@ import lint is green.
 | 0 | none | this documentation pair, the first work unit of the package (ARCHITECTURE §2) | written, and consistent with the root docs |
 | 1 | W2.2, W2.3, W3.3 | root W5.1: `KeyType`, `PubKey`/`PrivKey` with the `ProtoMessage` instances, the per-type marshalings, the strict unmarshal, and `PeerId` | the unit 1 milestones below pass, and the root W5.1 row holds |
 | 2 | W5.1, W3.2 | root W6.1: the package's own RLP behind its `Codec` surface (ARCHITECTURE, "The RLP is the package's own"), the ENR record with its `v4` signature over the keccak-256 digest, and the peer-id/multiaddr mapping | the unit 2 milestones below pass, and the root W6.1 row holds |
+| 3 | W5.1 | signed envelopes and peer records (RFC 0002, RFC 0003): the wire model with its theorems, sign, and the checked open; the spike adds it for gossipsub's peer exchange | the unit 3 milestones below pass, and go-libp2p consumes our record |
 
 Units 0 and 1 are done. The unit 1 suite is `Tests/Identity.lean`, and
 the theorems live in `Libp2p/Identity/KeyType.lean` (the table),
@@ -104,6 +105,23 @@ Milestones for unit 2:
   when it has no `tcp6`. In the reverse map, an IPv6 port equal to
   the `tcp` port stays in `tcp`, and a different one becomes `tcp6`.
 
+Milestones for unit 3 (`Tests/Record.lean`, `scripts/pubsub-interop.sh`):
+
+- The wire model: `EnvelopeMsg.decodeEncode` and
+  `PeerRecordMsg.decodeEncode` hold over the byte model, with no
+  `sorry`, and the `ByteArray` decoder reads the go vector as the model
+  does.
+- The go vector: our Ed25519 seal of the go-sealed record is
+  byte-identical, and the vector opens to its peer, seq, and addresses.
+- go-libp2p's `ConsumeEnvelope` accepts our record.
+- One rejection each: a flipped signature byte, an unknown payload type,
+  a record that names another peer than its signer, and bytes that are
+  not an envelope. The legacy RFC 0003 pair opens, and a signature does
+  not verify under the other domain.
+- The host store keeps the newest record per peer: an equal or older
+  `seq` leaves it, a newer one replaces it, and a record for another
+  peer than the expected one is refused.
+
 ## Vector stance
 
 The spike captured three key files, and all of them arrive on `main`
@@ -146,6 +164,11 @@ suite and the fixed cases of the empty string and `abc` (the backend
 pair's plan), and the record fixture pins the end-to-end path. The
 peer id of the example key has no captured vector; go-libp2p at the
 vendored commit derives it, and the suite states the string.
+
+Unit 3 pins one vector in `Tests/Record.lean` itself: the hex of the
+record that `scripts/pubsub-go record R 7 …` sealed with go-libp2p
+v0.51.0 (`../p2p/go-libp2p` at `0334994`). An Ed25519 seal is
+deterministic, so the vector holds for every rerun.
 
 Three more pins hold the sources that contracts 5 and 7 cite, with no
 extracted file: `vendor/go-ethereum`,

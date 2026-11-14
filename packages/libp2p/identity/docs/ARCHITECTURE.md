@@ -21,6 +21,7 @@ imports it for `PeerId`, and nothing in it knows a connection (§2,
 | `Libp2p/Identity/Keys.lean` | `PubKey` and `PrivKey`, the `ProtoMessage` instances over the field table, and the sign/verify/derive dispatch |
 | `Libp2p/Identity/Unmarshal.lean` | the strict unmarshal: decode, then the per-type `Data` check, before anything derives from the key |
 | `Libp2p/Identity/PeerId.lean` | derivation over the marshaled key, identity inlining, and the text forms |
+| `Libp2p/Identity/Record.lean` | the signed envelope (RFC 0002) and the peer record (RFC 0003): the wire model with its round-trip theorems, the signed bytes, sign, and the checked open |
 | `Libp2p/Identity/Rlp.lean` | the package's own RLP (the decision below): the item tree, the model codec with the `Codec` and `LawfulCodec` instances, and the canonical scalars |
 | `Libp2p/Identity/Rlp/Bytes.lean` | the `ByteArray` decoder and encoder, the production path that the harness of `base/bytes` pins to the model |
 | `Libp2p/Identity/Enr.lean` | the ENR record, its typed pairs, the `v4` signature check and signer, and the text form |
@@ -104,6 +105,18 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
   is unreachable. Its proof keeps `Enr.toText` total through the shared
   checked encoder. Other bases and codec failures at the multibase
   boundary map to `Enr.Error.text`.
+- Signed peer records (RFC 0002, RFC 0003). `EnvelopeMsg` and
+  `PeerRecordMsg` are the wire model over the byte model, each with its
+  table law and `decodeEncode` theorem; proto3 keeps an empty `bytes`
+  field and a zero `seq` off the wire, as go-libp2p writes them.
+  `Envelope` holds a checked `PubKey`; `Envelope.sign` signs
+  `unsignedBytes`, the domain, the payload type, and the payload, each
+  after its uvarint length. `PeerRecord.sign` seals with go-libp2p's
+  domain and payload type, and `PeerRecord.open?` runs the RFC 0003
+  order: payload type, signature, decode, then the signer's peer id
+  against the record's. The host keeps the newest record of each peer
+  (`libp2p/host`), identify carries it, and gossipsub's peer exchange
+  hands it on.
 
 ## Owned contracts and how the package keeps them
 
@@ -184,6 +197,13 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
    extracts sigp's two cases, and the suite refuses both. Its
    `goEthereum` field records go's answers: it refuses the padded text
    and accepts the trailing-bits text as the same record.
+8. **A peer record opens only through its signature.** `PeerRecord.open?`
+   checks the payload type, verifies the signature under the domain of
+   that type, and only then decodes the payload (RFC 0003: "a peer MUST
+   validate the signature before deserializing"). A record whose
+   `peer_id` is not the signer's is `recordPeer`. An Ed25519 seal is
+   deterministic, so `Tests/Record.lean` pins our bytes to go-libp2p's
+   for one record, and `scripts/pubsub-interop.sh` has go consume ours.
 
 ## Decisions
 
@@ -218,6 +238,16 @@ side is `Crypto/Keys.lean` and `Crypto/PeerId.lean` (§10 row 11);
   the ethereum/tests `RLPTests` vectors are the acceptance suite. The
   `Codec` surface is the one boundary, so the codec behind it is one
   module.
+- **The peer record speaks go-libp2p's domain and payload type.** RFC
+  0003 names `libp2p-routing-state` and `"/libp2p/routing-state-record"`.
+  go-libp2p signs with `libp2p-peer-record` and the multicodec 0x0301,
+  and rust-libp2p calls that pair its interop form, the RFC pair its
+  legacy form. The spec and both implementations disagree, so the choice
+  is a decision (PRINCIPLES 2.1): the seal writes go's pair, the form
+  every peer exchange of the consensus clients carries, and the open
+  accepts both pairs, each verified under its own domain. An address
+  that does not decode is dropped from the record, as go-libp2p's
+  `addrsFromProtobuf` drops it; rust-libp2p refuses the whole record.
 - **The strictness depth stops at the DER shell.** A full DER parse
   here would duplicate the backend's parser, and two parsers drift.
   The shell check is enough to gate the id derivation; the verifier

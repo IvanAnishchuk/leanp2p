@@ -65,6 +65,61 @@ multihash; a longer key hashes with sha2-256 (the peer-ids spec,
 maxInlineKeyLength`). A key at the threshold inlines. -/
 def maxInlineKeyBytes : Nat := 42
 
+/-! ## Signed envelopes and peer records
+
+RFC 0002 (`RFC/0002-signed-envelopes.md`) fixes the envelope fields, and
+RFC 0003 (`RFC/0003-routing-records.md`) the peer record fields. The
+domain and the payload type of a peer record are go-libp2p's
+(`core/peer/record.go`): the RFC text names an older pair, which
+rust-libp2p keeps as its legacy form. -/
+
+/-- `PublicKey public_key = 1` of the envelope. -/
+def envelopeKeyField : Nat := 1
+
+/-- `bytes payload_type = 2`. -/
+def envelopeTypeField : Nat := 2
+
+/-- `bytes payload = 3`. -/
+def envelopePayloadField : Nat := 3
+
+/-- `bytes signature = 5`. Field 4 is unused. -/
+def envelopeSignatureField : Nat := 5
+
+/-- `bytes peer_id = 1` of the peer record. -/
+def recordPeerIdField : Nat := 1
+
+/-- `uint64 seq = 2`. -/
+def recordSeqField : Nat := 2
+
+/-- `repeated AddressInfo addresses = 3`. -/
+def recordAddrsField : Nat := 3
+
+/-- `bytes multiaddr = 1` of `AddressInfo`. -/
+def addressMultiaddrField : Nat := 1
+
+/-- The signing domain of a peer record: `"libp2p-peer-record"`, as ASCII
+bytes. go-libp2p `PeerRecordEnvelopeDomain`, rust-libp2p
+`STANDARD_DOMAIN_SEP`. -/
+def peerRecordDomain : List Nat :=
+  [0x6c, 0x69, 0x62, 0x70, 0x32, 0x70, 0x2d, 0x70, 0x65, 0x65, 0x72, 0x2d, 0x72, 0x65, 0x63, 0x6f,
+   0x72, 0x64]
+
+/-- The payload type of a peer record: the multicodec `libp2p-peer-record`,
+0x0301, as its unsigned varint. go-libp2p `PeerRecordEnvelopePayloadType`. -/
+def peerRecordPayloadType : List Nat := [0x03, 0x01]
+
+/-- The legacy domain, `"libp2p-routing-state"`: the RFC 0003 text and
+rust-libp2p's default `PeerRecord::new`. -/
+def legacyRecordDomain : List Nat :=
+  [0x6c, 0x69, 0x62, 0x70, 0x32, 0x70, 0x2d, 0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x2d, 0x73,
+   0x74, 0x61, 0x74, 0x65]
+
+/-- The legacy payload type, the ASCII bytes of
+`"/libp2p/routing-state-record"`. -/
+def legacyRecordPayloadType : List Nat :=
+  [0x2f, 0x6c, 0x69, 0x62, 0x70, 0x32, 0x70, 0x2f, 0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x2d,
+   0x73, 0x74, 0x61, 0x74, 0x65, 0x2d, 0x72, 0x65, 0x63, 0x6f, 0x72, 0x64]
+
 /-! ## The ENR -/
 
 namespace Enr

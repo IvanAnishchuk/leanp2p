@@ -39,28 +39,11 @@ namespace Libp2p.Protocols.Gossipsub
 
 /-! ## Shared readers
 
-These readers are the house pattern of `Identify`, plus a strict bool
-reader and an optional varint reader. Each one gates on `Pb.hasField`,
-so a present field of another wire type is `badField` rather than a
-miss. -/
-
-/-- A present singular payload must be length-delimited. A miss means
-absent. -/
-private def bytesField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error (Option (List Nat)) :=
-  if Pb.hasField num fs then
-    match Pb.getBytes? num fs with
-    | some bs => .ok (some bs)
-    | none => .error .badField
-  else .ok none
-
-/-- A present singular string must be length-delimited and valid UTF-8.
-A miss means absent. -/
-private def strField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error (Option String) :=
-  if Pb.hasField num fs then
-    match (Pb.getBytes? num fs).bind (fun bs => Bytes.toString? (Bytes.ofNatList bs)) with
-    | some s => .ok (some s)
-    | none => .error .badField
-  else .ok none
+The strict singular readers are `codec/proto`'s (`Pb.bytesField?`,
+`Pb.strField?`, `Pb.varintField?`), the one home of the rule. This
+module adds a strict bool reader, which only gossipsub needs. Each
+reader gates on `Pb.hasField`, so a present field of another wire type
+is `badField` rather than a miss. -/
 
 /-- A strict bool. A miss and varint 0 are `false`, varint 1 is `true`,
 and every other present value is `badField`. -/
@@ -72,18 +55,9 @@ private def boolField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error Bool :=
     | _ => .error .badField
   else .ok false
 
-/-- An optional varint. A miss is `none`, and a present value of another
-wire type is `badField`. -/
-private def varintField? (num : Nat) (fs : Pb.Fields) : Except Pb.Error (Option Nat) :=
-  if Pb.hasField num fs then
-    match Pb.getVarint? num fs with
-    | some n => .ok (some n)
-    | none => .error .badField
-  else .ok none
-
 /-- A required string. A miss is `badField`. -/
 private def requiredStr? (num : Nat) (fs : Pb.Fields) : Except Pb.Error String := do
-  match ← strField? num fs with
+  match ← Pb.strField? num fs with
   | some s => .ok s
   | none => .error .badField
 
@@ -287,11 +261,11 @@ The required topic reads first, so a missing topic fails before the
 other fields run. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error Message := do
   let topic ← requiredStr? 4 fs
-  let frm ← bytesField? 1 fs
-  let data ← bytesField? 2 fs
-  let seqno ← bytesField? 3 fs
-  let signature ← bytesField? 5 fs
-  let key ← bytesField? 6 fs
+  let frm ← Pb.bytesField? 1 fs
+  let data ← Pb.bytesField? 2 fs
+  let seqno ← Pb.bytesField? 3 fs
+  let signature ← Pb.bytesField? 5 fs
+  let key ← Pb.bytesField? 6 fs
   .ok { «from» := frm, data, seqno, topic := ⟨topic⟩, signature, key }
 
 instance : Pb.ProtoMessage Message where
@@ -307,7 +281,7 @@ theorem ofFieldsToFields (m : Message) (h : Valid m) :
   obtain ⟨frm, data, seqno, topic, signature, key⟩ := m
   obtain ⟨name⟩ := topic
   cases frm <;> cases data <;> cases seqno <;> cases signature <;> cases key <;>
-    simp [ofFields?, requiredStr?, bytesField?, strField?, entries, Pb.hasField, Pb.getBytes?,
+    simp [ofFields?, requiredStr?, Pb.bytesField?, Pb.strField?, entries, Pb.hasField, Pb.getBytes?,
       Pb.lookupLast, List.lookup_cons, Bind.bind, Except.bind, Bytes.ofNatListToNatList,
       Bytes.toString?OfString]
 
@@ -322,7 +296,7 @@ theorem ofFields?MissingTopic (fs : Pb.Fields) (h : ¬ Pb.hasField 4 fs) :
     ofFields? fs = .error .badField := by
   have hb : Pb.hasField 4 fs = false := by
     cases hm : Pb.hasField 4 fs <;> simp_all
-  simp [ofFields?, requiredStr?, strField?, hb, Bind.bind, Except.bind]
+  simp [ofFields?, requiredStr?, Pb.strField?, hb, Bind.bind, Except.bind]
 
 end Message
 
@@ -369,7 +343,7 @@ def toFields (s : SubOpts) : Pb.Fields :=
 /-- The field table. A miss reads as false or the empty string. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error SubOpts := do
   let subscribe ← boolField? 1 fs
-  let topicid ← strField? 2 fs
+  let topicid ← Pb.strField? 2 fs
   let requestsPartial ← boolField? 3 fs
   let supportsSendingPartial ← boolField? 4 fs
   .ok { subscribe, topicid := topicid.getD "", requestsPartial, supportsSendingPartial }
@@ -386,7 +360,7 @@ theorem ofFieldsToFields (s : SubOpts) (h : Valid s) :
   rw [toFields, fieldsOf?, dite_eq_left he]
   obtain ⟨sub, tid, rp, ss⟩ := s
   cases sub <;> cases rp <;> cases ss <;>
-    simp [ofFields?, boolField?, strField?, entries, Pb.hasField, Pb.getBytes?,
+    simp [ofFields?, boolField?, Pb.strField?, entries, Pb.hasField, Pb.getBytes?,
       Pb.getVarint?, Pb.lookupLast, List.lookup_cons, Bind.bind, Except.bind,
       Bytes.ofNatListToNatList, Bytes.toString?OfString]
 
@@ -426,8 +400,8 @@ def toFields (p : PeerInfo) : Pb.Fields :=
 
 /-- The field table. A miss reads as an absent payload. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error PeerInfo := do
-  let peerId ← bytesField? 1 fs
-  let signedPeerRecord ← bytesField? 2 fs
+  let peerId ← Pb.bytesField? 1 fs
+  let signedPeerRecord ← Pb.bytesField? 2 fs
   .ok { peerId, signedPeerRecord }
 
 instance : Pb.ProtoMessage PeerInfo where
@@ -442,7 +416,7 @@ theorem ofFieldsToFields (p : PeerInfo) (h : Valid p) :
   rw [toFields, fieldsOf?, dite_eq_left he]
   obtain ⟨pid, spr⟩ := p
   cases pid <;> cases spr <;>
-    simp [ofFields?, bytesField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
+    simp [ofFields?, Pb.bytesField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
       List.lookup_cons, Bind.bind, Except.bind]
 
 /-- An encode decodes back to the value. -/
@@ -481,7 +455,7 @@ def toFields (i : ControlIHave) : Pb.Fields :=
 
 /-- The field table. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error ControlIHave := do
-  let topicId ← strField? 1 fs
+  let topicId ← Pb.strField? 1 fs
   .ok { topicId := topicId.getD "", messageIds := messageIdsOf 2 fs }
 
 instance : Pb.ProtoMessage ControlIHave where
@@ -498,7 +472,7 @@ theorem ofFieldsToFields (i : ControlIHave) (h : Valid i) :
   have hb : allBytesOf 2 ((1, Pb.Value.bytes (Bytes.toNatList (Bytes.ofString tid))) ::
       ids.map (fun m => (2, Pb.Value.bytes m.bytes))) = ids.map (fun m => m.bytes) := by
     simp [allBytesOf, allBytesOfMapBytes]
-  simp [ofFields?, strField?, entries, messageIdsOf, hb, mapMessageIdMkComp, Function.comp_def,
+  simp [ofFields?, Pb.strField?, entries, messageIdsOf, hb, mapMessageIdMkComp, Function.comp_def,
     Pb.hasField, Pb.getBytes?, Pb.lookupLast, List.lookup_append, Bind.bind, Except.bind,
     Bytes.ofNatListToNatList, Bytes.toString?OfString, lookupMissMap]
 
@@ -583,7 +557,7 @@ def toFields (g : ControlGraft) : Pb.Fields :=
 
 /-- The field table. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error ControlGraft := do
-  let topicId ← strField? 1 fs
+  let topicId ← Pb.strField? 1 fs
   .ok { topicId := topicId.getD "" }
 
 instance : Pb.ProtoMessage ControlGraft where
@@ -597,7 +571,7 @@ theorem ofFieldsToFields (g : ControlGraft) (h : Valid g) :
   have he : ∀ e ∈ g.entries, e.Valid := h
   rw [toFields, fieldsOf?, dite_eq_left he]
   obtain ⟨tid⟩ := g
-  simp [ofFields?, strField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
+  simp [ofFields?, Pb.strField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
     Bind.bind, Except.bind, Bytes.ofNatListToNatList, Bytes.toString?OfString]
 
 /-- An encode decodes back to the value. -/
@@ -640,9 +614,9 @@ def toFields (p : ControlPrune) : Pb.Fields :=
 
 /-- The field table. The peers decode as nested messages. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error ControlPrune := do
-  let topicId ← strField? 1 fs
+  let topicId ← Pb.strField? 1 fs
   let peers ← subAll? (α := PeerInfo) 2 fs
-  let backoff ← varintField? 3 fs
+  let backoff ← Pb.varintField? 3 fs
   .ok { topicId := topicId.getD "", peers, backoff }
 
 instance : Pb.ProtoMessage ControlPrune where
@@ -664,7 +638,7 @@ theorem ofFieldsToFields (p : ControlPrune) (h : Valid p) :
           peers.map (fun q => (2, Pb.Value.bytes (Pb.encodeMessage q)))) =
           peers.map (fun q => Pb.encodeMessage q) := by
         simp [allBytesOf, allBytesOfMapBytes]
-      simp [ofFields?, strField?, varintField?, subAll?, hdec, hb, entries, Pb.hasField,
+      simp [ofFields?, Pb.strField?, Pb.varintField?, subAll?, hdec, hb, entries, Pb.hasField,
         Pb.getBytes?, Pb.lookupLast, List.lookup_append, lookupMissMap, Bind.bind,
         Except.bind, Bytes.ofNatListToNatList, Bytes.toString?OfString]
   | some n =>
@@ -673,7 +647,7 @@ theorem ofFieldsToFields (p : ControlPrune) (h : Valid p) :
             [(3, Pb.Value.varint n)])) =
           peers.map (fun q => Pb.encodeMessage q) := by
         simp [allBytesOf, allBytesOfAppend, allBytesOfMapBytes]
-      simp [ofFields?, strField?, varintField?, subAll?, hdec, hb, entries, Pb.hasField,
+      simp [ofFields?, Pb.strField?, Pb.varintField?, subAll?, hdec, hb, entries, Pb.hasField,
         Pb.getBytes?, Pb.getVarint?, Pb.lookupLast, List.lookup_append, List.lookup_cons,
         List.reverse_append, lookupMissMap, Bind.bind, Except.bind,
         Bytes.ofNatListToNatList, Bytes.toString?OfString]
@@ -776,10 +750,10 @@ def toFields (p : PartialMessage) : Pb.Fields :=
 
 /-- The field table. A miss reads as an absent payload. -/
 def ofFields? (fs : Pb.Fields) : Except Pb.Error PartialMessage := do
-  let topicId ← bytesField? 1 fs
-  let groupId ← bytesField? 2 fs
-  let partialMessage ← bytesField? 3 fs
-  let partsMetadata ← bytesField? 4 fs
+  let topicId ← Pb.bytesField? 1 fs
+  let groupId ← Pb.bytesField? 2 fs
+  let partialMessage ← Pb.bytesField? 3 fs
+  let partsMetadata ← Pb.bytesField? 4 fs
   .ok { topicId, groupId, partialMessage, partsMetadata }
 
 instance : Pb.ProtoMessage PartialMessage where
@@ -794,7 +768,7 @@ theorem ofFieldsToFields (p : PartialMessage) (h : Valid p) :
   rw [toFields, fieldsOf?, dite_eq_left he]
   obtain ⟨t, g, m, md⟩ := p
   cases t <;> cases g <;> cases m <;> cases md <;>
-    simp [ofFields?, bytesField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
+    simp [ofFields?, Pb.bytesField?, entries, Pb.hasField, Pb.getBytes?, Pb.lookupLast,
       List.lookup_cons, Bind.bind, Except.bind]
 
 /-- An encode decodes back to the value. -/

@@ -184,6 +184,10 @@ structure Host where
   handlers : OnceRef Handlers
   /-- The peerstore (§3.8). -/
   peerstore : OnceRef Peerstore
+  /-- The certified records: the newest signed peer record of each peer,
+  with its `seq` (RFC 0003, "Peer Store APIs"). The same peer cap as
+  the peerstore bounds it. -/
+  records : OnceRef (Std.HashMap PeerId (Nat × ByteArray))
   /-- The next session number, and the next pending key. -/
   counter : OnceRef Nat
   /-- The closing flag (§5.5). -/
@@ -219,6 +223,7 @@ def new (config : Config) : BaseIO (Except Identity.Error Host) := do
       sessions := ← OnceRef.new {}
       handlers := ← OnceRef.new (config.handlers.foldl (fun t h => Handlers.set h t) {})
       peerstore := ← OnceRef.new {}
+      records := ← OnceRef.new {}
       counter := ← OnceRef.new 0
       closing := ← OnceRef.new false
       shutdown := ← Chan.new 1
@@ -267,6 +272,55 @@ owner calls it, as Lighthouse's peer manager runs its own heartbeat. -/
 def prunePeerstore (h : Host) : BaseIO Unit := do
   let now ← h.config.clock.nowMs
   h.peerstore.update (Peerstore.prune · now)
+
+/-! ## Signed peer records
+
+RFC 0003, "Peer Store APIs": a receiving peer "MUST keep track of the
+latest `seq` value received for each peer and reject incoming
+`RoutingState` messages unless they contain a greater `seq` value". It
+"SHOULD retain the original signed envelope", so the store keeps the
+bytes and hands them on unchanged, as gossipsub's peer exchange does. -/
+
+/-- The table after a verified record of `peer` with `seq` arrives: kept
+when it is newer than the stored one, refused for a new peer past
+`cap`. The answer says whether the table took it. -/
+def putRecord (peer : PeerId) (seq : Nat) (bytes : ByteArray) (cap : Nat)
+    (t : Std.HashMap PeerId (Nat × ByteArray)) : Std.HashMap PeerId (Nat × ByteArray) × Bool :=
+  match t.get? peer with
+  | some (old, _) => if old < seq then (t.insert peer (seq, bytes), true) else (t, false)
+  | none => if cap ≤ t.size then (t, false) else (t.insert peer (seq, bytes), true)
+
+/-- Consume a signed peer record: verify it (`PeerRecord.open?`), check
+the peer when the caller expects one, keep it when it is the newest of
+its peer, and add its addresses with `ttlMs`. The answer is the peer and
+whether the store took the record; an older record leaves both the
+record and the addresses as they were, as go-libp2p's
+`ConsumePeerRecord` does. -/
+def consumeRecord (h : Host) (bytes : ByteArray) (expected : Option PeerId := none)
+    (ttlMs : Option Nat := none) : BaseIO (Except Identity.Error (PeerId × Bool)) := do
+  match PeerRecord.open? bytes with
+  | .error e => return .error e
+  | .ok (_, r) =>
+    if let some e := expected then
+      if e.hash != r.peerId.hash then return .error .recordPeer
+    let fresh ← h.records.updateGet fun t =>
+      let (t', took) := putRecord r.peerId r.seq bytes h.config.peerstoreLimits.peers t
+      (took, t')
+    if fresh then h.addAddrs r.peerId r.addrs ttlMs
+    return .ok (r.peerId, fresh)
+
+/-- The stored signed record of `peer`, as it arrived. -/
+def recordOf (h : Host) (peer : PeerId) : BaseIO (Option ByteArray) := do
+  return ((← h.records.get).get? peer).map (·.2)
+
+/-- Sign our own peer record over `addrs` with `seq`. The caller picks
+`seq` and raises it with each new record, as RFC 0003 asks; go-libp2p
+uses the Unix time in nanoseconds. -/
+def signRecord (h : Host) (addrs : List Multiaddr) (seq : Nat) :
+    IO (Except Identity.Error ByteArray) := do
+  match ← (PeerRecord.sign h.config.identity { peerId := h.localPeer, seq, addrs }).run with
+  | .ok e => return .ok e.marshal
+  | .error err => return .error err
 
 /-- True when the host serves a live session with `peer`. -/
 def connected (h : Host) (peer : PeerId) : BaseIO Bool := do
