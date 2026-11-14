@@ -18,6 +18,7 @@ next port. The probe binds `--ip`, default `0.0.0.0`, and names it in its record
 The probe subscribes to the block, the aggregate, every attestation subnet, and every
 column subnet. Each peer whose `Status` arrives gets four requests once:
 
+* `BeaconBlocksByHead` for 4 blocks of the ancestry of its head root
 * `BeaconBlocksByRange` for the 8 slots up to its head
 * `DataColumnSidecarsByRange` for columns 0 and 1 of the 2 slots up to its head
 * `Ping`
@@ -97,7 +98,12 @@ def short (p : PeerId) : String :=
 
 /-- The four requests to a peer at its head slot. -/
 def probePeer (s : Service) (counts : OnceRef Counts) (digest : ByteArray) (peer : PeerId)
-    (head : Nat) : Async Unit := do
+    (head : Nat) (headRoot : ByteArray) : Async Unit := do
+  match ← s.request peer blocksByHeadMethod (some (blocksByHeadRequest headRoot 4)) with
+  | .ok chunks =>
+    let ok := chunks.filter (·.result matches .success)
+    IO.println s!"blocks-by-head {short peer}: {ok.length} chunks"
+  | .error e => IO.println s!"blocks-by-head {short peer}: {repr e}"
   match ← s.request peer blocksByRangeMethod (some (blocksByRangeRequest (head - min head 7) 8)) with
   | .ok chunks =>
     let ok := chunks.filter (·.result matches .success)
@@ -168,7 +174,7 @@ def run (a : Args) : IO UInt32 := do
           finalized epoch {st.finalizedEpoch}"
         counts.update fun c => { c with statuses := c.statuses + 1 }
         let first ← probed.updateGet fun l => (!l.contains p, if l.contains p then l else p :: l)
-        if first then tasks.spawn (probePeer s counts digest p st.headSlot)
+        if first then tasks.spawn (probePeer s counts digest p st.headSlot st.headRoot)
       | .gossip k id src ssz =>
         discard <| s.report id src .ignore
         counts.update fun c => match k with

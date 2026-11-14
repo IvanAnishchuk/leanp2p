@@ -46,8 +46,8 @@ and `quic`.
   `cgc?`, `attnets?`, `bitSet`, `sameDigest`, `sameFork`.
 - The methods `statusMethod`, `goodbyeMethod`, `pingMethod`,
   `metadataV3Method`, `metadataV2Method`, `blocksByRangeMethod`,
-  `blocksByRootMethod`, `columnsByRangeMethod`, `columnsByRootMethod`,
-  and the request encoders.
+  `blocksByRootMethod`, `blocksByHeadMethod`, `columnsByRangeMethod`,
+  `columnsByRootMethod`, and the request encoders.
 - `Status`, `MetaData`.
 - `gossipParams`.
 - `Scoring.scoredParams`, `Scoring.dynamicParams`, `Scoring.kindParams`,
@@ -105,8 +105,12 @@ and `quic`.
   404 bytes, and the least column is 356 bytes. The largest of each is
   the spec's global cap. Lighthouse cuts the column at the blob count
   of the fork, which needs the client's numbers.
-- **Goodbye answers nothing**, as in Lighthouse ("Goodbye request has no
-  response"). The requester's read ends at the peer's close.
+- **Goodbye answers one chunk, and takes zero or one.** phase0 says "The
+  response MUST consist of a single `response_chunk`". The service
+  answers `Uint64 0`, as Lodestar does, whose requester expects exactly
+  one chunk. Lighthouse answers none ("Goodbye request has no
+  response"), against the spec, so our requester reads at most one and
+  ends at the peer's close.
 - **Lighthouse's score profile, on by default.** The spec has no score
   parameters yet, and each client picks its own. The package already
   takes Lighthouse's numbers for the other open choices, and the devnet

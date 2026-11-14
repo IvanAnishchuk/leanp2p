@@ -125,6 +125,9 @@ inductive Event where
 inductive Inbound where
   | blocksByRange (startSlot count : Nat)
   | blocksByRoot (roots : List ByteArray)
+  /-- The ancestry of `root`, inclusive, newest first, at most `count`
+  blocks (fulu, "BeaconBlocksByHead v1"). -/
+  | blocksByHead (root : ByteArray) (count : Nat)
   | columnsByRange (startSlot count : Nat) (columns : List Nat)
   /-- The raw SSZ of a `DataColumnsByRootIdentifiers` list. -/
   | columnsByRoot (ssz : ByteArray)
@@ -267,6 +270,8 @@ def invalid : Chunk := ⟨.invalidRequest, ByteArray.empty, "malformed request".
 def inboundOf (m : Method) (p : ByteArray) : Option Inbound :=
   if m.id == blocksByRangeMethod.id then
     if p.size == 24 then some (.blocksByRange (le64At p 0) (le64At p 8)) else none
+  else if m.id == blocksByHeadMethod.id then
+    if p.size == 40 then some (.blocksByHead (p.extract 0 32) (le64At p 32)) else none
   else if m.id == blocksByRootMethod.id then
     if p.size % 32 == 0 then
       some (.blocksByRoot ((List.range (p.size / 32)).map fun i => p.extract (32 * i) (32 * i + 32)))
@@ -302,13 +307,18 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
       discard <| emit (plain (← b.metaData).encodeV3),
    b.handlerOf metadataV2Method fun _ _ emit => do
       discard <| emit (plain (← b.metaData).encodeV2),
-   b.handlerOf goodbyeMethod fun peer payload _ => do
+   b.handlerOf goodbyeMethod fun peer payload emit => do
       let reason := match payload with
         | some p => if p.size == 8 then le64At p 0 else 0
         | none => 0
+      -- "The response MUST consist of a single `response_chunk`" (phase0,
+      -- "Goodbye v1"). Lodestar answers 0 and expects one chunk back;
+      -- Lighthouse answers nothing.
+      discard <| emit (plain (Chain.le64 0))
       (b.config.onEvent (.goodbye peer reason) : BaseIO Unit),
    serveMethod blocksByRangeMethod,
    serveMethod blocksByRootMethod,
+   serveMethod blocksByHeadMethod,
    serveMethod columnsByRangeMethod,
    serveMethod columnsByRootMethod]
 
@@ -316,7 +326,7 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
 def servedIds : List String :=
   [Identify.protocolId, Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId,
    statusMethod.id, goodbyeMethod.id, pingMethod.id, metadataV3Method.id, metadataV2Method.id,
-   blocksByRangeMethod.id, blocksByRootMethod.id, columnsByRangeMethod.id,
+   blocksByRangeMethod.id, blocksByRootMethod.id, blocksByHeadMethod.id, columnsByRangeMethod.id,
    columnsByRootMethod.id].map (·.toString)
 
 /-- Report the host's sessions, and send `Status` on each outbound one.

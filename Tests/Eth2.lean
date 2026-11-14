@@ -313,6 +313,11 @@ private def serviceChecks (r : Runner) : Async Unit := do
     | .blocksByRange start count =>
       for i in [0:count] do
         discard <| emit digest ⟨Array.replicate 404 (start + i).toUInt8⟩
+    -- The ancestry of the root, newest first: blocks 9, 8, ... here.
+    | .blocksByHead root count =>
+      if root.size == 32 then
+        for i in [0:count] do
+          discard <| emit digest ⟨Array.replicate 404 (9 - i).toUInt8⟩
     | _ => pure ()
   let a ← startOn c 1 evA (serve := serve)
   let b ← startOn c 2 evB [← (a.localEnr : BaseIO Enr)]
@@ -372,6 +377,16 @@ private def serviceChecks (r : Runner) : Async Unit := do
     r.check "eth2 service: the chunks keep their order"
       (chunks.map (·.payload.get! 0) == [10, 11, 12])
   | .error _ => r.check "eth2 service: the range request answers" false
+  match ← b.request aPeer blocksByHeadMethod (some (blocksByHeadRequest ⟨Array.replicate 32 1⟩ 3)) with
+  | .ok chunks =>
+    r.check "eth2 service: the head request gets the ancestry, newest first"
+      (chunks.map (·.payload.get! 0) == [9, 8, 7] && chunks.all (·.context == digest))
+  | .error _ => r.check "eth2 service: the head request answers" false
+  match ← b.request aPeer goodbyeMethod (some (Chain.le64 3)) with
+  | .ok chunks =>
+    r.check "eth2 service: Goodbye answers one chunk of 0, as the spec asks"
+      (chunks.map (·.payload) == [Chain.le64 0])
+  | .error _ => r.check "eth2 service: Goodbye answers" false
   match ← b.request aPeer metadataV3Method none with
   | .ok [m] =>
     r.check "eth2 service: MetaData v3 names the custody"

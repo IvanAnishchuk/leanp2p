@@ -33,6 +33,8 @@ The request bounds follow the request types:
 * `BeaconBlocksByRange` v2: `start_slot`, `count`, `step`, 24 bytes.
 * `BeaconBlocksByRoot` v2: a list of up to `MAX_REQUEST_BLOCKS_DENEB`
   roots.
+* `BeaconBlocksByHead` v1 (new in Fulu): `beacon_root` and `count`, 40
+  bytes.
 * `DataColumnSidecarsByRange` v1: `start_slot`, `count`, and an offset,
   then up to `NUMBER_OF_COLUMNS` indices of 8 bytes.
 * `DataColumnSidecarsByRoot` v1: up to `MAX_REQUEST_BLOCKS_DENEB`
@@ -115,9 +117,10 @@ def statusMethod : Method :=
     request := some (exactly statusLen), response := exactly statusLen
     contextLen := 0, maxChunks := 1 }
 
-/-- `/eth2/beacon_chain/req/goodbye/1/ssz_snappy`. The responder sends
-no chunk, as Lighthouse does ("Goodbye request has no response"), so
-the requester reads at most one. -/
+/-- `/eth2/beacon_chain/req/goodbye/1/ssz_snappy`. "The response MUST
+consist of a single `response_chunk`", and the service answers one, as
+Lodestar does. Lighthouse answers none ("Goodbye request has no
+response"), so the requester reads at most one. -/
 def goodbyeMethod : Method :=
   { id := Libp2p.Protocols.Constants.reqRespId "goodbye" 1
     request := some (exactly 8), response := exactly 8, contextLen := 0, maxChunks := 1 }
@@ -158,6 +161,16 @@ def blocksByRootMethod : Method :=
     contextLen := Libp2p.Protocols.Constants.forkDigestLen
     maxChunks := Constants.maxRequestBlocksDeneb }
 
+/-- `/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy` (fulu,
+"BeaconBlocksByHead v1"): `beacon_root` and `count`, 40 bytes, and the
+blocks of the root's ancestry, newest first. "No more than
+`MAX_REQUEST_BLOCKS_DENEB` may be requested at a time." -/
+def blocksByHeadMethod : Method :=
+  { id := Libp2p.Protocols.Constants.reqRespId "beacon_blocks_by_head" 1
+    request := some (exactly 40), response := blockBounds
+    contextLen := Libp2p.Protocols.Constants.forkDigestLen
+    maxChunks := Constants.maxRequestBlocksDeneb }
+
 /-- `/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy`. -/
 def columnsByRangeMethod : Method :=
   { id := Libp2p.Protocols.Constants.reqRespId "data_column_sidecars_by_range" 1
@@ -176,6 +189,10 @@ def columnsByRootMethod : Method :=
 /-- The SSZ of a `BeaconBlocksByRange` request: `step` is 1. -/
 def blocksByRangeRequest (startSlot count : Nat) : ByteArray :=
   Chain.le64 startSlot ++ Chain.le64 count ++ Chain.le64 1
+
+/-- The SSZ of a `BeaconBlocksByHead` request: the root, then `count`. -/
+def blocksByHeadRequest (root : ByteArray) (count : Nat) : ByteArray :=
+  root ++ Chain.le64 count
 
 /-- The SSZ of a `BeaconBlocksByRoot` request: the roots, back to back. -/
 def blocksByRootRequest (roots : List ByteArray) : ByteArray :=
@@ -203,6 +220,7 @@ def columnsByRootRequest (roots : List ByteArray) (columns : List Nat) : ByteArr
   ⟨⟨#[1, 2, 3, 4]⟩, ⟨Array.replicate 32 7⟩, 5, ⟨Array.replicate 32 9⟩, 170, 3⟩)).map
     (fun s => (s.finalizedEpoch, s.headSlot, s.earliestAvailableSlot)) == some (5, 170, 3)
 #guard (blocksByRangeRequest 64 32).size == 24
+#guard (blocksByHeadRequest ⟨Array.replicate 32 0⟩ 8).size == 40
 #guard (columnsByRangeRequest 0 1 [1, 2]).size == 20 + 16
 #guard (columnsByRootRequest [⟨Array.replicate 32 0⟩] [0]).size == 4 + 36 + 8
 
