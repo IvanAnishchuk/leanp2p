@@ -254,14 +254,24 @@ def limiterOf (b : Base) (peer : PeerId) : BaseIO Limiter := do
     | some old => (old, t)
     | none => (l, (peer, l) :: t)
 
+/-- Send one request and hand each chunk to `check` as it arrives.
+`check` answers whether the read goes on, so the client verifies each
+chunk before it consumes the next ("Before consuming the next response
+chunk, the response reader SHOULD verify", deneb and fulu). A refused
+chunk resets the stream. -/
+def requestEach (b : Base) (peer : PeerId) (m : Method) (payload : Option ByteArray)
+    (check : Chunk → Async Bool) : Async (Except ReqResp.Error Unit) := do
+  let lim ← b.limiterOf peer
+  let openTo := (Gossipsub.HostSeam.ofHost b.host).newStream peer
+  ReqResp.requestPeer openTo lim m Clock.system b.config.requestTimeoutMs payload check
+
 /-- Send one request and collect its chunks. -/
 def request (b : Base) (peer : PeerId) (m : Method) (payload : Option ByteArray) :
     Async (Except ReqResp.Error (List Chunk)) := do
   let acc ← (OnceRef.new ([] : List Chunk) : BaseIO _)
-  let lim ← b.limiterOf peer
-  let openTo := (Gossipsub.HostSeam.ofHost b.host).newStream peer
-  match ← ReqResp.requestPeer openTo lim m Clock.system b.config.requestTimeoutMs payload
-      (fun c => (acc.update (c :: ·) : BaseIO Unit)) with
+  match ← b.requestEach peer m payload fun c => do
+      (acc.update (c :: ·) : BaseIO Unit)
+      return true with
   | .error e => return .error e
   | .ok () => return .ok (← (acc.get : BaseIO _)).reverse
 
@@ -702,10 +712,16 @@ def setStatus (s : Service) (finalizedRoot : ByteArray) (finalizedEpoch : Nat)
   let forkDigest := (← s.forks.get).current
   s.base.status.set { forkDigest, finalizedRoot, finalizedEpoch, headRoot, headSlot, earliestAvailableSlot }
 
-/-- Send one request to a peer. -/
+/-- Send one request to a peer, and collect its chunks. -/
 def request (s : Service) (peer : PeerId) (m : Method) (payload : Option ByteArray) :
     Async (Except ReqResp.Error (List Chunk)) :=
   s.base.request peer m payload
+
+/-- Send one request to a peer, and check each chunk before the next.
+A `check` that answers `false` ends the read and resets the stream. -/
+def requestEach (s : Service) (peer : PeerId) (m : Method) (payload : Option ByteArray)
+    (check : Chunk → Async Bool) : Async (Except ReqResp.Error Unit) :=
+  s.base.requestEach peer m payload check
 
 /-- The connected peers. -/
 def peers (s : Service) : BaseIO (List PeerId) := s.base.host.peers

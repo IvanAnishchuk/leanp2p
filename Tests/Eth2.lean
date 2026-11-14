@@ -387,6 +387,13 @@ private def serviceChecks (r : Runner) : Async Unit := do
       (chunks.map (·.payload.get! 0) == [10, 11, 12])
     r.check "eth2 service: the cap refuses the two chunks past count" ((← refused.get) == 2)
   | .error _ => r.check "eth2 service: the range request answers" false
+  -- A check that refuses the second block ends the read there.
+  let checked ← (OnceRef.new ([] : List Nat) : BaseIO (OnceRef (List Nat)))
+  let each ← b.requestEach aPeer blocksByRangeMethod (some (blocksByRangeRequest 10 3)) fun c => do
+    (checked.update (· ++ [(c.payload.get! 0).toNat]) : BaseIO Unit)
+    return c.payload.get! 0 != 11
+  r.check "eth2 service: a check of each chunk stops the read at the refused block"
+    ((match each with | .ok () => true | .error _ => false) && (← checked.get) == [10, 11])
   match ← b.request aPeer columnsByRangeMethod (some (columnsByRangeRequest 5 1 [1, 2])) with
   | .ok chunks =>
     r.check "eth2 service: a column range ends with ResourceUnavailable after its column"

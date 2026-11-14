@@ -18,7 +18,8 @@ interaction"). The stream arrives negotiated, so the shell works on any
   side ("The requester MUST close the write side"), and reads chunks
   until the core is done: the peer closed, an error chunk came, or
   `maxChunks` chunks came. Each chunk goes to `deliver` as it finishes,
-  so a long response never sits in memory whole. After the last chunk
+  so a long response never sits in memory whole, and `deliver` may
+  refuse a chunk to end the read. After the last chunk
   it waits for the peer's close, so its reset never fails the
   responder's close.
 * `serve` is the responder. It reads the request to the end of the
@@ -66,35 +67,43 @@ open Conc (Async)
 -- Inside this namespace a bare `Core` is the reader core,
 -- `ReqResp.Core`, so the seam types keep the full `Libp2p.Core` prefix.
 
-/-- Hand out the chunks of a list of actions. -/
-def deliverAll (deliver : Chunk → Async Unit) : List Core.Action → Async Unit
-  | [] => pure ()
-  | .chunk c :: rest => do deliver c; deliverAll deliver rest
+/-- Hand out the chunks of a list of actions. `false` when `deliver`
+refuses one: the chunks after it stay undelivered. -/
+def deliverAll (deliver : Chunk → Async Bool) : List Core.Action → Async Bool
+  | [] => pure true
+  | .chunk c :: rest => do
+    if ← deliver c then deliverAll deliver rest else return false
   | .finished :: rest => deliverAll deliver rest
 
-/-- Read the stream into the core until it is done or the stream ends.
-The answer says whether the end of the stream came, and it carries the
-last state of the core, whose buffer holds any bytes after the last
-chunk. Park: `s.read`, which the peer's close, a reset, or the
-session's end wakes. -/
-partial def pump (s : Streams.Stream) (st : Core.State) (deliver : Chunk → Async Unit) :
-    Async (Except Error (Bool × Core.State)) := do
+/-- How a read of the stream ended, short of an error. -/
+inductive PumpEnd where
+  /-- The end of the stream came. -/
+  | eof
+  /-- The requester read its last chunk. The buffer of the core holds
+  any bytes that came after it. -/
+  | done (st : Core.State)
+  /-- `deliver` refused a chunk. -/
+  | refused
+
+/-- Read the stream into the core until it is done, the stream ends, or
+`deliver` refuses a chunk. Park: `s.read`, which the peer's close, a
+reset, or the session's end wakes. -/
+partial def pump (s : Streams.Stream) (st : Core.State) (deliver : Chunk → Async Bool) :
+    Async (Except Error PumpEnd) := do
   -- The requester stops at its last chunk; the responder waits for the end.
-  if st.done ∧ st.config.side = .response then return .ok (false, st)
+  if st.done ∧ st.config.side = .response then return .ok (.done st)
   match ← s.read with
   | .error e => return .error (.stream e)
   | .ok none =>
     match Core.step st .eof with
     | .error e => return .error e
-    | .ok (st, acts) =>
-      deliverAll deliver acts
-      return .ok (true, st)
+    | .ok (_, acts) =>
+      if ← deliverAll deliver acts then return .ok .eof else return .ok .refused
   | .ok (some b) =>
     match Core.step st (.bytes b) with
     | .error e => return .error e
     | .ok (st, acts) =>
-      deliverAll deliver acts
-      pump s st deliver
+      if ← deliverAll deliver acts then pump s st deliver else return .ok .refused
 
 /-- Run `work` against a deadline that resets `s` on expiry. The reset
 task lives in a set this call owns and joins. -/
@@ -130,26 +139,33 @@ def awaitEnd (s : Streams.Stream) : Async (Except Error Bool) := do
 The stream is negotiated for `m.id`. A protocol error resets the stream
 ("they SHOULD reset the stream immediately").
 
+`deliver` answers whether the read goes on. The client checks each
+chunk there before it consumes the next ("Before consuming the next
+response chunk, the response reader SHOULD verify", deneb and fulu).
+A refused chunk ends the read ("Any part of the `response_chunk` fails
+validation", rule 3), and the requester resets the stream.
+
 After the last chunk the requester waits for the responder's close,
 under a second deadline of `timeoutMs`. The responder closes right
 after its last chunk ("Responding side", step 5), and a reset that
 arrives first fails that close: Lighthouse scores the failed close of
 an inbound stream as an error of the requester. A byte after the last
 chunk, or the expiry, resets the stream. The chunks are already out, so
-the answer is `.ok` on each of these paths. -/
+the answer is `.ok` on each of these paths, and on a refusal. -/
 def request (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
-    (payload : Option ByteArray) (deliver : Chunk → Async Unit) : Async (Except Error Unit) := do
+    (payload : Option ByteArray) (deliver : Chunk → Async Bool) : Async (Except Error Unit) := do
   match encodeRequestB m payload with
   | .error e => return .error e
   | .ok bytes =>
-    let work : Async (Except Error (Bool × Core.State)) := do
+    let work : Async (Except Error PumpEnd) := do
       if 0 < bytes.size then
         if let .error e ← s.write bytes then return .error (.stream e)
       s.close
       pump s (Core.init m.responseConfig) deliver
     match ← underDeadline s clock timeoutMs work with
-    | .ok (true, _) => return .ok ()
-    | .ok (false, st) =>
+    | .ok .eof => return .ok ()
+    | .ok .refused => s.reset; return .ok ()
+    | .ok (.done st) =>
       -- Bytes that came with the last chunk are past it.
       if 0 < st.buf.size then s.reset; return .ok ()
       -- The expiry resets the stream inside `underDeadline`.
@@ -169,7 +185,7 @@ abbrev OpenStream :=
 open the stream for `m.id` through the host, and run `request` on it.
 The slot goes back on every path, a thrown fault included. -/
 def requestPeer (openStream : OpenStream) (limiter : Limiter) (m : Method) (clock : Conc.Clock)
-    (timeoutMs : Nat) (payload : Option ByteArray) (deliver : Chunk → Async Unit) :
+    (timeoutMs : Nat) (payload : Option ByteArray) (deliver : Chunk → Async Bool) :
     Async (Except Error Unit) := do
   if !(← limiter.take m.id) then return .error .tooManyRequests
   try
@@ -184,7 +200,7 @@ fits in memory, such as a single chunk. -/
 def requestAll (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
     (payload : Option ByteArray) : Async (Except Error (List Chunk)) := do
   let acc ← Conc.OnceRef.new ([] : List Chunk)
-  match ← request s m clock timeoutMs payload (fun c => acc.update (c :: ·)) with
+  match ← request s m clock timeoutMs payload (fun c => do acc.update (c :: ·); return true) with
   | .error e => return .error e
   | .ok () => return .ok (← acc.get).reverse
 
@@ -217,8 +233,10 @@ method with no request content) and gives the chunks to send. -/
 def serve (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
     (respond : Option ByteArray → Async (List Chunk)) : Async (Except Error Unit) := do
   let got ← Conc.OnceRef.new (none : Option ByteArray)
-  let read : Async (Except Error (Bool × Core.State)) :=
-    pump s (Core.init m.requestConfig m.request.isSome) fun c => got.set (some c.payload)
+  let read : Async (Except Error PumpEnd) :=
+    pump s (Core.init m.requestConfig m.request.isSome) fun c => do
+      got.set (some c.payload)
+      return true
   match ← underDeadline s clock timeoutMs read with
   | .error (.stream e) => return .error (.stream e)
   | .error .timeout => return .error .timeout
@@ -258,8 +276,10 @@ def serveStreaming (ctx : Libp2p.Core.StreamContext) (s : Streams.Stream) (m : M
       (Chunk → Async (Except Error Unit)) → Async Unit) :
     Async (Except Error Unit) := do
   let got ← Conc.OnceRef.new (none : Option ByteArray)
-  let read : Async (Except Error (Bool × Core.State)) :=
-    pump s (Core.init m.requestConfig m.request.isSome) fun c => got.set (some c.payload)
+  let read : Async (Except Error PumpEnd) :=
+    pump s (Core.init m.requestConfig m.request.isSome) fun c => do
+      got.set (some c.payload)
+      return true
   match ← underDeadline s clock timeoutMs read with
   | .error (.stream e) => return .error (.stream e)
   | .error .timeout => return .error .timeout

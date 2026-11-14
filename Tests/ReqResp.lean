@@ -464,7 +464,7 @@ def exchangeChecks (r : Runner) : Async Unit := do
       res.set (some (← serve b m tc.clock 1000 fun _ => return []))
     discard <| a.write (encodeLengthB 300000)
     a.close
-    let st ← pump a (responseReader (method (maxChunks := 1))) fun _ => pure ()
+    let st ← pump a (responseReader (method (maxChunks := 1))) fun _ => pure true
     owner.joinAll
     r.check "a malformed request: the responder reports the bounds"
       ((← res.get).any (failsWith (.lengthOutOfBounds 300000)))
@@ -479,7 +479,9 @@ def exchangeChecks (r : Runner) : Async Unit := do
     discard <| a.write (bs [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80])
     a.close
     let got : OnceRef (List Chunk) ← OnceRef.new []
-    discard <| pump a (responseReader (method (maxChunks := 1))) fun c => got.update (· ++ [c])
+    discard <| pump a (responseReader (method (maxChunks := 1))) fun c => do
+      got.update (· ++ [c])
+      return true
     owner.joinAll
     r.check "a malformed request: the answer is InvalidRequest"
       (match ← got.get with | [c] => c.result == .invalidRequest | _ => false)
@@ -520,7 +522,7 @@ def exchangeChecks (r : Runner) : Async Unit := do
     let closed : OnceRef Bool ← OnceRef.new false
     owner.spawn do
       -- Read the request to its end, answer one chunk, then close.
-      discard <| pump b (requestReader one) fun _ => pure ()
+      discard <| pump b (requestReader one) fun _ => pure true
       discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩)
       closed.set true
       b.close
@@ -544,7 +546,7 @@ def exchangeChecks (r : Runner) : Async Unit := do
     let owner ← TaskSet.new
     let res : OnceRef (Option (Except Error (List Chunk))) ← OnceRef.new none
     owner.spawn do res.set (some (← requestAll a one tc.clock 1000 (some (noise 1 4))))
-    discard <| pump b (requestReader one) fun _ => pure ()
+    discard <| pump b (requestReader one) fun _ => pure true
     discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩)
     r.check "the last chunk, the peer open: the request deadline arms" (← tc.nextTimer)
     r.check "the last chunk, the peer open: the wait for the close arms" (← tc.nextTimer)
@@ -562,13 +564,30 @@ def exchangeChecks (r : Runner) : Async Unit := do
     let (a, b) ← pair
     let owner ← TaskSet.new
     owner.spawn do
-      discard <| pump b (requestReader one) fun _ => pure ()
+      discard <| pump b (requestReader one) fun _ => pure true
       discard <| b.write (chunkWire one ⟨.success, ByteArray.empty, noise 2 8⟩ ++ bs [0])
     let got ← requestAll a one tc.clock 1000 (some (noise 1 4))
     owner.joinAll
     r.check "a byte after the last chunk: the chunk is the answer"
       (match got with | .ok [c] => c.payload == noise 2 8 | _ => false)
     r.check "a byte after the last chunk: the peer sees the reset"
+      (match ← b.read with | .error .reset => true | _ => false)
+    tc.close
+  -- A chunk that the check refuses ends the read, and resets the stream.
+  do
+    let tc ← TestClock.new
+    let (a, b) ← pair
+    let owner ← TaskSet.new
+    owner.spawn do
+      discard <| serve b m tc.clock 1000 fun _ => return answer
+    let seen : OnceRef Nat ← OnceRef.new 0
+    let res ← request a m tc.clock 1000 (some (noise 7 300)) fun _ => do
+      seen.update (· + 1)
+      return false
+    owner.joinAll
+    r.check "a refused chunk: the request still answers ok" (match res with | .ok () => true | _ => false)
+    r.check "a refused chunk: the check saw the first chunk only" ((← seen.get) == 1)
+    r.check "a refused chunk: the peer sees the reset"
       (match ← b.read with | .error .reset => true | _ => false)
     tc.close
   -- The handler value maps the error once, at the seam.
@@ -673,7 +692,7 @@ def simChecks (r : Runner) : Async Unit := do
     let limiter ← Limiter.new
     let got : OnceRef (List Chunk) ← OnceRef.new []
     let res ← requestPeer (openStreamOf p) limiter m tc.clock 1000 (some (noise 3 200))
-      fun c => got.update (· ++ [c])
+      fun c => do got.update (· ++ [c]); return true
     r.check s!"sim (split {split}): a request through the host gets its chunks"
       (succeedsWith () res && (← got.get).map (·.payload) == answer.map (·.payload))
     r.check s!"sim (split {split}): the handler saw no failure" ((← p.failures.get).isEmpty)
@@ -692,7 +711,7 @@ def simChecks (r : Runner) : Async Unit := do
         if let .error _ ← emit c then return)
     let got : OnceRef (List Chunk) ← OnceRef.new []
     let res ← requestPeer (openStreamOf p) (← Limiter.new) m tc.clock 1000 (some (noise 3 200))
-      fun c => got.update (· ++ [c])
+      fun c => do got.update (· ++ [c]); return true
     r.check "sim: a streaming responder's chunks arrive in order"
       (succeedsWith () res && (← got.get).map (·.payload) == answer.map (·.payload))
     r.check "sim: the streaming responder learns the requesting peer"
@@ -705,7 +724,7 @@ def simChecks (r : Runner) : Async Unit := do
     let tc ← TestClock.new
     let p ← hostPair
     let res ← requestPeer (openStreamOf p) (← Limiter.new) m tc.clock 1000 (some (noise 3 4))
-      fun _ => pure ()
+      fun _ => pure true
     r.check "sim: an id with no handler fails the open"
       (match res with | .error (.openFailed _) => true | _ => false)
     r.check "sim: an id with no handler, the hosts close with no fault" (← p.close).isNone
@@ -723,7 +742,7 @@ def simChecks (r : Runner) : Async Unit := do
     let res : OnceRef (Option (Except Error Unit)) ← OnceRef.new none
     owner.spawn do
       res.set (some (← requestPeer (openStreamOf p) (← Limiter.new) m tc.clock 300 (some (noise 3 4))
-        fun _ => pure ()))
+        fun _ => pure true))
     r.check "sim: a silent peer, the deadline arms" (← tc.nextTimer)
     tc.advance 300
     owner.joinAll
@@ -742,7 +761,7 @@ def simChecks (r : Runner) : Async Unit := do
     let res : OnceRef (Option (Except Error Unit)) ← OnceRef.new none
     owner.spawn do
       res.set (some (← requestPeer (openStreamOf p) (← Limiter.new) m tc.clock 60000 (some (noise 3 4))
-        fun _ => pure ()))
+        fun _ => pure true))
     -- The handler ran, so the request is past its write and parks on the read.
     discard <| parked.recv
     p.client.close

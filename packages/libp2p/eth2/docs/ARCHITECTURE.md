@@ -54,7 +54,8 @@ and `quic`.
   `Scoring.globalParams`, `Scoring.thresholds`.
 - `Peers`, `ForkState`, `ForkAction`.
 - `Service.start`, `subscribe`, `unsubscribe`, `publish`, `report`, `setStatus`,
-  `request`, `peers`, `disconnect`, `ban`, `isBanned`, `updateScores`,
+  `request`, `requestEach` (a check of each chunk before the next),
+  `peers`, `disconnect`, `ban`, `isBanned`, `updateScores`,
   `localEnr`, `stop`, and the client's seams:
   `Config.onEvent` (the `Event` stream) and `Config.serve` (the
   `Inbound` requests with their `Emit`, answered by an `Ending`).
