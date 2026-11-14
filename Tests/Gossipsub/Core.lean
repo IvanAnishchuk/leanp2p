@@ -193,15 +193,16 @@ private def graftCount (t : TopicId) (l : List Action) : Nat := sends l (isGraft
 private def publishCount (l : List Action) : Nat := sends l hasPublish
 private def ihaveCount (l : List Action) : Nat := sends l hasIhave
 
+/-- The invalid deliveries of a peer in a topic, in whole events. -/
 private def invalidCount (s : State) (q : Peer) (t : TopicId) : Nat :=
   match peerOf s q with
-  | some pd => (Score.countersOf pd.score t).invalidMessageDeliveries
+  | some pd => (Score.countersOf pd.score t).invalidMessageDeliveries / Score.counterUnit
   | none => 0
 
-/-- The counters of a peer with one invalid delivery. -/
+/-- The counters of a peer with one invalid delivery, in counter units. -/
 private def negCounters : Score.TopicCounters :=
   { Score.TopicCounters.zero with
-    inMesh := true, graftTime := 0, invalidMessageDeliveries := 1 }
+    inMesh := true, graftTime := 0, invalidMessageDeliveries := Score.counterUnit }
 
 /-- The score state of a peer with one invalid delivery in topic `t`. -/
 private def negPeerState : Score.PeerState :=
@@ -351,6 +352,26 @@ def run (r : Runner) : IO Unit := do
   r.check "core.score.negative-pruned"
     (match step cfgParams negState (.tick 1000 []) with
      | .ok (s', acts) => meshIs s' ta [] && pruneCount ta acts = 1
+     | _ => false)
+
+  -- The scores decay once per `decayInterval`, which may span several
+  -- heartbeats. With an interval of 2000 ms and a factor of one half, the
+  -- heartbeat at 1000 keeps the invalid count, and the one at 2000 halves it.
+  let halving : Params :=
+    { cfgParams with
+      score := { topics := fun t =>
+                   if t = ta then some { scoreTopic with invalidMessageDeliveriesDecay := 500 }
+                   else none
+                 global := { cfgParams.score.global with decayInterval := 2000 } } }
+  let rawInvalid (s : State) : Nat :=
+    ((peerOf s pa).map fun pd => (Score.countersOf pd.score ta).invalidMessageDeliveries).getD 0
+  r.check "core.score.decay-per-interval"
+    (match step halving negState (.tick 1000 []) with
+     | .ok (s1, _) =>
+       rawInvalid s1 == Score.counterUnit &&
+         (match step halving s1 (.tick 2000 []) with
+          | .ok (s2, _) => rawInvalid s2 == Score.counterUnit / 2
+          | _ => false)
      | _ => false)
 
   -- A join sends the hello RPC; a leave drops the peer from the mesh.
@@ -503,7 +524,9 @@ def run (r : Runner) : IO Unit := do
       (maintain cfgParams withFanout cfgParams.fanoutTtl).1.fanout.isEmpty)
   -- A promise past its deadline is one P₇ penalty, and leaves the table.
   let promised : State := { known with iwant := Cache.PromiseTable.promise [] pa ⟨[7]⟩ 100 }
-  let penalty (s : State) (q : Peer) : Nat := ((peerOf s q).map (·.score.behaviourPenalty)).getD 0
+  -- In whole events.
+  let penalty (s : State) (q : Peer) : Nat :=
+    ((peerOf s q).map (·.score.behaviourPenalty / Score.counterUnit)).getD 0
   r.check "core.maintain.broken-promise-penalised"
     (penalty (maintain cfgParams promised 99).1 pa = 0 &&
       penalty (maintain cfgParams promised 100).1 pa = 1 &&
@@ -535,7 +558,8 @@ def run (r : Runner) : IO Unit := do
   -- threshold, so it grafts the one outside peer that scores above it.
   -- P₂ first deliveries score `pc` above the mesh's zero median.
   let ogTopic : Score.TopicParams :=
-    { scoreTopic with firstMessageDeliveriesWeight := 1000, firstMessageDeliveriesCap := 10 }
+    { scoreTopic with firstMessageDeliveriesWeight := 1000,
+                      firstMessageDeliveriesCap := 10 * Score.counterUnit }
   let ogTopics : TopicId → Option Score.TopicParams := fun t =>
     if t = ta then some ogTopic else none
   let ogThresholds : Thresholds := { cfgParams.thresholds with opportunisticGraftThreshold := 1 }
@@ -552,13 +576,16 @@ def run (r : Runner) : IO Unit := do
   -- window counts toward P₃. The topic's window is 10 ms here.
   -- `scoreTopic` caps the P₃ counter at 0, so this topic lifts the cap.
   let windowTopic : Score.TopicParams :=
-    { scoreTopic with meshMessageDeliveriesWindow := 10, meshMessageDeliveriesCap := 10 }
+    { scoreTopic with meshMessageDeliveriesWindow := 10,
+                      meshMessageDeliveriesCap := 10 * Score.counterUnit }
   let windowTopics : TopicId → Option Score.TopicParams := fun t =>
     if t = ta then some windowTopic else none
   let windowParams : Params :=
     { cfgParams with score := { cfgParams.score with topics := windowTopics } }
+  -- In whole events.
   let meshCount (s : State) (q : Peer) : Nat :=
-    ((peerOf s q).map fun pd => (Score.countersOf pd.score ta).meshMessageDeliveries).getD 0
+    ((peerOf s q).map fun pd =>
+      (Score.countersOf pd.score ta).meshMessageDeliveries / Score.counterUnit).getD 0
   r.check "core.deliveries.near-first-credit"
     (match Libp2p.Protocols.Gossipsub.Core.run windowParams meshed
         [inbound, .rpc pb (Pb.encodeMessage (rpcOfPublish [msgOf ta [1]]))] with
@@ -606,7 +633,8 @@ def run (r : Runner) : IO Unit := do
   -- the front of the mesh list, where the fill does not reach, and scores
   -- above the others through P₂ first deliveries.
   let firstTopic : Score.TopicParams :=
-    { scoreTopic with firstMessageDeliveriesWeight := 1000, firstMessageDeliveriesCap := 10 }
+    { scoreTopic with firstMessageDeliveriesWeight := 1000,
+                      firstMessageDeliveriesCap := 10 * Score.counterUnit }
   let firstTopics : TopicId → Option Score.TopicParams := fun t =>
     if t = ta then some firstTopic else none
   let firstParams : Params :=

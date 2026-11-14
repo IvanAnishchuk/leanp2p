@@ -263,6 +263,10 @@ structure State where
   now : Millis
   /-- The time of the last heartbeat. -/
   lastHeartbeat : Millis
+  /-- The time of the last score decay. The scores decay at the first
+  heartbeat one `decayInterval` after it ("The decay interval",
+  `gossipsub-v1.1.md`), so the interval may span many heartbeats. -/
+  lastDecay : Millis := 0
   /-- The messages that wait for the application's answer, with their
   ids and the peers that sent them (`Params.validateMessages`). -/
   pending : List (MessageId × Peer × Message) := []
@@ -826,12 +830,16 @@ def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
       else (targets.filter (!wantsPartial p s · t)).map fun q => Action.sendRpc q (ihaveRpc t ids)
     ihaves ++ offer
 
-/-- The state at the start of the heartbeat: the decayed scores, the new
-clock, the cleared backoff table, the pruned seen cache, and the shifted
-message cache. -/
+/-- The state at the start of the heartbeat: the scores decayed when a
+decay interval has passed, the new clock, the cleared backoff table, the
+pruned seen cache, and the shifted message cache. -/
 def freshState (p : Params) (s : State) (now : Millis) : State :=
+  let due := decide (p.score.global.decayInterval ≤ now - s.lastDecay)
   { s with
-    peers := s.peers.map (fun e => (e.1, { e.2 with score := Score.decay p.score e.2.score })),
+    peers := if due then
+        s.peers.map (fun e => (e.1, { e.2 with score := Score.decay p.score e.2.score }))
+      else s.peers,
+    lastDecay := if due then now else s.lastDecay,
     now := now,
     lastHeartbeat := now,
     backoff := Cache.Backoff.clear s.backoff now,

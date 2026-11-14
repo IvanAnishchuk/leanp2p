@@ -9,17 +9,21 @@ walk of the score function, its strict boundaries, and the validity rejections. 
 number carries its hand computation.
 
 The fixed-point scale is 1000, so a weight of 1000 is 1.0 and a weight of -100 is -0.1. The
-walk's topic `"eth"` carries these values: `topicWeight` 1000, `timeInMeshWeight` 10,
+counter unit is 1000 too, so one event adds 1000 to a counter, and a cap of 10000 is 10 events.
+The walk's topic `"eth"` carries these values: `topicWeight` 1000, `timeInMeshWeight` 10,
 `timeInMeshQuantum` 1000 ms, `timeInMeshCap` 100, `firstMessageDeliveriesWeight` 10,
-`firstMessageDeliveriesDecay` 500, `firstMessageDeliveriesCap` 10, `meshMessageDeliveriesWeight`
--100, `meshMessageDeliveriesDecay` 500, `meshMessageDeliveriesThreshold` 4,
-`meshMessageDeliveriesCap` 10, `meshMessageDeliveriesActivation` 20000 ms,
-`meshMessageDeliveriesWindow` 10 ms, `meshFailurePenaltyWeight` -100,
-`meshFailurePenaltyDecay` 500, `invalidMessageDeliveriesWeight` -1000, and
-`invalidMessageDeliveriesDecay` 500. The global table carries `appSpecificWeight` 1,
+`firstMessageDeliveriesDecay` 500, `firstMessageDeliveriesCap` 10000,
+`meshMessageDeliveriesWeight` -100, `meshMessageDeliveriesDecay` 500,
+`meshMessageDeliveriesThreshold` 4000, `meshMessageDeliveriesCap` 10000,
+`meshMessageDeliveriesActivation` 20000 ms, `meshMessageDeliveriesWindow` 10 ms,
+`meshFailurePenaltyWeight` -100, `meshFailurePenaltyDecay` 500, `invalidMessageDeliveriesWeight`
+-1000, and `invalidMessageDeliveriesDecay` 500. The global table carries `appSpecificWeight` 1,
 `ipColocationFactorWeight` -100, `ipColocationFactorThreshold` 2, `behaviourPenaltyWeight`
 -100, `behaviourPenaltyThreshold` 0, `behaviourPenaltyDecay` 500, `decayInterval` 1000 ms,
-`decayToZero` 1, and `topicScoreCap` 10000.
+`decayToZero` 1000, and `topicScoreCap` 10000.
+
+A topic term is a weight times counter units, and the contribution divides by 1000 × 1000. A
+square divides by 1000 once.
 -/
 
 set_option autoImplicit false
@@ -43,11 +47,11 @@ private def ethParams : TopicParams where
   timeInMeshCap := 100
   firstMessageDeliveriesWeight := 10
   firstMessageDeliveriesDecay := 500
-  firstMessageDeliveriesCap := 10
+  firstMessageDeliveriesCap := 10000
   meshMessageDeliveriesWeight := -100
   meshMessageDeliveriesDecay := 500
-  meshMessageDeliveriesThreshold := 4
-  meshMessageDeliveriesCap := 10
+  meshMessageDeliveriesThreshold := 4000
+  meshMessageDeliveriesCap := 10000
   meshMessageDeliveriesActivation := 20000
   meshMessageDeliveriesWindow := 10
   meshFailurePenaltyWeight := -100
@@ -65,7 +69,7 @@ private def walkGlobal : GlobalParams where
   behaviourPenaltyThreshold := 0
   behaviourPenaltyDecay := 500
   decayInterval := 1000
-  decayToZero := 1
+  decayToZero := 1000
   topicScoreCap := 10000
 
 /-- The parameters of the walk. Only `"eth"` is configured. -/
@@ -120,7 +124,8 @@ private def capParams : Params where
   topics := fun id => if id = eth then some capTopic else none
   global := { walkGlobal with topicScoreCap := 5 }
 
-/-- A state with `n` first message deliveries in `"eth"` and no other input. -/
+/-- A state with a first message delivery counter of `n`, in counter units, in `"eth"` and no
+other input. -/
 private def capState (n : Nat) : PeerState where
   topics := [(eth, { TopicCounters.zero with firstMessageDeliveries := n })]
   appScore := 0
@@ -245,40 +250,43 @@ def run (r : Runner) : IO Unit := do
 
   -- Step 2: graft at time 0, scored at 10000. Elapsed mesh time 10000 ms gives P1 = 10000 /
   -- 1000 = 10, capped at 100, so 10. P3 is 0 because the activation is 20000 ms. Topic score
-  -- = 10 * 10 + 10 * 0 + (-100) * 0 + (-100) * 0 + (-1000) * 0 = 100. Topic contribution =
-  -- 1000 * 100 tdiv 1000 = 100. Total = 100.
+  -- = 10 * (10 * 1000) = 100000. Topic contribution = 1000 * 100000 tdiv 1000000 = 100.
+  -- Total = 100.
   r.check "score.walk.graft" (score walkParams s1 10000 == 100)
 
-  -- Step 3: one mesh delivery and one first delivery, scored at 10000. P1 = 10, P2 = 1, so the
-  -- topic score = 100 + 10 * 1 = 110. Contribution = 110. Total = 110.
+  -- Step 3: one mesh delivery and one first delivery, scored at 10000. P1 gives 100000, and
+  -- P2 = 1000 gives 10 * 1000. Topic score = 110000. Contribution = 110. Total = 110.
   r.check "score.walk.deliveries" (score walkParams s2 10000 == 110)
 
-  -- Step 4: two more mesh deliveries, so the count is 3, scored at 30000. Elapsed = 30000,
-  -- P1 = 30, so 300. P3 applies because 20000 < 30000 and 3 < 4: deficit 1, square 1, term
-  -- = -100 * 1 = -100. Topic score = 300 + 10 - 100 = 210. Contribution = 210. Total = 210.
+  -- Step 4: two more mesh deliveries, so the count is 3000, scored at 30000. P1 = 30 gives
+  -- 300000. P3 applies because 20000 < 30000 and 3000 < 4000: deficit 1000, square
+  -- 1000 * 1000 / 1000 = 1000, term = -100 * 1000 = -100000. Topic score = 300000 + 10000 -
+  -- 100000 = 210000. Contribution = 210. Total = 210.
   r.check "score.walk.p3" (score walkParams s3 30000 == 210)
 
-  -- Step 5: one invalid delivery, scored at 30000. P4 = 1 * 1 = 1, term = -1000. Topic score
-  -- = 210 - 1000 = -790. Contribution = -790. Total = -790.
+  -- Step 5: one invalid delivery, scored at 30000. P4 = 1000 * 1000 / 1000 = 1000, term =
+  -- -1000000. Topic score = -790000. Contribution = -790. Total = -790.
   r.check "score.walk.p4" (score walkParams s4 30000 == -790)
 
-  -- Step 6: one behavior penalty, scored at 30000. The threshold is 0, so P7 = (1 - 0)^2 = 1,
-  -- global term = -100 * 1 = -100. Total = -790 - 100 = -890.
+  -- Step 6: one behavior penalty, scored at 30000. The threshold is 0, so P7 = 1000 * 1000 /
+  -- 1000 = 1000, global term = -100 * 1000 tdiv 1000 = -100. Total = -790 - 100 = -890.
   r.check "score.walk.p7" (score walkParams s5 30000 == -890)
 
-  -- Step 7: prune at 30000. The elapsed time 30000 passes the activation, and the count 3 is
-  -- below the threshold 4, so the failure penalty grows by (4 - 3)^2 = 1. P1 = 300, P2 = 10,
-  -- P3 = -100, P3b = -100 * 1 = -100, P4 = -1000: topic score = -890. Global P7 = -100.
-  -- Total = -990.
+  -- Step 7: prune at 30000. The elapsed time 30000 passes the activation, and the count 3000
+  -- is below the threshold 4000, so the failure penalty grows by the square of 1000, 1000.
+  -- P3b = -100 * 1000 = -100000, so the topic score = -890000 and the contribution -890.
+  -- Global P7 = -100. Total = -990.
   r.check "score.walk.prune" (score walkParams s6 30000 == -990)
 
   -- Step 8: one decay. Each factor is 500, so a counter c becomes c * 500 / 1000, and a result
-  -- below 1 becomes 0. First deliveries 1 -> 0, mesh deliveries 3 -> 1, failure penalty 1 -> 0,
-  -- invalid deliveries 1 -> 0, behavior penalty 1 -> 0. The mesh time and the membership stay.
+  -- below 1000 becomes 0. First deliveries 1000 -> 0, mesh deliveries 3000 -> 1500, failure
+  -- penalty 1000 -> 0, invalid deliveries 1000 -> 0, behavior penalty 1000 -> 0. The mesh time
+  -- and the membership stay. With whole-event counters, 3 deliveries would floor to 1, where
+  -- the spec's float64 counter holds 1.5.
   r.check "score.walk.decay.first-message-deliveries"
     ((countersOf s7 eth).firstMessageDeliveries == 0)
   r.check "score.walk.decay.mesh-message-deliveries"
-    ((countersOf s7 eth).meshMessageDeliveries == 1)
+    ((countersOf s7 eth).meshMessageDeliveries == 1500)
   r.check "score.walk.decay.mesh-failure-penalty"
     ((countersOf s7 eth).meshFailurePenalty == 0)
   r.check "score.walk.decay.invalid-message-deliveries"
@@ -287,26 +295,31 @@ def run (r : Runner) : IO Unit := do
   r.check "score.walk.decay.keeps-mesh-time"
     ((countersOf s7 eth).timeInMesh == 30000 && (countersOf s7 eth).inMesh == false)
 
-  -- Step 9: score after the decay, at 30000. P1 = 300, P2 = 0, P3 = (4 - 1)^2 = 9 with term
-  -- -900, P3b = 0, P4 = 0. Topic score = 300 - 900 = -600. Contribution = -600. Global P7 = 0.
-  -- Total = -600.
-  r.check "score.walk.final" (score walkParams s7 30000 == -600)
+  -- Step 9: score after the decay, at 30000. P1 gives 300000, P2 = 0. P3: deficit 4000 - 1500
+  -- = 2500, square 2500 * 2500 / 1000 = 6250, term -625000. P3b = 0, P4 = 0. Topic score =
+  -- -325000. Contribution = -325. Global P7 = 0. Total = -325, the float64 answer of the spec:
+  -- 300 - 100 * 2.5^2.
+  r.check "score.walk.final" (score walkParams s7 30000 == -325)
 
   -- The P3 activation boundary. At 20000 ms the activation is equal, so the strict comparison
-  -- fails and P3 = 0. At 20001 ms the deficit is (4 - 0)^2 = 16.
+  -- fails and P3 = 0. At 20001 ms the deficit is 4000, square 16000.
   r.check "score.p3.activation-boundary"
-    (p3 ethParams 20000 meshCounters == 0 && p3 ethParams 20001 meshCounters == 16)
+    (p3 ethParams 20000 meshCounters == 0 && p3 ethParams 20001 meshCounters == 16000)
 
-  -- The P3 threshold boundary. At the count 4 the strict comparison fails and P3 = 0. At 3 the
-  -- deficit is 1 and P3 = 1.
+  -- The P3 threshold boundary. At the count 4000 the strict comparison fails and P3 = 0. At
+  -- 3000 the deficit is 1000 and P3 = 1000.
   r.check "score.p3.threshold-boundary"
-    (p3 ethParams 30000 { meshCounters with meshMessageDeliveries := 4 } == 0 &&
-      p3 ethParams 30000 { meshCounters with meshMessageDeliveries := 3 } == 1)
+    (p3 ethParams 30000 { meshCounters with meshMessageDeliveries := 4000 } == 0 &&
+      p3 ethParams 30000 { meshCounters with meshMessageDeliveries := 3000 } == 1000)
 
   -- The decay zero boundary. A counter equal to `decayToZero` with a full decay stays at 1. A
   -- counter one below becomes 0.
   r.check "score.decay.zero-boundary"
     (decayCounter 1000 1 1 == 1 && decayCounter 1000 1 0 == 0)
+
+  -- The decay stays geometric for one event. A factor of 996 takes 1000 to 996, where a
+  -- whole-event counter of 1 would become 0.
+  r.check "score.decay.one-event-geometric" (decayCounter 996 10 1000 == 996)
 
   -- The P1 cap boundary. Elapsed 100000 ms gives 100 points, equal to the cap, so P1 = 100. One
   -- quantum more gives 101 points, and the cap holds P1 at 100.
@@ -319,23 +332,25 @@ def run (r : Runner) : IO Unit := do
     (p6 walkGlobal { PeerState.zero with ipColocation := 2 } == 0 &&
       p6 walkGlobal { PeerState.zero with ipColocation := 3 } == 1)
 
-  -- The P7 threshold boundary. Penalty 0 equals the threshold, so P7 = 0. Penalty 1 gives the
-  -- excess 1 squared.
+  -- The P7 threshold boundary. Penalty 0 equals the threshold, so P7 = 0. Penalty 1000 gives
+  -- the excess 1000, square 1000.
   r.check "score.p7.threshold-boundary"
     (p7 walkGlobal { PeerState.zero with behaviourPenalty := 0 } == 0 &&
-      p7 walkGlobal { PeerState.zero with behaviourPenalty := 1 } == 1)
+      p7 walkGlobal { PeerState.zero with behaviourPenalty := 1000 } == 1000)
 
-  -- The topic cap boundary. With `P2` at weight 1 and no other term, the raw topic part equals
-  -- the delivery count. At 5 the raw part equals the cap 5 and stays. At 6 the raw part 6 is
-  -- above the cap, so the topic part is 5.
+  -- The topic cap boundary. With `P2` at weight 1 and no other term, the raw topic part is the
+  -- counter times 1000, divided by 1000000: the delivery count. At 5000 the raw part equals the
+  -- cap 5 and stays. At 6000 the raw part 6 is above the cap, so the topic part is 5.
   r.check "score.topic-cap-boundary"
-    (topicPart capParams 0 (capState 5) == 5 && topicPart capParams 0 (capState 6) == 5)
+    (topicPart capParams 0 (capState 5000) == 5 && topicPart capParams 0 (capState 6000) == 5)
 
-  -- The cap applies at increment time. A first delivery from 9 reaches the cap 10, and one more
-  -- from 10 leaves the counter at 10.
+  -- The cap applies at increment time. A first delivery from 9000 reaches the cap 10000, and
+  -- one more from 10000 leaves the counter at 10000.
   r.check "score.cap-at-increment"
-    ((countersOf (firstDelivery walkParams (capState 9) eth) eth).firstMessageDeliveries == 10 &&
-      (countersOf (firstDelivery walkParams (capState 10) eth) eth).firstMessageDeliveries == 10)
+    ((countersOf (firstDelivery walkParams (capState 9000) eth) eth).firstMessageDeliveries ==
+        10000 &&
+      (countersOf (firstDelivery walkParams (capState 10000) eth) eth).firstMessageDeliveries ==
+        10000)
 
   -- A delivery to a topic with no parameters leaves the score alone. The state s3 scores 210 at
   -- 30000, and the first delivery to `"other"` is a no-op.

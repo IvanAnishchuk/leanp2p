@@ -306,6 +306,19 @@ Both spike programs call `Ping.ping`.
   forbids the request and a wait would park on another request's
   deadline. The slot goes back on every path. The responder's side of
   the rule, "MAY penalise", is scoring, and stays with the client.
+- **The score counters count thousandths of an event.** The spec
+  computes with float64. `Score.lean` computes with integers: weights
+  in `1/scoreScale`, counters in `1/counterUnit`, both 1000. One event
+  adds `counterUnit`, and the caps, thresholds, and `decayToZero` take
+  the same unit. A whole-event counter floors at every decay. A factor
+  of 0.996 then takes a count of 1 to 0 in one heartbeat, and consensus
+  topics decay over hundreds of heartbeats. With the unit, the floor
+  costs one thousandth of an event a step.
+- **The scores decay once per `decayInterval`.** The spec decays every
+  counter each decay interval, and go runs the decay on its own ticker.
+  The core decays at the first heartbeat one interval after the last
+  decay (`State.lastDecay`). A consensus profile decays each 12 s slot
+  under a heartbeat of 700 ms.
 - **Peer exchange is ignored below `acceptPXThreshold`, and accepted at
   it.** The spec says it two ways. Its parameter table: "PX information
   by peers below this threshold is ignored", with the constraint "Must

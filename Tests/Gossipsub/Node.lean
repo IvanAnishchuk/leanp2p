@@ -244,7 +244,7 @@ private def scoreChecks (r : Tests.Runner) : Async Unit := do
       meshMessageDeliveriesWindow := 0, meshFailurePenaltyWeight := 0
       meshFailurePenaltyDecay := scoreScale, invalidMessageDeliveriesWeight := -1000
       invalidMessageDeliveriesDecay := scoreScale }
-  r.check "node.score.set-topic-params" (← (f.node.setTopicParams topic (some tp) : BaseIO Bool))
+  r.check "node.score.set-topic-params" (← f.node.setTopicParams topic (some tp))
   discard <| f.control.write (frame { subscriptions := [], publish := [bad], control := none })
   r.check "node.score.barrier-after-invalid" (← barrier f)
   match ← f.node.scores with
@@ -252,7 +252,7 @@ private def scoreChecks (r : Tests.Runner) : Async Unit := do
   | _ => r.check "node.score.topic-params-apply" false
   -- A second replacement for the same topic takes the place of the
   -- first: with no parameters the topic scores nothing again.
-  r.check "node.score.replace-again" (← (f.node.setTopicParams topic none : BaseIO Bool))
+  r.check "node.score.replace-again" (← f.node.setTopicParams topic none)
   match ← f.node.scores with
   | some [(_, s)] => r.check s!"node.score.replacement-replaces ({s})" (s == 0)
   | _ => r.check "node.score.replacement-replaces" false

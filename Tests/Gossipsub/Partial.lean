@@ -45,7 +45,7 @@ private def topicScore : Score.TopicParams :=
     timeInMeshCap := 0
     firstMessageDeliveriesWeight := 1
     firstMessageDeliveriesDecay := scoreScale
-    firstMessageDeliveriesCap := 10
+    firstMessageDeliveriesCap := 10 * Score.counterUnit
     meshMessageDeliveriesWeight := 0
     meshMessageDeliveriesDecay := scoreScale
     meshMessageDeliveriesThreshold := 0
@@ -118,8 +118,9 @@ private def sentTo (q : Peer) (l : List Action) : List Rpc.RPC :=
     | .sendRpc q' r => if q' == q then some r else none
     | _ => none
 
+/-- The behavior penalty of a peer, in whole events. -/
 private def penalty (s : State) (q : Peer) : Nat :=
-  ((peerOf s q).map (·.score.behaviourPenalty)).getD 0
+  ((peerOf s q).map (·.score.behaviourPenalty / Score.counterUnit)).getD 0
 
 private def counters (s : State) (q : Peer) : Score.TopicCounters :=
   ((peerOf s q).map (Score.countersOf ·.score ta)).getD Score.TopicCounters.zero
@@ -281,10 +282,10 @@ def run (r : Runner) : IO Unit := do
   -- The scoring hooks of the Fulu partial columns.
   let j1 := stateOf (step params s1 (.partialJudged pa ta true))
   r.check "core: novel valid parts count as a first delivery"
-    ((counters j1 pa).firstMessageDeliveries == 1)
+    ((counters j1 pa).firstMessageDeliveries == Score.counterUnit)
   let j2 := stateOf (step params s1 (.partialJudged pa ta false))
   r.check "core: bad parts count as an invalid delivery"
-    ((counters j2 pa).invalidMessageDeliveries == 1)
+    ((counters j2 pa).invalidMessageDeliveries == Score.counterUnit)
 
   -- Our own announcements carry our choice.
   r.check "core: our subscription to t requests partial messages"

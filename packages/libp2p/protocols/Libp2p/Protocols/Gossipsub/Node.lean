@@ -273,9 +273,10 @@ structure Node where
   scores : Conc.Async (Option (List (Peer × Score)))
   /-- Replace the score parameters of one topic, as Lighthouse does by
   validator count and slot (`service/mod.rs`,
-  `update_gossipsub_parameters`). `false` under the same conditions as
-  `publish`. -/
-  setTopicParams : TopicId → Option Score.TopicParams → BaseIO Bool
+  `update_gossipsub_parameters`). Lighthouse replaces 66 topics at once,
+  more than the control queue holds, so the post parks while the queue
+  is full, as `subscribeWait` does. `false` once the node stops. -/
+  setTopicParams : TopicId → Option Score.TopicParams → Conc.Async Bool
   /-- Set a peer's application score, P₅. `false` under the same
   conditions as `publish`. -/
   setAppScore : Peer → Int → BaseIO Bool
@@ -934,7 +935,8 @@ private def initialState (p : Core.Params) (now : Millis) : Core.State :=
     iwant := []
     topics := []
     now := now
-    lastHeartbeat := now }
+    lastHeartbeat := now
+    lastDecay := now }
 
 /-- The published message of a payload. The four signed fields stay absent,
 as `strictNoSign` requires. -/
@@ -1125,8 +1127,9 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       -- Park: the loop answers, or `stop` closes the queue after serving it.
       reply.recv
     setTopicParams := fun topic tp => do
-      if ← closing.get then return false
-      control.trySend (.setTopicParams topic tp)
+      if ← (closing.get : BaseIO Bool) then return false
+      -- Park: the loop's take frees a slot, and `stop` closes the queue.
+      return (← control.send (.setTopicParams topic tp)) matches .ok _
     sendPartial := fun peer pm => post (.sendPartial peer pm)
     judgePartial := fun peer topic valid => post (.partialJudged peer topic valid)
     partialPeers := fun topic => do
