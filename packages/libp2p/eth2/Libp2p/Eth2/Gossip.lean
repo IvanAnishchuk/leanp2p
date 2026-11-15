@@ -18,7 +18,7 @@ makes and the spec leaves open.
 | the `data` cap | `max_compressed_len(MAX_PAYLOAD_SIZE)` | phase0, "Gossipsub size limits" |
 | the answer later | on | phase0 "Topics and messages" uses ACCEPT, REJECT, and IGNORE |
 | IDONTWANT | at 1000 bytes and more | Lighthouse `config.rs`, `idontwant_message_size_threshold` |
-| the subscription caps | 406 per RPC, 812 per peer | Lighthouse `service/mod.rs`, `MaxCountSubscriptionFilter` |
+| the subscription caps | 410 per RPC, 820 per peer | Lighthouse `service/mod.rs`, `MaxCountSubscriptionFilter`, over `all_topics_at_fork` |
 
 The message id is `Libp2p.Eth2.messageId`. The node runs the
 `ByteArray` payload path, so the id reads the payload bytes once.
@@ -44,10 +44,12 @@ def seenCapacity : Nat := 262144
 /-- The IDONTWANT threshold. -/
 def idontwantThreshold : Nat := 1000
 
-/-- The topics of one fork from Fulu on: the seven core kinds, and the
-attestation, sync committee, and column subnets. -/
+/-- The topics of one fork from Fulu on: the seven core kinds, the two
+light-client kinds, and the attestation, sync committee, and column
+subnets. Lighthouse counts the same set: `all_topics_at_fork` turns on
+the light-client server and every subnet (`types/topics.rs`). -/
 def topicsPerFork : Nat :=
-  7 + Constants.attestationSubnetCount + Constants.syncCommitteeSubnetCount +
+  9 + Constants.attestationSubnetCount + Constants.syncCommitteeSubnetCount +
     Constants.dataColumnSidecarSubnetCount
 
 /-- The subscription caps of Lighthouse's `MaxCountSubscriptionFilter`

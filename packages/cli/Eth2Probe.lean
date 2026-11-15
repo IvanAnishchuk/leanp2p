@@ -16,13 +16,15 @@ The directory holds `config.yaml` and `genesis.ssz`, and it may hold `boot_enr.y
 next port. The probe binds `--ip`, default `0.0.0.0`, and names it in its record.
 
 The probe subscribes to the block, the aggregate, every attestation subnet, and every
-column subnet. Each peer whose `Status` arrives gets four requests once:
+column subnet. Each peer whose `Status` arrives gets these requests once:
 
 * `BeaconBlocksByHead` for 4 blocks of the ancestry of its head root
 * `BeaconBlocksByRange` for the 8 slots up to its head
 * `DataColumnSidecarsByRange` for columns 0 and 1 of the 2 slots up to its head
 * `Ping`
 * `MetaData` v3
+* `GetLightClientFinalityUpdate` and `GetLightClientOptimisticUpdate`
+* `GetLightClientBootstrap` for its finalized root
 
 It prints one line per event and per answer, then a count of each. It exits 0 when a peer
 sent its `Status`, a block arrived on gossip, and a peer answered the block range with
@@ -91,14 +93,16 @@ structure Counts where
   pings : Nat := 0
   metadata : Nat := 0
   goodbyes : Nat := 0
+  /-- The light-client requests that a peer answered with data. -/
+  lightClient : Nat := 0
 
 def short (p : PeerId) : String :=
   let s := toString p
   s.drop (s.length - min s.length 8) |>.toString
 
-/-- The four requests to a peer at its head slot. -/
+/-- The requests to a peer at its head slot (the module doc lists them). -/
 def probePeer (s : Service) (counts : OnceRef Counts) (digest : ByteArray) (peer : PeerId)
-    (head : Nat) (headRoot : ByteArray) : Async Unit := do
+    (head : Nat) (headRoot finalizedRoot : ByteArray) : Async Unit := do
   match ← s.request peer blocksByHeadMethod (some (blocksByHeadRequest headRoot 4)) with
   | .ok chunks =>
     let ok := chunks.filter (·.result matches .success)
@@ -131,6 +135,18 @@ def probePeer (s : Service) (counts : OnceRef Counts) (digest : ByteArray) (peer
       {(m.map (Bytes.toHex ·.attnets)).getD "?"}"
     (counts.update fun c => { c with metadata := c.metadata + 1 } : BaseIO Unit)
   | other => IO.println s!"metadata {short peer}: {match other with | .error e => reprStr e | .ok cs => s!"{cs.length} chunks"}"
+  -- The light-client methods: one chunk, or an error code.
+  let lightClient (name : String) (m : Libp2p.Protocols.ReqResp.Method) (p : Option ByteArray) :
+      Async Unit := do
+    match ← s.request peer m p with
+    | .ok chunks =>
+      IO.println s!"{name} {short peer}: {chunks.map fun c => s!"{repr c.result} {c.payload.size} bytes"}"
+      if chunks.any (·.result matches .success) then
+        (counts.update fun c => { c with lightClient := c.lightClient + 1 } : BaseIO Unit)
+    | .error e => IO.println s!"{name} {short peer}: {repr e}"
+  lightClient "light-client-finality-update" lightClientFinalityUpdateMethod none
+  lightClient "light-client-optimistic-update" lightClientOptimisticUpdateMethod none
+  lightClient "light-client-bootstrap" lightClientBootstrapMethod (some finalizedRoot)
 
 def run (a : Args) : IO UInt32 := do
   let chain ← IO.ofExcept (Config.chainOf (← IO.FS.readFile s!"{a.dir}/config.yaml")
@@ -174,7 +190,7 @@ def run (a : Args) : IO UInt32 := do
           finalized epoch {st.finalizedEpoch}"
         counts.update fun c => { c with statuses := c.statuses + 1 }
         let first ← probed.updateGet fun l => (!l.contains p, if l.contains p then l else p :: l)
-        if first then tasks.spawn (probePeer s counts digest p st.headSlot st.headRoot)
+        if first then tasks.spawn (probePeer s counts digest p st.headSlot st.headRoot st.finalizedRoot)
       | .gossip k id src ssz =>
         discard <| s.report id src .ignore
         counts.update fun c => match k with
@@ -208,7 +224,8 @@ def run (a : Args) : IO UInt32 := do
   IO.println s!"eth2-probe: peers {c.peers}, statuses {c.statuses}, gossip blocks {c.blocks}, \
     aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}, \
     range chunks {c.rangeChunks} (context ours: {c.rangeContextOk}), column chunks {c.columnChunks}, \
-    pings {c.pings}, metadata {c.metadata}, goodbyes {c.goodbyes}"
+    pings {c.pings}, metadata {c.metadata}, goodbyes {c.goodbyes}, \
+    light-client answers {c.lightClient}"
   return if c.statuses > 0 && c.blocks > 0 && c.rangeChunks > 0 && c.rangeContextOk then 0 else 1
 
 end Eth2Probe

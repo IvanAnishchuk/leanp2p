@@ -40,6 +40,10 @@ The request bounds follow the request types:
 * `DataColumnSidecarsByRoot` v1: up to `MAX_REQUEST_BLOCKS_DENEB`
   identifiers. Each one is an offset, a root, an offset, and up to
   `NUMBER_OF_COLUMNS` indices.
+* `GetLightClientBootstrap` v1: a block root, 32 bytes.
+* `LightClientUpdatesByRange` v1: `start_period` and `count`, 16 bytes.
+* `GetLightClientFinalityUpdate` and `GetLightClientOptimisticUpdate` v1:
+  no request content.
 -/
 
 set_option autoImplicit false
@@ -185,6 +189,114 @@ def columnsByRootMethod : Method :=
     response := columnBounds
     contextLen := Libp2p.Protocols.Constants.forkDigestLen
     maxChunks := Constants.maxRequestDataColumnSidecars }
+
+/-! ## The light-client methods
+
+altair `light-client/p2p-interface.md`, "The Req/Resp domain". Each
+response carries the `ForkDigest` of its header's epoch, and its type
+changes by fork. Lighthouse bounds each type from its Altair form up to
+its Electra form (`rpc/protocol.rs`, `rpc_light_client_*_limits_by_fork`),
+and Fulu keeps the Electra types. The sizes below follow the SSZ of the
+types in altair, capella, and electra `light-client/sync-protocol.md`:
+
+* a `BeaconBlockHeader` is 112 bytes, a `SyncCommittee` 24624 at 512
+  members, and a `SyncAggregate` 160;
+* the Altair `LightClientHeader` is the beacon header alone. From
+  Capella on it adds an offset, the execution header, and an execution
+  branch of 4 roots. The Deneb execution header, which Electra keeps,
+  has a fixed part of 584 bytes and up to 32 bytes of `extra_data`;
+* the branches are 5, 5, and 6 roots in Altair (current committee, next
+  committee, finality), and 6, 6, and 7 roots from Electra on.
+
+The least `LightClientUpdate` is its Altair form, 25368 bytes. Lighthouse
+takes the 584 bytes of the Altair finality update as the least update
+instead. Each valid update has at least 25368 bytes, so the tighter
+bound refuses no valid update. -/
+
+/-- The SSZ width of a `BeaconBlockHeader`: slot, proposer, three roots. -/
+def beaconBlockHeaderLen : Nat := 8 + 8 + 32 + 32 + 32
+
+/-- The SSZ width of a `SyncCommittee`: the member keys and the aggregate key. -/
+def syncCommitteeLen : Nat := Constants.syncCommitteeSize * 48 + 48
+
+/-- The SSZ width of a `SyncAggregate`: the participation bits and the signature. -/
+def syncAggregateLen : Nat := Constants.syncCommitteeSize / 8 + 96
+
+/-- The fixed part of the Deneb `ExecutionPayloadHeader`, the offset of
+`extra_data` included. -/
+def executionHeaderFixedLen : Nat :=
+  32 + 20 + 32 + 32 + 256 + 32 + 8 * 4 + 4 + 32 + 32 + 32 + 32 + 8 + 8
+
+/-- The largest `LightClientHeader` from Capella on: the beacon header,
+the offset of `execution`, the execution branch, and the largest
+execution header. -/
+def lightClientHeaderMaxLen : Nat :=
+  beaconBlockHeaderLen + 4 + 4 * 32 + executionHeaderFixedLen + Constants.maxExtraDataBytes
+
+/-- The bounds of a `LightClientBootstrap`: header, committee, branch. -/
+def lightClientBootstrapBounds : Bounds :=
+  ⟨beaconBlockHeaderLen + syncCommitteeLen + 5 * 32,
+   4 + lightClientHeaderMaxLen + syncCommitteeLen + 6 * 32⟩
+
+/-- The bounds of a `LightClientUpdate`: two headers, the next committee
+with its branch, the finality branch, the aggregate, and the slot. -/
+def lightClientUpdateBounds : Bounds :=
+  ⟨2 * beaconBlockHeaderLen + syncCommitteeLen + 5 * 32 + 6 * 32 + syncAggregateLen + 8,
+   2 * (4 + lightClientHeaderMaxLen) + syncCommitteeLen + 6 * 32 + 7 * 32 + syncAggregateLen + 8⟩
+
+/-- The bounds of a `LightClientFinalityUpdate`: two headers, the
+finality branch, the aggregate, and the slot. -/
+def lightClientFinalityUpdateBounds : Bounds :=
+  ⟨2 * beaconBlockHeaderLen + 6 * 32 + syncAggregateLen + 8,
+   2 * (4 + lightClientHeaderMaxLen) + 7 * 32 + syncAggregateLen + 8⟩
+
+/-- The bounds of a `LightClientOptimisticUpdate`: one header, the
+aggregate, and the slot. -/
+def lightClientOptimisticUpdateBounds : Bounds :=
+  ⟨beaconBlockHeaderLen + syncAggregateLen + 8,
+   4 + lightClientHeaderMaxLen + syncAggregateLen + 8⟩
+
+/-- `/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy`: a block
+root, and one `LightClientBootstrap`. -/
+def lightClientBootstrapMethod : Method :=
+  { id := Libp2p.Protocols.Constants.reqRespId "light_client_bootstrap" 1
+    request := some (exactly 32), response := lightClientBootstrapBounds
+    contextLen := Libp2p.Protocols.Constants.forkDigestLen, maxChunks := 1 }
+
+/-- `/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy`:
+`start_period` and `count`, and at most
+`min(MAX_REQUEST_LIGHT_CLIENT_UPDATES, count)` updates. -/
+def lightClientUpdatesByRangeMethod : Method :=
+  { id := Libp2p.Protocols.Constants.reqRespId "light_client_updates_by_range" 1
+    request := some (exactly 16), response := lightClientUpdateBounds
+    contextLen := Libp2p.Protocols.Constants.forkDigestLen
+    maxChunks := Constants.maxRequestLightClientUpdates }
+
+/-- `/eth2/beacon_chain/req/light_client_finality_update/1/ssz_snappy`:
+"No Request Content", and one `LightClientFinalityUpdate`. -/
+def lightClientFinalityUpdateMethod : Method :=
+  { id := Libp2p.Protocols.Constants.reqRespId "light_client_finality_update" 1
+    request := none, response := lightClientFinalityUpdateBounds
+    contextLen := Libp2p.Protocols.Constants.forkDigestLen, maxChunks := 1 }
+
+/-- `/eth2/beacon_chain/req/light_client_optimistic_update/1/ssz_snappy`:
+"No Request Content", and one `LightClientOptimisticUpdate`. -/
+def lightClientOptimisticUpdateMethod : Method :=
+  { id := Libp2p.Protocols.Constants.reqRespId "light_client_optimistic_update" 1
+    request := none, response := lightClientOptimisticUpdateBounds
+    contextLen := Libp2p.Protocols.Constants.forkDigestLen, maxChunks := 1 }
+
+/-- The SSZ of a `LightClientUpdatesByRange` request. -/
+def lightClientUpdatesByRangeRequest (startPeriod count : Nat) : ByteArray :=
+  Chain.le64 startPeriod ++ Chain.le64 count
+
+-- The widths of the module doc, and the bounds they give.
+#guard beaconBlockHeaderLen == 112 && syncCommitteeLen == 24624 && syncAggregateLen == 160
+#guard executionHeaderFixedLen == 584 && lightClientHeaderMaxLen == 860
+#guard lightClientBootstrapBounds == ⟨24896, 25680⟩
+#guard lightClientUpdateBounds == ⟨25368, 26936⟩
+#guard lightClientFinalityUpdateBounds == ⟨584, 2120⟩
+#guard lightClientOptimisticUpdateBounds == ⟨280, 1032⟩
 
 /-- The SSZ of a `BeaconBlocksByRange` request: `step` is 1. -/
 def blocksByRangeRequest (startSlot count : Nat) : ByteArray :=

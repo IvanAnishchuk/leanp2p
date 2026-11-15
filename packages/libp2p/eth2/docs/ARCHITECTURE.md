@@ -30,7 +30,7 @@ and `quic`.
 | `Libp2p/Eth2/Topic.lean` | the topic kinds up to Fulu, the topic string, and its strict parse |
 | `Libp2p/Eth2/MessageId.lean` | the Altair message id, with the valid and the invalid snappy domain |
 | `Libp2p/Eth2/Enr.lean` | the ENR fields `eth2`, `attnets`, `syncnets`, `cgc`, and `nfd`, and the fork predicates for discovery |
-| `Libp2p/Eth2/Messages.lean` | the req/resp methods with their bounds, and the SSZ of `Status`, `MetaData`, Ping, Goodbye, and the requests |
+| `Libp2p/Eth2/Messages.lean` | the req/resp methods with their bounds, the light-client methods with bounds from the SSZ of their types, and the SSZ of `Status`, `MetaData`, Ping, Goodbye, and the requests |
 | `Libp2p/Eth2/Gossip.lean` | the router parameters of a consensus node |
 | `Libp2p/Eth2/Scoring.lean` | Lighthouse's score profile: the thresholds, the global parameters, and the parameters of each scored topic, from the active validator count and the slot |
 | `Libp2p/Eth2/Forks.lean` | the gossip across a fork: the pure schedule of the post-fork joins, the switch, and the retirement of the pre-fork topics |
@@ -47,7 +47,8 @@ and `quic`.
 - The methods `statusMethod`, `goodbyeMethod`, `pingMethod`,
   `metadataV3Method`, `metadataV2Method`, `blocksByRangeMethod`,
   `blocksByRootMethod`, `blocksByHeadMethod`, `columnsByRangeMethod`,
-  `columnsByRootMethod`, and the request encoders.
+  `columnsByRootMethod`, the four `lightClient*Method`s, and the request
+  encoders.
 - `Status`, `MetaData`.
 - `gossipParams`.
 - `Scoring.scoredParams`, `Scoring.dynamicParams`, `Scoring.kindParams`,
@@ -126,6 +127,16 @@ and `quic`.
   `updateScores` with the chain's numbers, every 60 s in Lighthouse. The
   rounding to fixed point is in `Scoring.lean`. `Config.scoring := false`
   runs the router unscored.
+- **Light clients at the network level.** altair
+  `light-client/p2p-interface.md` asks full nodes to subscribe to the two
+  light-client topics and to serve the four methods. The package carries
+  the topic kinds and the methods, and the client gives the data
+  (`Config.serve`). A light-client request with no data gets
+  `ResourceUnavailable`, as the spec asks. Lighthouse does not score the
+  two topics, and neither does the profile. The response bounds run from
+  each type's Altair form to its Electra form, as Lighthouse's do, with
+  one tighter bound: the least `LightClientUpdate` is 25368 bytes, where
+  Lighthouse takes 584.
 - **The seen cache holds 262144 ids**, which covers 341 messages per
   second at mainnet's TTL of 768 s. The ids are `List Nat` in the
   router, about 480 bytes each, so a larger cache costs memory that the

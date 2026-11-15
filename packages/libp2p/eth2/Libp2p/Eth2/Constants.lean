@@ -95,6 +95,16 @@ def numberOfColumns : Nat := 128
 /-- `compute_max_request_data_column_sidecars()` (fulu, "Helpers"). -/
 def maxRequestDataColumnSidecars : Nat := maxRequestBlocksDeneb * numberOfColumns
 
+/-- `MAX_REQUEST_LIGHT_CLIENT_UPDATES` (altair `light-client/p2p-interface.md`,
+"Configs"). -/
+def maxRequestLightClientUpdates : Nat := 128
+
+/-- `SYNC_COMMITTEE_SIZE` (altair `beacon-chain.md`, mainnet preset). -/
+def syncCommitteeSize : Nat := 512
+
+/-- `MAX_EXTRA_DATA_BYTES` (bellatrix `beacon-chain.md`, "Preset"). -/
+def maxExtraDataBytes : Nat := 32
+
 /-- The Goodbye reasons of phase0 ("Goodbye v1"). -/
 def goodbyeClientShutdown : Nat := 1
 def goodbyeIrrelevantNetwork : Nat := 2

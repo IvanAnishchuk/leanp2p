@@ -17,11 +17,14 @@ The names, by the fork that adds them:
 |---|---|
 | phase0 | `beacon_block`, `beacon_aggregate_and_proof`, `voluntary_exit`, `proposer_slashing`, `attester_slashing`, `beacon_attestation_{i}` |
 | altair | `sync_committee_contribution_and_proof`, `sync_committee_{i}` |
+| altair, light client | `light_client_finality_update`, `light_client_optimistic_update` |
 | capella | `bls_to_execution_change` |
 | fulu | `data_column_sidecar_{i}` |
 
 Deneb's `blob_sidecar_{i}` is deprecated in Fulu, and this package
-leaves it out.
+leaves it out. The light-client topics come from altair
+`light-client/p2p-interface.md`: "All full nodes SHOULD subscribe to
+and provide stability on" both.
 -/
 
 set_option autoImplicit false
@@ -38,6 +41,8 @@ inductive Kind where
   | attesterSlashing
   | syncCommitteeContributionAndProof
   | blsToExecutionChange
+  | lightClientFinalityUpdate
+  | lightClientOptimisticUpdate
   | beaconAttestation (subnet : Nat)
   | syncCommittee (subnet : Nat)
   | dataColumnSidecar (subnet : Nat)
@@ -53,7 +58,9 @@ def globals : List (String × Kind) :=
    ("proposer_slashing", .proposerSlashing),
    ("attester_slashing", .attesterSlashing),
    ("sync_committee_contribution_and_proof", .syncCommitteeContributionAndProof),
-   ("bls_to_execution_change", .blsToExecutionChange)]
+   ("bls_to_execution_change", .blsToExecutionChange),
+   ("light_client_finality_update", .lightClientFinalityUpdate),
+   ("light_client_optimistic_update", .lightClientOptimisticUpdate)]
 
 /-- The subnet names: the prefix before the index, the count of
 subnets, and the kind of an index. -/
@@ -71,6 +78,8 @@ def name : Kind → String
   | .attesterSlashing => "attester_slashing"
   | .syncCommitteeContributionAndProof => "sync_committee_contribution_and_proof"
   | .blsToExecutionChange => "bls_to_execution_change"
+  | .lightClientFinalityUpdate => "light_client_finality_update"
+  | .lightClientOptimisticUpdate => "light_client_optimistic_update"
   | .beaconAttestation i => s!"beacon_attestation_{i}"
   | .syncCommittee i => s!"sync_committee_{i}"
   | .dataColumnSidecar i => s!"data_column_sidecar_{i}"
@@ -116,6 +125,8 @@ def topicParse? (t : String) : Option (ByteArray × Kind) := do
 #guard (topicParse? "/eth2/446a7232/sync_committee_contribution_and_proof/ssz_snappy").map (·.2) ==
   some .syncCommitteeContributionAndProof
 #guard (topicParse? "/eth2/446a7232/blob_sidecar_0/ssz_snappy").isNone
+#guard (topicParse? "/eth2/446a7232/light_client_finality_update/ssz_snappy").map (·.2) ==
+  some .lightClientFinalityUpdate
 #guard (topicParse? "/eth2/446a72/beacon_block/ssz_snappy").isNone
 
 end Libp2p.Eth2

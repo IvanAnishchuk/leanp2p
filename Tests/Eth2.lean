@@ -215,9 +215,9 @@ private def scoringChecks (r : Runner) : IO Unit := do
   r.check "scoring: a topic of another digest is not scored"
     (params.score.topics ⟨topicOf ⟨#[1, 2, 3, 4]⟩ .beaconBlock⟩).isNone
   r.check "scoring: the score retention is 100 epochs" (params.retainScore == 38400000)
-  r.check "gossip: the subscription caps are Lighthouse's, for 203 topics a fork"
-    (topicsPerFork == 203 && params.maxSubscriptionsPerRpc == some 406 &&
-      params.maxSubscribedTopics == some 812)
+  r.check "gossip: the subscription caps are Lighthouse's, for 205 topics a fork"
+    (topicsPerFork == 205 && params.maxSubscriptionsPerRpc == some 410 &&
+      params.maxSubscribedTopics == some 820)
 
 /-! ## The fork schedule -/
 
@@ -341,6 +341,15 @@ private def serviceChecks (r : Runner) : Async Unit := do
     | .columnsByRange start _ _ =>
       discard <| emit digest ⟨Array.replicate 356 start.toUInt8⟩
       return .resourceUnavailable "pruned"
+    -- The least bootstrap, and one update past `count`, which the cap
+    -- refuses. The finality and optimistic updates take the default.
+    | .lightClientBootstrap _ =>
+      discard <| emit digest ⟨Array.replicate lightClientBootstrapBounds.minLen 3⟩
+      return .done
+    | .lightClientUpdatesByRange start count =>
+      for i in [0:count + 1] do
+        discard <| emit digest ⟨Array.replicate lightClientUpdateBounds.minLen (start + i).toUInt8⟩
+      return .done
     | _ => return .done
   let a ← startOn c 1 evA (serve := serve)
   let b ← startOn c 2 evB [← (a.localEnr : BaseIO Enr)]
@@ -417,6 +426,26 @@ private def serviceChecks (r : Runner) : Async Unit := do
     return c.payload.get! 0 != 11
   r.check "eth2 service: a check of each chunk stops the read at the refused block"
     ((match each with | .ok () => true | .error _ => false) && (← checked.get) == [10, 11])
+  -- The light-client methods.
+  match ← b.request aPeer lightClientBootstrapMethod (some ⟨Array.replicate 32 5⟩) with
+  | .ok chunks =>
+    r.check "eth2 service: a light-client bootstrap answers one chunk with our digest"
+      (chunks.map (·.payload.size) == [lightClientBootstrapBounds.minLen] &&
+        chunks.all (·.context == digest))
+  | .error _ => r.check "eth2 service: the light-client bootstrap answers" false
+  match ← b.request aPeer lightClientUpdatesByRangeMethod (some (lightClientUpdatesByRangeRequest 4 2)) with
+  | .ok chunks =>
+    r.check "eth2 service: light-client updates stop at count"
+      (chunks.map (·.payload.get! 0) == [4, 5])
+  | .error _ => r.check "eth2 service: the light-client updates answer" false
+  match ← b.request aPeer lightClientFinalityUpdateMethod none with
+  | .ok chunks =>
+    r.check "eth2 service: a light-client request with no data gets ResourceUnavailable"
+      (chunks.map (·.result) == [.resourceUnavailable])
+  | .error _ => r.check "eth2 service: the finality update answers" false
+  r.check "eth2 service: the light-client topics parse"
+    ((topicParse? (topicOf digest .lightClientOptimisticUpdate)).map (·.2) ==
+      some .lightClientOptimisticUpdate)
   match ← b.request aPeer columnsByRangeMethod (some (columnsByRangeRequest 5 1 [1, 2])) with
   | .ok chunks =>
     r.check "eth2 service: a column range ends with ResourceUnavailable after its column"

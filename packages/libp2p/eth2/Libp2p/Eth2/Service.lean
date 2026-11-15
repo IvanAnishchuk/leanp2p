@@ -121,7 +121,7 @@ inductive Event where
   (`Service.disconnect`). -/
   | unresponsive (peer : PeerId)
 
-/-- A block or column request that a peer sent us. -/
+/-- A block, column, or light-client request that a peer sent us. -/
 inductive Inbound where
   | blocksByRange (startSlot count : Nat)
   | blocksByRoot (roots : List ByteArray)
@@ -131,6 +131,15 @@ inductive Inbound where
   | columnsByRange (startSlot count : Nat) (columns : List Nat)
   /-- The raw SSZ of a `DataColumnsByRootIdentifiers` list. -/
   | columnsByRoot (ssz : ByteArray)
+  /-- The `LightClientBootstrap` of a block root. -/
+  | lightClientBootstrap (root : ByteArray)
+  /-- The `LightClientUpdate`s of the sync committee periods
+  `[startPeriod, startPeriod + count)`. -/
+  | lightClientUpdatesByRange (startPeriod count : Nat)
+  /-- The latest `LightClientFinalityUpdate`. -/
+  | lightClientFinalityUpdate
+  /-- The latest `LightClientOptimisticUpdate`. -/
+  | lightClientOptimisticUpdate
 
 /-- The most success chunks that the answer to a request may hold,
 below the method's own cap (`Method.maxChunks`). A block range holds
@@ -145,6 +154,18 @@ def Inbound.limit : Inbound → Option Nat
   | .blocksByHead _ count => some count
   | .columnsByRange _ count columns => some (count * columns.length)
   | .columnsByRoot _ => none
+  | .lightClientUpdatesByRange _ count => some count
+  | .lightClientBootstrap _ | .lightClientFinalityUpdate | .lightClientOptimisticUpdate => some 1
+
+/-- Whether the answer to a request is one chunk or an error. A
+light-client request that the client cannot answer gets
+`ResourceUnavailable`: "When no `LightClientFinalityUpdate` is
+available, peers SHOULD respond with error code
+`3: ResourceUnavailable`", and the same for the bootstrap and the
+optimistic update. -/
+def Inbound.oneOrError : Inbound → Bool
+  | .lightClientBootstrap _ | .lightClientFinalityUpdate | .lightClientOptimisticUpdate => true
+  | _ => false
 
 /-- The answer of one chunk to an inbound request: the context bytes,
 the `ForkDigest` of the chunk's epoch, and the SSZ. It answers `false`
@@ -211,10 +232,12 @@ structure Config where
   scoring : Bool := true
   /-- The events. Must not park. -/
   onEvent : Event → BaseIO Unit := fun _ => pure ()
-  /-- The client's answer to a block or column request. It emits the
-  chunks it has, in the order the method requires, and it names how the
-  answer ends. The default emits none, which the spec allows ("Clients
-  MAY limit the number of blocks in the response"). -/
+  /-- The client's answer to a block, column, or light-client request.
+  It emits the chunks it has, in the order the method requires, and it
+  names how the answer ends. The default emits none, which the spec
+  allows ("Clients MAY limit the number of blocks in the response").
+  For a light-client request with no chunk, the service then answers
+  `ResourceUnavailable` (`Inbound.oneOrError`). -/
   serve : PeerId → Inbound → Emit → Async Ending := fun _ _ _ => pure .done
 
 /-- Milliseconds since the Unix epoch. -/
@@ -337,6 +360,12 @@ def inboundOf (m : Method) (p : ByteArray) : Option Inbound :=
         ((List.range ((p.size - 20) / 8)).map fun i => le64At p (20 + 8 * i)))
     else none
   else if m.id == columnsByRootMethod.id then some (.columnsByRoot p)
+  else if m.id == lightClientBootstrapMethod.id then
+    if p.size == 32 then some (.lightClientBootstrap p) else none
+  else if m.id == lightClientUpdatesByRangeMethod.id then
+    if p.size == 16 then some (.lightClientUpdatesByRange (le64At p 0) (le64At p 8)) else none
+  else if m.id == lightClientFinalityUpdateMethod.id then some .lightClientFinalityUpdate
+  else if m.id == lightClientOptimisticUpdateMethod.id then some .lightClientOptimisticUpdate
   else none
 
 /-- The handlers of the req/resp methods. -/
@@ -354,7 +383,13 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
           BaseIO Bool)
         if !room then return false
         return (← emit ⟨.success, context, ssz⟩) matches .ok _
-      if let some c := ending.chunk? then discard <| emit c
+      match ending.chunk? with
+      | some c => discard <| emit c
+      | none =>
+        -- A light-client request with no chunk gets the error code the
+        -- spec asks for (`Inbound.oneOrError`).
+        if req.oneOrError && (← (sent.get : BaseIO Nat)) == 0 then
+          discard <| emit ((Ending.resourceUnavailable "no light client data").chunk?.getD invalid)
   [b.handlerOf statusMethod fun peer payload emit => do
       discard <| emit (plain (← (b.status.get : BaseIO Status)).encode)
       if let some st := payload.bind Status.decode? then
@@ -383,14 +418,19 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
    serveMethod blocksByRootMethod,
    serveMethod blocksByHeadMethod,
    serveMethod columnsByRangeMethod,
-   serveMethod columnsByRootMethod]
+   serveMethod columnsByRootMethod,
+   serveMethod lightClientBootstrapMethod,
+   serveMethod lightClientUpdatesByRangeMethod,
+   serveMethod lightClientFinalityUpdateMethod,
+   serveMethod lightClientOptimisticUpdateMethod]
 
 /-- The protocol ids the identify answer lists. -/
 def servedIds : List String :=
   [Identify.protocolId, Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId,
    statusMethod.id, goodbyeMethod.id, pingMethod.id, metadataV3Method.id, metadataV2Method.id,
    blocksByRangeMethod.id, blocksByRootMethod.id, blocksByHeadMethod.id, columnsByRangeMethod.id,
-   columnsByRootMethod.id].map (·.toString)
+   columnsByRootMethod.id, lightClientBootstrapMethod.id, lightClientUpdatesByRangeMethod.id,
+   lightClientFinalityUpdateMethod.id, lightClientOptimisticUpdateMethod.id].map (·.toString)
 
 /-- Report the host's sessions, and send `Status` on each outbound one.
 A replaced session raises `disconnected` while the peer stays
