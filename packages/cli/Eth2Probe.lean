@@ -79,6 +79,12 @@ def recordsOf (path : String) : IO (List Enr) := do
   if ← System.FilePath.pathExists path then return recordsIn (← IO.FS.readFile path)
   return []
 
+/-- The events that wait for the loop. -/
+def eventSlots : Nat := 4096
+
+/-- The pause between two reports of the gossip so far. -/
+def reportEveryMs : Nat := 10000
+
 /-- The counts the summary prints. -/
 structure Counts where
   peers : Nat := 0
@@ -158,12 +164,16 @@ def run (a : Args) : IO UInt32 := do
   let key ← match ← Crypto.secp256k1Generate.run with
     | .ok k => IO.ofExcept ((PrivKey.ofData? .secp256k1 k.bytes).mapError fun _ => "the key does not build")
     | .error _ => throw (IO.userError "the secp256k1 generator failed")
-  let events ← (OnceRef.new (#[] : Array Event) : BaseIO _)
+  -- The service's callback must not park, so it offers each event to a
+  -- bounded queue, and a full queue drops the event and counts it.
+  let events ← (Chan.new eventSlots (by decide) : BaseIO (Chan Event))
+  let dropped ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
   let s ← Async.run (Service.start {
     chain, key, ip := a.ip, tcpPort := a.port, quicPort := if a.quic then some (a.port + 1) else none
     discPort := a.port
     bootEnrs := boot, advert := { cgc := 128 }, scoring := a.scoring
-    onEvent := fun e => events.update (·.push e) })
+    onEvent := fun e => do
+      unless ← events.trySend e do dropped.update (· + 1) })
   IO.println s!"eth2-probe: listening on {s.listenAddrs.map toString}"
   IO.println s!"eth2-probe: record {(← s.localEnr).toText}"
   let kinds : List Kind := [.beaconBlock, .beaconAggregateAndProof] ++
@@ -176,10 +186,15 @@ def run (a : Args) : IO UInt32 := do
   let tasks ← (TaskSet.new : BaseIO TaskSet)
   let start ← IO.monoMsNow
   let deadline := start + a.seconds * 1000
-  let mut nextReport := start + 10000
-  while (← IO.monoMsNow) < deadline do
-    IO.sleep 200
-    for e in ← (events.updateGet fun q => (q, #[]) : BaseIO (Array Event)) do
+  let mut nextReport := start + reportEveryMs
+  repeat
+    let now ← IO.monoMsNow
+    if deadline ≤ now then break
+    -- Park: an event wakes it, and so does the timer of the next report
+    -- or of the end.
+    let timer ← (Park.sleep (min deadline nextReport - now) none : BaseIO (Park (Option Event)))
+    let got ← Async.run (select #[Park.recv events id, timer])
+    if let some e := got then
       match e with
       | .connected p out =>
         IO.println s!"peer + {short p} {if out then "out" else "in"}"
@@ -209,7 +224,7 @@ def run (a : Args) : IO UInt32 := do
     -- Every 10 s, the gossip so far, so a stall shows as a flat count.
     let now ← IO.monoMsNow
     if now ≥ nextReport then
-      nextReport := now + 10000
+      nextReport := now + reportEveryMs
       let c ← counts.get
       let meshed ← match ← Async.run s.gossip.stats with
         | some st => pure s!"{(st.mesh.filter (·.2 > 0)).length} of {st.topics} topics meshed, \
@@ -217,9 +232,12 @@ def run (a : Args) : IO UInt32 := do
             dontSend {st.dontSend}, dropped {st.dropped}, v1.2 {st.v12Peers}, v1.3 {st.v13Peers}"
         | none => pure "no stats"
       IO.println s!"t+{(now - start) / 1000}s: peers {(← s.peers).length}, blocks {c.blocks}, \
-        aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}, {meshed}"
-  Async.run tasks.joinAll
+        aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}, \
+        events dropped {← dropped.get}, {meshed}"
+  -- The stop closes the host, which wakes every request the tasks park
+  -- on, and then the join returns at once.
   Async.run s.stop
+  Async.run tasks.joinAll
   let c ← counts.get
   IO.println s!"eth2-probe: peers {c.peers}, statuses {c.statuses}, gossip blocks {c.blocks}, \
     aggregates {c.aggregates}, attestations {c.attestations}, columns {c.columns}, \

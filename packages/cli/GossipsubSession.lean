@@ -15,8 +15,6 @@ namespace Cli.GossipsubSession
 
 open Conc Streams Multiformats Libp2p.Core Libp2p.Identity Libp2p.Host
 open Libp2p.Protocols Libp2p.Protocols.Constants
-open Conc Streams Multiformats Libp2p.Core Libp2p.Identity Libp2p.Host
-open Libp2p.Protocols Libp2p.Protocols.Constants
 open Libp2p.Protocols.Gossipsub Libp2p.Protocols.Gossipsub.Node
 
 /-- Use the production yamux session through the core muxer seam. -/
@@ -32,21 +30,27 @@ def offeredMuxers : List Libp2p.Core.Muxer := [yamuxMuxer, Libp2p.Mux.mplex]
 structure Running where
   host : Libp2p.Host.Host
   node : Node
+  /-- The public key that the identify answer carries. -/
+  pubkey : PubKey
+  /-- Whether the node serves floodsub, so identify lists it. -/
+  floodsub : Bool
 
 /-- The protocol ids this host serves, as the identify responder
-advertises them. `Host.new` installs identify; `Node.start` installs
-meshsub before `listen`, so every peer that asks after the listen sees
-both ids.
+advertises them: identify, and every version that `Node.start`
+registers (`/meshsub/1.3.0`, `1.2.0`, `1.1.0`, and floodsub when the
+node speaks it).
 
 A peer that learns no served id here never opens its own gossipsub
 stream to this node: go-libp2p-pubsub adds a peer only after identify
 reports a protocol that the router speaks, then opens the router stream.
 An empty list leaves the peer with no router stream, so it never enters
 the mesh. -/
-def servedProtocols : List String :=
-  [identifyId.toString, meshsubId.toString]
+def servedProtocols (floodsub : Bool) : List String :=
+  [identifyId.toString, meshsubV13Id.toString, meshsubV12Id.toString, meshsubId.toString] ++
+    (if floodsub then [floodsubId.toString] else [])
 
-/-- Build Noise and the real TCP host. Node.start installs meshsub. -/
+/-- Build Noise and the real TCP host. Node.start installs meshsub. The
+identify answer goes in at `listen`, once the listen address exists. -/
 def start (identity : PrivKey) (nodeConfig : Node.Config := {}) : IO (Except String Running) := do
   let generated ← (Libp2p.Security.Noise.Config.generate identity).run
   let noise ← match generated with
@@ -59,18 +63,33 @@ def start (identity : PrivKey) (nodeConfig : Node.Config := {}) : IO (Except Str
     identity := identity
     transports := [Streams.Tcp.transport]
     security := [Libp2p.Security.Noise.securityProtocol noise]
-    muxers := offeredMuxers
-    handlers := [Identify.respondHandler pubkey [] servedProtocols "leanp2p"] }
+    muxers := offeredMuxers }
   let hostResult ← BaseIO.toIO (Libp2p.Host.Host.new config)
   let host ← match hostResult with
     | .error e => return .error (reprStr e)
     | .ok value => pure value
   let node ← BaseIO.toIO (Node.start (HostSeam.ofHost host) nodeConfig)
-  return .ok { host, node }
+  return .ok { host, node, pubkey, floodsub := nodeConfig.floodsub }
 
-/-- Listen only after Node.start has registered meshsub. -/
+/-- The addresses that identify names for a bound address. An
+unspecified IPv4 address names no address that a peer can dial. go
+expands it into the interface addresses, and the Lean runtime has no
+interface list, so it names none. -/
+def identifyAddrs (bound : Multiaddr) : List (List Nat) :=
+  match bound.components with
+  | ⟨.«ip4», [0, 0, 0, 0]⟩ :: _ => []
+  | _ => [bound.toBytes]
+
+/-- Listen only after Node.start has registered meshsub, then install
+the identify answer with the bound address. No connection comes before
+the listen: the script dials later. -/
 def listen (running : Running) (addr : Multiaddr) : Conc.Async (Except String Multiaddr) := do
-  return (← running.host.startListening addr).mapError (fun e => reprStr e)
+  match ← running.host.startListening addr with
+  | .error e => return .error (reprStr e)
+  | .ok bound =>
+    (running.host.setHandler (Identify.respondHandler running.pubkey (identifyAddrs bound)
+      (servedProtocols running.floodsub) "leanp2p") : BaseIO Unit)
+    return .ok bound
 
 /-- Stop node and host concurrently, then let the caller drain records. -/
 def stop (running : Running) : Conc.Async Unit := do

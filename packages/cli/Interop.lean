@@ -30,8 +30,8 @@ itself (root PLAN W4.4).
   kills it when the dialer is done, and a run that reaches the end of
   the sleep failed.
 * **The dialer** takes the address through `BLPOP`, dials it, opens a
-  ping stream, and pings once. It prints the timing record to stdout,
-  and nothing else.
+  ping stream, and pings once, under the test timeout. It prints the
+  timing record to stdout, and nothing else.
 
 Diagnostics go to stderr. Every failure exits nonzero.
 
@@ -180,12 +180,19 @@ def dial (cfg : Config) (redis : Redis.Client) (h : Host) : Run Unit := do
   let payload ← orFail "ping payload" (fun e => reprStr e)
     (← (Crypto.randomBytes Ping.payloadSize).run)
   let pingStart ← IO.monoNanosNow
-  -- The annotation binds the ping's `Except` as data, so its failure
-  -- waits until after the reset below. `orFail` then reports it.
-  let answer : Except Libp2p.Protocols.Ping.Error (Option Nat) ←
-    (Ping.ping stream Conc.Clock.system payload : Async _)
+  -- The ping runs under the test timeout, so a peer that never echoes
+  -- ends the run with a failure before the runner kills it. The expiry
+  -- resets the stream, which wakes the parked read, and the reset task
+  -- lives in a set this call owns and joins. The annotation binds the
+  -- answer as data, so its failure waits until after the reset below.
+  let resets ← Conc.TaskSet.new
+  let raced : Except Conc.Error (Except Libp2p.Protocols.Ping.Error (Option Nat)) ←
+    Conc.withinDeadline Conc.Clock.system (1000 * cfg.timeoutSec) (resets.spawn stream.reset)
+      (Ping.ping stream Conc.Clock.system payload)
+  resets.joinAll
   let done ← IO.monoNanosNow
   stream.reset
+  let answer ← orFail "ping" (fun _ => s!"no echo within {cfg.timeoutSec} s") raced
   discard <| orFail "ping" (fun e => reprStr e) answer
   IO.println (Config.timingJson ((done - start) / 1000) ((done - pingStart) / 1000))
 

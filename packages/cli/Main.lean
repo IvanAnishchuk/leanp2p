@@ -64,8 +64,8 @@ def run (args : List String) : IO UInt32 := do
     let listenAddr ← match Multiaddr.parse? "/ip4/0.0.0.0/tcp/9000" with
       | .ok value => pure value
       | .error e => throw (IO.userError (reprStr e))
-    match ← (active.host.startListening listenAddr).run with
-    | .error e => throw (IO.userError (reprStr e))
+    match ← (GossipsubSession.listen active listenAddr).run with
+    | .error e => throw (IO.userError e)
     | .ok _ => pure ()
     let peerTime ← BaseIO.toIO observationTime
     let peerLine ← BaseIO.toIO (RecordWriter.offer writer (peerRecord peerTime peer.toString nodeId))
@@ -92,7 +92,7 @@ def run (args : List String) : IO UInt32 := do
         for attempt in [1, 2, 3, 4] do
           match dialResult with
           | .error (.unreachable _) =>
-            IO.eprintln s!"dial {nodeName} unreachable, retry {attempt}/5 after 200 ms"
+            IO.eprintln s!"dial {nodeName} unreachable, attempt {attempt + 1}/5 after 200 ms"
             let timer ← (Conc.Clock.system.after 200 : BaseIO (Conc.Park Unit))
             discard <| Conc.select #[timer]
             dialResult ← active.host.dialPeer targetPeer
