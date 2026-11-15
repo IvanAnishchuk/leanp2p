@@ -230,6 +230,8 @@ def decodeAtB? (input : ByteArray) (position : Nat := 0) : Except Error (Frame �
   let protocol ← match Protocol.ofCode? rawProtocol.val with
     | none => .error .unknownProtocol
     | some protocol => .ok protocol
+  -- The model's check: the tag must be the protocol's own code.
+  if protocol.toCode ≠ rawProtocol.val then throw .unknownProtocol
   let (value, after) ← match protocol.fixedBytes? with
     | some count => Wire.takeBytesAt input next count maxComponentBytes
     | none => do

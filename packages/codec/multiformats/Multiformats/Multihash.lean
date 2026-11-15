@@ -177,6 +177,8 @@ def decodeAtB? (input : ByteArray) (position : Nat := 0) : Except Error (Multiha
   let code ← match HashCode.ofCode? rawCode.val with
     | none => .error .unknownHash
     | some code => .ok code
+  -- The model's check: the code must be the algorithm's own code.
+  if code.toCode ≠ rawCode.val then throw .unknownHash
   let (length, next) ← Wire.readVarintAt input next
   let (payload, after) ← Wire.takeBytesAt input next length.val maxDigestBytes
   let value ← ofDigest? code payload

@@ -206,6 +206,8 @@ def decodeAtB? (input : ByteArray) (position : Nat := 0) : Except Error (Cid × 
     let codec ← match ContentCodec.ofCode? rawCodec.val with
       | none => .error .badCid
       | some codec => .ok codec
+    -- The model's check: the code must be the codec's own code.
+    if codec.toCode ≠ rawCodec.val then throw .badCid
     let (hash, after) ← Multihash.decodeAtB? input next
     .ok (.v1 codec hash, after)
   else .error .badCid
