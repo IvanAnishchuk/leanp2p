@@ -66,7 +66,7 @@ private def params : Params :=
     prims := prims
     msgId := fun m => ⟨m.data.getD []⟩
     score := { defaults.score with topics := fun t => if t = ta then some topicScore else none }
-    partialTopics := [(ta, { requests := true, supports := true })] }
+    partialTopics := .ofList [(ta, { requests := true, supports := true })] }
 
 private def peerRec : PeerData :=
   { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }
@@ -270,7 +270,7 @@ def run (r : Runner) : IO Unit := do
       | .sendRpc _ r => !hasIhave r
       | _ => true)
   -- A topic where we cannot send partial messages makes no offer.
-  let fullOnly : Params := { params with partialTopics := [] }
+  let fullOnly : Params := { params with partialTopics := {} }
   let offFull := match Core.run fullOnly s1 [.tick params.heartbeatInterval [pa, pb, pc]] with
     | .ok (_, a) => a
     | .error _ => []

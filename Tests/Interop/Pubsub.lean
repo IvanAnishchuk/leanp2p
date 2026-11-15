@@ -249,7 +249,7 @@ peer. -/
 def partialMode (expected : String) (target listen : Option String) : Async UInt32 := do
   let base := Core.defaults
   let params : Core.Params :=
-    { base with partialTopics := [(topic, { requests := true, supports := true })] }
+    { base with partialTopics := .ofList [(topic, { requests := true, supports := true })] }
   let got : OnceRef (Option String) ← OnceRef.new none
   let fulls : OnceRef Nat ← OnceRef.new 0
   let want := Bytes.toNatList expected.toUTF8

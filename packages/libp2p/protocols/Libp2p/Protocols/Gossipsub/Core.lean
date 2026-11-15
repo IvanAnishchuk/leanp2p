@@ -98,6 +98,30 @@ structure PartialOpts where
 /-- The choice can send partial messages: a request implies support. -/
 def PartialOpts.sends (o : PartialOpts) : Bool := o.requests || o.supports
 
+/-- Our partial-messages choices: a lookup per topic, and whether some
+topic can send, which makes the node announce the extension. The
+constructors below set both from one source, so they agree. A lookup
+keeps the cost per message at one call, so a node with hundreds of
+partial topics (the column subnets of every fork digest) pays no list
+search on each forward. -/
+structure PartialTopics where
+  /-- The choice for a topic. A topic with the default takes full
+  messages only. -/
+  lookup : TopicId → PartialOpts := fun _ => {}
+  /-- Some topic can send partial messages. -/
+  anySends : Bool := false
+
+/-- The choices of a list of topics. -/
+def PartialTopics.ofList (l : List (TopicId × PartialOpts)) : PartialTopics :=
+  { lookup := fun t => ((l.find? (fun e => decide (e.1 = t))).map (·.2)).getD {}
+    anySends := l.any (·.2.sends) }
+
+/-- One choice for every topic of a set, through a hash set of the topic
+names. -/
+def PartialTopics.ofSet (names : Std.HashSet String) (o : PartialOpts) : PartialTopics :=
+  { lookup := fun t => if names.contains t.name then o else {}
+    anySends := o.sends && !names.isEmpty }
+
 /-- The per-peer record: the score state, the pubsub protocol, and the
 topics the peer announced. `Peer` keeps its one meaning, the peer id of
 `Types.lean`. -/
@@ -226,9 +250,10 @@ structure Params where
   above the median. rust grafts 2 every 60 heartbeats. -/
   opportunisticGraftPeers : Nat := 2
   /-- Our partial-messages choice per topic (gossipsub v1.3,
-  `partial-messages.md`). A topic not listed takes full messages only.
-  Any entry that can send makes the node announce the extension. -/
-  partialTopics : List (TopicId × PartialOpts) := []
+  `partial-messages.md`). A topic with the default choice takes full
+  messages only. A topic that can send makes the node announce the
+  extension (`PartialTopics.anySends`). -/
+  partialTopics : PartialTopics := {}
   /-- Peer exchange on prune (`gossipsub-v1.1.md`, "Peer Exchange"): a
   prune we send names up to `prunePeers` other peers of the topic. go and
   rust disable it by default, and so does this router. Teku enables it.
@@ -530,7 +555,7 @@ inbound partial message goes to the application. -/
 
 /-- Our choice for topic `t`. -/
 def partialOpts (p : Params) (t : TopicId) : PartialOpts :=
-  ((p.partialTopics.find? (fun e => decide (e.1 = t))).map (·.2)).getD {}
+  p.partialTopics.lookup t
 
 /-- The choice peer `q` announced for `t`. -/
 def peerPartial (s : State) (q : Peer) (t : TopicId) : PartialOpts :=
@@ -556,7 +581,7 @@ theorem mem_dropForPartial {p : Params} {s : State} {acts : List Action} {a : Ac
 /-- The Extensions message the node sends first on each stream: present
 when some topic can send partial messages (`gossipsub-v1.3.md`). -/
 def ownExtensions (p : Params) : Option Rpc.ControlExtensions :=
-  if p.partialTopics.any (·.2.sends) then some { partialMessages := true } else none
+  if p.partialTopics.anySends then some { partialMessages := true } else none
 
 /-- One subscription record with our choice for the topic. An
 unsubscribe carries no flags: the receiver ignores them there. -/

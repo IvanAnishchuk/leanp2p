@@ -235,7 +235,7 @@ def runPartial (r : Runner) : IO Unit := Async.run do
   let p ← hostPair
   let topic : TopicId := ⟨"columns"⟩
   let params : Core.Params :=
-    { Core.defaults with partialTopics := [(topic, { requests := true, supports := true })] }
+    { Core.defaults with partialTopics := .ofList [(topic, { requests := true, supports := true })] }
   -- The server logs whether the client's first RPC carried extensions,
   -- and every partial message it hands to the application.
   let firsts : Chan Bool ← Chan.new 4
