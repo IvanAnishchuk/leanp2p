@@ -211,8 +211,11 @@ structure Config where
   ip : List Nat
   /-- The TCP port. 0 lets the system pick. -/
   tcpPort : Nat
-  /-- The QUIC port, or `none` for no QUIC. -/
-  quicPort : Option Nat := none
+  /-- The QUIC port, or `none` for no QUIC. QUIC is on by default:
+  "All implementations MUST support the QUIC (UDP) libp2p transport"
+  (phase0, beta.4). The default 0 lets the system pick, as `tcpPort` 0
+  does, and the record names the bound port. -/
+  quicPort : Option Nat := some 0
   /-- The discv5 UDP port. 0 lets the system pick. -/
   discPort : Nat
   /-- The boot records. -/

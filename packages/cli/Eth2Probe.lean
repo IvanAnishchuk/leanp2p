@@ -169,7 +169,9 @@ def run (a : Args) : IO UInt32 := do
   let events ← (Chan.new eventSlots (by decide) : BaseIO (Chan Event))
   let dropped ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
   let s ← Async.run (Service.start {
-    chain, key, ip := a.ip, tcpPort := a.port, quicPort := if a.quic then some (a.port + 1) else none
+    chain, key, ip := a.ip, tcpPort := a.port
+    -- QUIC on the next port, as Lighthouse's default does.
+    quicPort := if a.quic then some (a.port + 1) else none
     discPort := a.port
     bootEnrs := boot, advert := { cgc := 128 }, scoring := a.scoring
     onEvent := fun e => do

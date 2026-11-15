@@ -357,6 +357,7 @@ private def serviceChecks (r : Runner) : Async Unit := do
   let bPeer := b.base.host.localPeer
   let has (ev : OnceRef (List Event)) (f : Event → Bool) : Async Bool := do
     return (← (ev.get : BaseIO (List Event))).any f
+  r.check "eth2 service: QUIC is on by default, beside TCP" (a.listenAddrs.length == 2)
   r.check "eth2 service: the boot record's peer connects"
     (← waitUntil (has evB fun | .connected p true => p == aPeer | _ => false) 5000)
   r.check "eth2 service: the listener sees the inbound peer"
