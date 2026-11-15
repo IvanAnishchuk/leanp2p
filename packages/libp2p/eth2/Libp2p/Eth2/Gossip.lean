@@ -1,4 +1,5 @@
 import Libp2p.Protocols.Gossipsub.Core
+import Libp2p.Eth2.Fork
 import Libp2p.Eth2.MessageId
 
 /-!

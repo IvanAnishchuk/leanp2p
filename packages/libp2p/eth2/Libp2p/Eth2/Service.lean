@@ -21,15 +21,18 @@ import Libp2p.Eth2.Gossip
 import Libp2p.Eth2.Peers
 import Libp2p.Eth2.Scoring
 import Libp2p.Eth2.Forks
+import Libp2p.Eth2.PartialColumns
 
 /-!
 # The consensus network service
 
 One value that a consensus client runs for its networking: the host,
 the gossipsub node, the discv5 node, and the req/resp methods, wired
-the way the consensus spec asks. The client keeps the chain. It answers
+the way the consensus spec asks. The client keeps the chain and every
+consensus type. It hands the service its fork schedule (`Chain`), its
+`Status`, and its `MetaData`, each as the client encodes it. It answers
 the gossip validations and the block and column requests, and it reads
-the events.
+the events. The service carries the bytes and never decodes SSZ.
 
 ## What the service does by itself
 
@@ -41,14 +44,15 @@ the events.
   two must be one key.
 * **Status.** "The dialing client MUST send a `Status` request upon
   connection." The service sends ours on each outbound connection, and
-  it answers each inbound one with ours. A peer whose `fork_digest` is
-  not ours gets Goodbye with reason 2, and its connection ends ("SHOULD
-  immediately disconnect"). The other check of the spec, a finalized
-  root outside our chain, needs the chain, so it stays with the client.
+  it answers each inbound one with ours. A peer whose `fork_digest`, the
+  first 4 bytes, is not ours gets Goodbye with reason 2, and its
+  connection ends ("SHOULD immediately disconnect"). The other check of
+  the spec, a finalized root outside our chain, needs the chain, so it
+  stays with the client.
 * **Ping, MetaData, Goodbye.** The service answers Ping with our
-  `MetaData.seq_number`, and MetaData v3 and v2 with ours. Each Goodbye
-  of a peer becomes an event. At `stop`, the service says Goodbye with
-  reason 1 to every peer.
+  `seq_number`, and MetaData v3 and v2 with the client's bytes. Each
+  Goodbye of a peer becomes an event. At `stop`, the service says
+  Goodbye with reason 1 to every peer.
 * **Liveness.** The service pings each peer on Lighthouse's intervals
   (`Peers`). A newer `seq_number` in the answer brings a MetaData
   request, and the answer becomes `Event.metaData`. A peer that does not
@@ -70,6 +74,15 @@ the events.
   `report`. Data that does not decompress gets REJECT at once: "Clients
   MUST reject (fail validation) messages containing an incorrect type,
   or invalid payload".
+* **Requests.** The service checks each request against its method's
+  bounds, and it hands the client the method and the request's bytes
+  (`Config.serve`). It sends at most the method's chunk count. The
+  client keeps the request's own count, for example "no more than
+  `count` blocks".
+* **Partial columns.** The service carries the parts metadata and the
+  message of each partial column to the client and back, by block root
+  and column (`PartialColumns`). It gives each peer the first-delivery
+  reward once per block and column.
 * **Forks.** The fork loop follows the schedule (`Forks`). One epoch
   before a fork, it joins the client's kinds under the next digest. At
   the fork, our `Status` and our record take the new digest, and the
@@ -106,73 +119,55 @@ inductive Event where
   | connected (peer : PeerId) (outbound : Bool)
   /-- A peer's last session ended. -/
   | disconnected (peer : PeerId)
-  /-- A peer's `Status`, from either side of the handshake. -/
-  | status (peer : PeerId) (s : Status)
+  /-- A peer's `Status`, from either side of the handshake: its 92 bytes
+  of SSZ. -/
+  | status (peer : PeerId) (status : ByteArray)
   /-- A held gossip message: its kind, its message id, its propagation
   source, and its SSZ, decompressed. The client answers with `report`. -/
   | gossip (kind : Kind) (id : MessageId) (source : PeerId) (ssz : ByteArray)
   /-- A peer said Goodbye. -/
   | goodbye (peer : PeerId) (reason : Nat)
   /-- A peer's Ping answer named a newer `seq_number`, and its MetaData v3
-  arrived. -/
-  | metaData (peer : PeerId) (md : MetaData)
+  arrived: the `seq_number` of the Ping and the 25 bytes of SSZ. -/
+  | metaData (peer : PeerId) (seq : Nat) (metaData : ByteArray)
   /-- A peer did not answer our Ping. The spec lets the client end the
   connection ("MAY disconnect"); the service leaves that to the client
   (`Service.disconnect`). -/
   | unresponsive (peer : PeerId)
-
-/-- A block, column, or light-client request that a peer sent us. -/
-inductive Inbound where
-  | blocksByRange (startSlot count : Nat)
-  | blocksByRoot (roots : List ByteArray)
-  /-- The ancestry of `root`, inclusive, newest first, at most `count`
-  blocks (fulu, "BeaconBlocksByHead v1"). -/
-  | blocksByHead (root : ByteArray) (count : Nat)
-  | columnsByRange (startSlot count : Nat) (columns : List Nat)
-  /-- The raw SSZ of a `DataColumnsByRootIdentifiers` list. -/
-  | columnsByRoot (ssz : ByteArray)
-  /-- The `LightClientBootstrap` of a block root. -/
-  | lightClientBootstrap (root : ByteArray)
-  /-- The `LightClientUpdate`s of the sync committee periods
-  `[startPeriod, startPeriod + count)`. -/
-  | lightClientUpdatesByRange (startPeriod count : Nat)
-  /-- The latest `LightClientFinalityUpdate`. -/
-  | lightClientFinalityUpdate
-  /-- The latest `LightClientOptimisticUpdate`. -/
-  | lightClientOptimisticUpdate
-
-/-- The most success chunks that the answer to a request may hold,
-below the method's own cap (`Method.maxChunks`). A block range holds
-at most `count` blocks ("The response MUST contain no more than `count`
-blocks", phase0), and a head walk at most `count` blocks (fulu). A root
-list gets a block per root it names. A column range gets a sidecar of
-each requested column at each slot of the range. A column root list has
-only the method's cap. -/
-def Inbound.limit : Inbound → Option Nat
-  | .blocksByRange _ count => some count
-  | .blocksByRoot roots => some roots.length
-  | .blocksByHead _ count => some count
-  | .columnsByRange _ count columns => some (count * columns.length)
-  | .columnsByRoot _ => none
-  | .lightClientUpdatesByRange _ count => some count
-  | .lightClientBootstrap _ | .lightClientFinalityUpdate | .lightClientOptimisticUpdate => some 1
-
-/-- Whether the answer to a request is one chunk or an error. A
-light-client request that the client cannot answer gets
-`ResourceUnavailable`: "When no `LightClientFinalityUpdate` is
-available, peers SHOULD respond with error code
-`3: ResourceUnavailable`", and the same for the bootstrap and the
-optimistic update. -/
-def Inbound.oneOrError : Inbound → Bool
-  | .lightClientBootstrap _ | .lightClientFinalityUpdate | .lightClientOptimisticUpdate => true
-  | _ => false
+  /-- A partial message on a column topic: the column, the block root of
+  its group, the source, the parts metadata, and the message, each as
+  it arrived. The client decodes and validates them, answers with
+  `Service.judgePartialColumn`, and sends what the peer lacks through
+  `Service.sendPartialColumn`. -/
+  | partialColumn (column : Nat) (root : ByteArray) (source : PeerId)
+      (metadata : Option ByteArray) (message : Option ByteArray)
+  /-- The heartbeat's partial gossip on a column topic: these peers take
+  partial messages there, and they get our parts metadata in place of
+  an IHAVE (`partial-messages.md`, "Partial Message Gossip"). The client
+  sends its metadata of each block it holds through
+  `Service.sendPartialColumn`. -/
+  | partialGossip (column : Nat) (peers : List PeerId)
 
 /-- The answer of one chunk to an inbound request: the context bytes,
 the `ForkDigest` of the chunk's epoch, and the SSZ. It answers `false`
-when the stream failed or the answer holds its most chunks
-(`Inbound.limit`), and the client should stop then. The service never
+when the stream failed or the answer holds the method's most chunks
+(`Method.maxChunks`), and the client should stop then. The service never
 sends a chunk past that cap. -/
 abbrev Emit := ByteArray → ByteArray → Async Bool
+
+/-- Our `MetaData`, as the client encodes it. The service answers Ping
+with `seq`, and MetaData v3 and v2 with the bytes. `seq` is the
+`seq_number` inside the bytes. -/
+structure MetaData where
+  seq : Nat
+  /-- The SSZ of `MetaData` v3, 25 bytes. -/
+  v3 : ByteArray
+  /-- The SSZ of `MetaData` v2, 17 bytes. -/
+  v2 : ByteArray
+
+/-- The bytes have their widths. -/
+def MetaData.wellFormed (m : MetaData) : Bool :=
+  m.v3.size == metaDataV3Len && m.v2.size == metaDataV2Len
 
 /-- How the client ends its answer to a block or column request. An
 error ends the answer with one error chunk, after the chunks emitted
@@ -182,8 +177,8 @@ code", phase0). The message goes out cut at the 256 bytes of
 inductive Ending where
   /-- The chunks emitted are the whole answer. -/
   | done
-  /-- `1: InvalidRequest`: the request parses, and the client finds it
-  invalid. -/
+  /-- `1: InvalidRequest`: the request does not parse, or the client
+  finds it invalid. -/
   | invalidRequest (message : String)
   /-- `2: ServerError`: the client failed to answer. -/
   | serverError (message : String)
@@ -204,7 +199,15 @@ where
 
 /-- The service's configuration. -/
 structure Config where
+  /-- The fork schedule and the slot timing. -/
   chain : Chain
+  /-- Our first `Status`, its 92 bytes of SSZ. The service writes our
+  digest over its first 4 bytes. The client keeps it current
+  (`Service.setStatus`). -/
+  status : ByteArray
+  /-- Our first `MetaData`. The client keeps it current
+  (`Service.setMetaData`). -/
+  metaData : MetaData
   /-- The secp256k1 key: the libp2p identity and the ENR key. -/
   key : PrivKey
   /-- The IPv4 address the service binds and names in its ENR. -/
@@ -235,13 +238,23 @@ structure Config where
   scoring : Bool := true
   /-- The events. Must not park. -/
   onEvent : Event → BaseIO Unit := fun _ => pure ()
-  /-- The client's answer to a block, column, or light-client request.
-  It emits the chunks it has, in the order the method requires, and it
-  names how the answer ends. The default emits none, which the spec
-  allows ("Clients MAY limit the number of blocks in the response").
-  For a light-client request with no chunk, the service then answers
-  `ResourceUnavailable` (`Inbound.oneOrError`). -/
-  serve : PeerId → Inbound → Emit → Async Ending := fun _ _ _ => pure .done
+  /-- Our partial-messages choice on the column subnets (fulu
+  `partial-columns/p2p-interface.md`). With `requests`, peers that can
+  send partial columns send them in place of full sidecars, so the
+  client must take `Event.partialColumn` and rebuild the columns. With
+  `supports` alone, the client sends partial columns to peers that ask,
+  and receives full sidecars. The default takes full sidecars only, so
+  a client that cannot rebuild columns still gets every column. -/
+  partialColumns : Gossipsub.Core.PartialOpts := {}
+  /-- The client's answer to a request of one of `servedMethods`: the
+  method and the request's bytes, within the method's bounds. It emits
+  the chunks it has, in the order the method requires, and it names how
+  the answer ends. A request that does not parse gets
+  `.invalidRequest`. The default emits none, which the spec allows
+  ("Clients MAY limit the number of blocks in the response"). For a
+  method of `oneOrErrorMethods` with no chunk, the service then answers
+  `ResourceUnavailable`. -/
+  serve : PeerId → Method → ByteArray → Emit → Async Ending := fun _ _ _ _ => pure .done
 
 /-- Milliseconds since the Unix epoch. -/
 def wallMs : IO Nat := do
@@ -249,18 +262,17 @@ def wallMs : IO Nat := do
 
 /-- The fork digest of the wall-clock epoch. -/
 def digestNow (c : Chain) : IO ByteArray := do
-  match c.forkDigest (c.epochAt (← wallMs)) with
-  | .ok d => return d
-  | .error _ => throw (IO.userError "eth2: the SHA-256 of the fork digest failed")
+  return c.forkDigest (c.epochAt (← wallMs))
 
 /-- The parts that every handler reaches: the host and the small state. -/
 structure Base where
   config : Config
   host : Libp2p.Host.Host
-  /-- Our `Status`, which the client keeps current (`setStatus`). -/
-  status : OnceRef Status
-  /-- Our `MetaData.seq_number`. -/
-  metaSeq : OnceRef Nat
+  /-- Our `Status`, which the client keeps current (`setStatus`). Its
+  first 4 bytes are our digest. -/
+  status : OnceRef ByteArray
+  /-- Our `MetaData`, which the client keeps current (`setMetaData`). -/
+  metaData : OnceRef MetaData
   /-- The request slots of each peer: `MAX_CONCURRENT_REQUESTS` per
   protocol id (`Limiter`). -/
   limiters : OnceRef (List (PeerId × Limiter))
@@ -312,27 +324,21 @@ def successOf : Except ReqResp.Error (List Chunk) → Option ByteArray
 /-- Say Goodbye with `reason`. The answer, zero chunks or one, has no
 use here. -/
 def goodbye (b : Base) (peer : PeerId) (reason : Nat) : Async Unit := do
-  discard <| b.request peer goodbyeMethod (some (Chain.le64 reason))
+  discard <| b.request peer goodbyeMethod (some (le64 reason))
 
-/-- Act on a peer's `Status`: report it, and end a peer of another
-fork. -/
-def onStatus (b : Base) (peer : PeerId) (st : Status) : Async Unit := do
+/-- Act on a peer's `Status`, which the method's bounds hold at 92
+bytes: report it, and end a peer of another fork. -/
+def onStatus (b : Base) (peer : PeerId) (st : ByteArray) : Async Unit := do
   (b.config.onEvent (.status peer st) : BaseIO Unit)
-  let ours ← (b.status.get : BaseIO Status)
-  if st.forkDigest != ours.forkDigest then
+  let ours ← (b.status.get : BaseIO ByteArray)
+  if statusDigest st != statusDigest ours then
     b.goodbye peer Constants.goodbyeIrrelevantNetwork
     discard <| (b.host.closePeer peer : BaseIO Bool)
 
 /-- Send our `Status`, the dialer's duty. -/
 def sendStatus (b : Base) (peer : PeerId) : Async Unit := do
-  let ours ← (b.status.get : BaseIO Status)
-  let answer ← b.request peer statusMethod (some ours.encode)
-  if let some st := (successOf answer).bind Status.decode? then b.onStatus peer st
-
-/-- Our `MetaData`. -/
-def metaData (b : Base) : BaseIO MetaData := do
-  return { seqNumber := ← b.metaSeq.get, attnets := b.config.advert.attnets,
-           syncnets := b.config.advert.syncnets, custodyGroupCount := b.config.advert.cgc }
+  let ours ← (b.status.get : BaseIO ByteArray)
+  if let some st := successOf (← b.request peer statusMethod (some ours)) then b.onStatus peer st
 
 /-- One success chunk with no context. -/
 def plain (payload : ByteArray) : Chunk := ⟨.success, ByteArray.empty, payload⟩
@@ -344,58 +350,34 @@ def handlerOf (b : Base) (m : Method)
   ReqResp.streamingHandler m Clock.system b.config.requestTimeoutMs fun ctx payload emit =>
     respond ctx.remotePeer payload emit
 
-/-- The `InvalidRequest` chunk of a request that does not parse. -/
-def invalid : Chunk := ⟨.invalidRequest, ByteArray.empty, "malformed request".toUTF8⟩
+/-- The `ResourceUnavailable` chunk of a one-chunk method with no data. -/
+def unavailable : Chunk :=
+  ⟨.resourceUnavailable, ByteArray.empty, "no data".toUTF8⟩
 
-/-- The inbound request of a method's payload, when it parses. -/
-def inboundOf (m : Method) (p : ByteArray) : Option Inbound :=
-  if m.id == blocksByRangeMethod.id then
-    if p.size == 24 then some (.blocksByRange (le64At p 0) (le64At p 8)) else none
-  else if m.id == blocksByHeadMethod.id then
-    if p.size == 40 then some (.blocksByHead (p.extract 0 32) (le64At p 32)) else none
-  else if m.id == blocksByRootMethod.id then
-    if p.size % 32 == 0 then
-      some (.blocksByRoot ((List.range (p.size / 32)).map fun i => p.extract (32 * i) (32 * i + 32)))
-    else none
-  else if m.id == columnsByRangeMethod.id then
-    if 20 ≤ p.size && (p.size - 20) % 8 == 0 && le64At (p.extract 16 20 ++ ⟨#[0, 0, 0, 0]⟩) 0 == 20 then
-      some (.columnsByRange (le64At p 0) (le64At p 8)
-        ((List.range ((p.size - 20) / 8)).map fun i => le64At p (20 + 8 * i)))
-    else none
-  else if m.id == columnsByRootMethod.id then some (.columnsByRoot p)
-  else if m.id == lightClientBootstrapMethod.id then
-    if p.size == 32 then some (.lightClientBootstrap p) else none
-  else if m.id == lightClientUpdatesByRangeMethod.id then
-    if p.size == 16 then some (.lightClientUpdatesByRange (le64At p 0) (le64At p 8)) else none
-  else if m.id == lightClientFinalityUpdateMethod.id then some .lightClientFinalityUpdate
-  else if m.id == lightClientOptimisticUpdateMethod.id then some .lightClientOptimisticUpdate
-  else none
+/-- The handler of a method the client answers. -/
+def serveMethod (b : Base) (m : Method) : Libp2p.Core.StreamHandler :=
+  b.handlerOf m fun peer payload emit => do
+    let sent ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
+    let ending ← b.config.serve peer m (payload.getD ByteArray.empty) fun context ssz => do
+      -- A slot under the cap, taken in one update: a chunk past the
+      -- cap breaks the spec's bound, so it never goes out.
+      let room ← (sent.updateGet fun n => if n < m.maxChunks then (true, n + 1) else (false, n) :
+        BaseIO Bool)
+      if !room then return false
+      return (← emit ⟨.success, context, ssz⟩) matches .ok _
+    match ending.chunk? with
+    | some c => discard <| emit c
+    | none =>
+      -- A one-chunk method with no chunk gets the error code the spec
+      -- asks for (`oneOrErrorMethods`).
+      if oneOrErrorMethods.any (·.id == m.id) && (← (sent.get : BaseIO Nat)) == 0 then
+        discard <| emit unavailable
 
 /-- The handlers of the req/resp methods. -/
 def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
-  let serveMethod (m : Method) := b.handlerOf m fun peer payload emit => do
-    match inboundOf m (payload.getD ByteArray.empty) with
-    | none => discard <| emit invalid
-    | some req =>
-      let cap := min (req.limit.getD m.maxChunks) m.maxChunks
-      let sent ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
-      let ending ← b.config.serve peer req fun context ssz => do
-        -- A slot under the cap, taken in one update: a chunk past the
-        -- cap breaks the spec's bound, so it never goes out.
-        let room ← (sent.updateGet fun n => if n < cap then (true, n + 1) else (false, n) :
-          BaseIO Bool)
-        if !room then return false
-        return (← emit ⟨.success, context, ssz⟩) matches .ok _
-      match ending.chunk? with
-      | some c => discard <| emit c
-      | none =>
-        -- A light-client request with no chunk gets the error code the
-        -- spec asks for (`Inbound.oneOrError`).
-        if req.oneOrError && (← (sent.get : BaseIO Nat)) == 0 then
-          discard <| emit ((Ending.resourceUnavailable "no light client data").chunk?.getD invalid)
   [b.handlerOf statusMethod fun peer payload emit => do
-      discard <| emit (plain (← (b.status.get : BaseIO Status)).encode)
-      if let some st := payload.bind Status.decode? then
+      discard <| emit (plain (← (b.status.get : BaseIO ByteArray)))
+      if let some st := payload then
         -- The answer goes first, so a Goodbye after it finds a peer
         -- that has our Status.
         (b.tasks.spawn (b.onStatus peer st) : BaseIO Unit),
@@ -403,11 +385,11 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
       -- A Ping of the peer counts as our check of it too.
       let now ← (IO.monoMsNow : BaseIO Nat)
       (b.peers.update (·.pinged peer now) : BaseIO Unit)
-      discard <| emit (plain (Chain.le64 (← (b.metaSeq.get : BaseIO Nat)))),
+      discard <| emit (plain (le64 (← (b.metaData.get : BaseIO MetaData)).seq)),
    b.handlerOf metadataV3Method fun _ _ emit => do
-      discard <| emit (plain (← b.metaData).encodeV3),
+      discard <| emit (plain (← (b.metaData.get : BaseIO MetaData)).v3),
    b.handlerOf metadataV2Method fun _ _ emit => do
-      discard <| emit (plain (← b.metaData).encodeV2),
+      discard <| emit (plain (← (b.metaData.get : BaseIO MetaData)).v2),
    b.handlerOf goodbyeMethod fun peer payload emit => do
       let reason := match payload with
         | some p => if p.size == 8 then le64At p 0 else 0
@@ -415,25 +397,15 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
       -- "The response MUST consist of a single `response_chunk`" (phase0,
       -- "Goodbye v1"). Lodestar answers 0 and expects one chunk back;
       -- Lighthouse answers nothing.
-      discard <| emit (plain (Chain.le64 0))
-      (b.config.onEvent (.goodbye peer reason) : BaseIO Unit),
-   serveMethod blocksByRangeMethod,
-   serveMethod blocksByRootMethod,
-   serveMethod blocksByHeadMethod,
-   serveMethod columnsByRangeMethod,
-   serveMethod columnsByRootMethod,
-   serveMethod lightClientBootstrapMethod,
-   serveMethod lightClientUpdatesByRangeMethod,
-   serveMethod lightClientFinalityUpdateMethod,
-   serveMethod lightClientOptimisticUpdateMethod]
+      discard <| emit (plain (le64 0))
+      (b.config.onEvent (.goodbye peer reason) : BaseIO Unit)] ++
+  servedMethods.map b.serveMethod
 
 /-- The protocol ids the identify answer lists. -/
 def servedIds : List String :=
-  [Identify.protocolId, Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId,
-   statusMethod.id, goodbyeMethod.id, pingMethod.id, metadataV3Method.id, metadataV2Method.id,
-   blocksByRangeMethod.id, blocksByRootMethod.id, blocksByHeadMethod.id, columnsByRangeMethod.id,
-   columnsByRootMethod.id, lightClientBootstrapMethod.id, lightClientUpdatesByRangeMethod.id,
-   lightClientFinalityUpdateMethod.id, lightClientOptimisticUpdateMethod.id].map (·.toString)
+  ([Identify.protocolId, Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId] ++
+    ([statusMethod, goodbyeMethod, pingMethod, metadataV3Method, metadataV2Method] ++
+      servedMethods).map (·.id)).map (·.toString)
 
 /-- Report the host's sessions, and send `Status` on each outbound one.
 A replaced session raises `disconnected` while the peer stays
@@ -487,15 +459,14 @@ partial def discover (b : Base) (disc : Discv5.Node) (stopping : Chan Unit) : As
 MetaData v3 request, and its answer becomes `Event.metaData`. No
 answer, or one that is not 8 bytes, becomes `Event.unresponsive`. -/
 def ping (b : Base) (peer : PeerId) : Async Unit := do
-  let ours ← (b.metaSeq.get : BaseIO Nat)
-  let some seq := (successOf (← b.request peer pingMethod (some (Chain.le64 ours)))).bind
+  let ours := (← (b.metaData.get : BaseIO MetaData)).seq
+  let some seq := (successOf (← b.request peer pingMethod (some (le64 ours)))).bind
       fun p => if p.size == 8 then some (le64At p 0) else none
     | (b.config.onEvent (.unresponsive peer) : BaseIO Unit)
   unless (← (b.peers.get : BaseIO Peers)).seqNews peer seq do return
-  let some md := (successOf (← b.request peer metadataV3Method none)).bind MetaData.decodeV3?
-    | return
-  (b.peers.update (·.setMeta peer md.seqNumber) : BaseIO Unit)
-  (b.config.onEvent (.metaData peer md) : BaseIO Unit)
+  let some md := successOf (← b.request peer metadataV3Method none) | return
+  (b.peers.update (·.setMeta peer seq) : BaseIO Unit)
+  (b.config.onEvent (.metaData peer seq md) : BaseIO Unit)
 
 /-- The pause of the liveness loop between two looks at the table. The
 intervals are 15 s and 20 s, so a look each second keeps a Ping within
@@ -534,6 +505,22 @@ structure Service where
   /-- The active validator count and the slot of the last
   `updateScores`, for the score parameters of new topics. -/
   scoreInputs : OnceRef (Nat × Nat)
+  /-- The first-delivery rewards of partial columns
+  (`PartialColumns.Rewards`). -/
+  partials : OnceRef PartialColumns.Rewards
+
+/-- The column topics of every digest of the schedule from `epoch` on,
+by name. -/
+def columnTopicNames (c : Chain) (epoch : Nat) : Std.HashSet String :=
+  (c.digestsFrom epoch).foldl (fun set d =>
+    (List.range Constants.dataColumnSidecarSubnetCount).foldl
+      (fun set i => set.insert (topicOf d (.dataColumnSidecar i))) set) {}
+
+/-- The column of a column topic. -/
+def columnOf? (topic : TopicId) : Option Nat :=
+  match topicParse? topic.name with
+  | some (_, .dataColumnSidecar i) => some i
+  | _ => none
 
 namespace Service
 
@@ -558,10 +545,9 @@ def performFork (s : Service) (epoch : Nat) : ForkAction → Async Unit
       discard <| s.join d k
   | .switch old new => do
     let cfg := s.base.config
-    (s.base.status.update fun st => { st with forkDigest := new } : BaseIO Unit)
+    (s.base.status.update (withDigest · new) : BaseIO Unit)
     -- The record names the new digest, the next fork, and `nfd`.
-    if let .ok pairs := advertPairs cfg.chain epoch cfg.advert then
-      discard <| (s.disc.updateEnr pairs : BaseIO Bool)
+    discard <| (s.disc.updateEnr (advertPairs cfg.chain epoch cfg.advert) : BaseIO Bool)
     -- "Peers who propagate messages on the pre-fork topics MUST NOT be
     -- scored negatively": the pre-fork topics lose their parameters.
     for k in ← (s.kinds.get : BaseIO (List Kind)) do
@@ -573,10 +559,7 @@ def performFork (s : Service) (epoch : Nat) : ForkAction → Async Unit
 /-- One look of the fork loop at `epoch`: the transition and its duties. -/
 def forkTick (s : Service) (epoch : Nat) : Async Unit := do
   let chain := s.base.config.chain
-  let acts ← (s.forks.updateGet fun st =>
-    match ForkState.step chain epoch st with
-    | .ok (acts, st') => (acts, st')
-    | .error _ => ([], st) : BaseIO (List ForkAction))
+  let acts ← (s.forks.updateGet (ForkState.step chain epoch) : BaseIO (List ForkAction))
   for a in acts do s.performFork epoch a
 
 /-- The pause of the fork loop between two looks at the clock. -/
@@ -599,6 +582,12 @@ private def orThrow {ε α : Type} (what : String) : Except ε α → IO α
 /-- Start the service: the host and its handlers, the listeners, the
 gossipsub node, and discv5 with our record. -/
 def start (cfg : Config) : Async Service := do
+  unless cfg.chain.wellFormed do
+    throw (IO.userError "eth2: the fork schedule is not well formed (Chain.wellFormed)")
+  unless cfg.status.size == statusLen do
+    throw (IO.userError s!"eth2: the Status must have {statusLen} bytes")
+  unless cfg.metaData.wellFormed do
+    throw (IO.userError "eth2: the MetaData bytes do not have their widths")
   let pub ← orThrow "the key has no public form" cfg.key.toPublic
   let scalar ← if h : cfg.key.keyType = .secp256k1 then pure (cfg.key.secp256k1Scalar h)
     else throw (IO.userError "eth2: the key must be secp256k1, the key of ENR scheme v4")
@@ -633,14 +622,11 @@ def start (cfg : Config) : Async Service := do
     muxers := [Libp2p.Mux.yamux, Libp2p.Mux.mplex] }
   let host ← orThrow "the host does not start" (← (Libp2p.Host.Host.new hostCfg : BaseIO _))
   let epoch := cfg.chain.epochAt (← wallMs)
-  let digest ← orThrow "the fork digest fails" (cfg.chain.forkDigest epoch)
-  -- The genesis checkpoint has the zero root (phase0 "Status v1"), until
-  -- the client's first `setStatus`.
-  let zero : ByteArray := ⟨Array.replicate 32 0⟩
+  let digest := cfg.chain.forkDigest epoch
   let base : Base := {
     config := cfg, host
-    status := ← OnceRef.new ⟨digest, zero, 0, zero, 0, 0⟩
-    metaSeq := ← OnceRef.new 0
+    status := ← OnceRef.new (withDigest cfg.status digest)
+    metaData := ← OnceRef.new cfg.metaData
     limiters := ← OnceRef.new []
     peers
     tasks := ← TaskSet.new }
@@ -658,14 +644,32 @@ def start (cfg : Config) : Async Service := do
     match Snappy.decompress data Constants.maxPayloadSize with
     | .ok ssz => cfg.onEvent (.gossip kind id src ssz)
     | .error _ => discard <| n.report id src .reject
-  let params := if cfg.scoring then
+  let base0 := if cfg.scoring then
       Scoring.scoredParams cfg.chain digest cfg.chain.slotsPerEpoch 0
     else gossipParams cfg.chain
+  -- The column topics of every digest ahead take the client's choice,
+  -- so a fork needs no change of the router's parameters.
+  let partialTopics :=
+    Gossipsub.Core.PartialTopics.ofSet (columnTopicNames cfg.chain epoch) cfg.partialColumns
+  let params := { base0 with partialTopics }
+  -- Partial columns: the callbacks hand the bytes to the client, and
+  -- `onEvent` does not park, so the gossipsub loop never waits.
+  let partials ← (OnceRef.new ({} : PartialColumns.Rewards) : BaseIO _)
+  let onPartial : PeerId → Gossipsub.Rpc.PartialMessage → BaseIO Unit := fun src pm => do
+    let topic : TopicId := ⟨(pm.topicId.bind fun b => Bytes.toString? (Bytes.ofNatList b)).getD ""⟩
+    let some column := columnOf? topic | return
+    -- "Implementations MUST ignore unknown versions."
+    let some root := (pm.groupId.map Bytes.ofNatList).bind PartialColumns.rootOf? | return
+    cfg.onEvent (.partialColumn column root src (pm.partsMetadata.map Bytes.ofNatList)
+      (pm.partialMessage.map Bytes.ofNatList))
+  let onPartialGossip : TopicId → List PeerId → BaseIO Unit := fun topic peers => do
+    let some column := columnOf? topic | return
+    cfg.onEvent (.partialGossip column peers)
   let gossip ← (Gossipsub.Node.start (Gossipsub.HostSeam.ofHost host)
     { params
       maxRpcSize := Constants.gossipMaxMessageSize
       payloadId := some messageId
-      onValidate } : BaseIO _)
+      onValidate, onPartial, onPartialGossip } : BaseIO _)
   (nodeRef.set (some gossip) : BaseIO Unit)
   -- The listeners.
   let tcpAt ← orThrow "the TCP address" (Enr.address .ip4 cfg.ip .tcp cfg.tcpPort)
@@ -682,7 +686,7 @@ def start (cfg : Config) : Async Service := do
     "leanp2p") : BaseIO Unit)
   -- Discovery, with the consensus fields and the libp2p ports in our
   -- record. discv5 writes `ip` and `udp` itself.
-  let advert ← orThrow "the ENR fields" (advertPairs cfg.chain epoch cfg.advert)
+  let advert := advertPairs cfg.chain epoch cfg.advert
   let ports ← orThrow "the ENR ports" (Enr.consensusPairs listenAddrs)
   let disc ← Discv5.Node.start scalar cfg.ip cfg.discPort (advert ++ ports)
   for r in cfg.bootEnrs do
@@ -695,7 +699,8 @@ def start (cfg : Config) : Async Service := do
     base, gossip, disc, listenAddrs, stopping
     forks := ← OnceRef.new { current := digest }
     kinds := ← OnceRef.new []
-    scoreInputs := ← OnceRef.new (cfg.chain.slotsPerEpoch, 0) }
+    scoreInputs := ← OnceRef.new (cfg.chain.slotsPerEpoch, 0)
+    partials }
   -- The first look at the schedule runs now, so a fork one epoch away
   -- finds its topics joined before the first subscribe.
   s.forkTick epoch
@@ -751,12 +756,62 @@ def publish (s : Service) (k : Kind) (ssz : ByteArray) : IO Bool := do
   | .ok data => s.gossip.publish (← s.topic k) data
   | .error _ => return false
 
-/-- Our `Status` from the client's chain. The digest is ours in the fork
-schedule, the one our topics carry. -/
-def setStatus (s : Service) (finalizedRoot : ByteArray) (finalizedEpoch : Nat)
-    (headRoot : ByteArray) (headSlot earliestAvailableSlot : Nat) : IO Unit := do
-  let forkDigest := (← s.forks.get).current
-  s.base.status.set { forkDigest, finalizedRoot, finalizedEpoch, headRoot, headSlot, earliestAvailableSlot }
+/-- The peers to offer partial messages on the topic of `column`, each
+with its request flag (`Node.partialPeers`). The full
+`DataColumnSidecar` goes through `publish`. The router skips the peers
+that requested partial messages when it sends it, as the spec asks
+("Avoid forwarding the full `DataColumnSidecar` message to peers that
+requested partial messages"). `none` when the node does not answer. -/
+def partialColumnPeers (s : Service) (column : Nat) :
+    Async (Option (List (PeerId × Bool))) := do
+  s.gossip.partialPeers (← (s.topic (.dataColumnSidecar column) : BaseIO TopicId))
+
+/-- Send a partial message on the topic of `column` to `peer`: the group
+of the block `root`, and the client's parts metadata and message, each
+the SSZ the client encodes. The router sends the metadata alone to a
+peer that only supports partial messages there, and nothing to a peer
+that takes none. Each call only queues. `false` when the node does not
+take it. -/
+def sendPartialColumn (s : Service) (peer : PeerId) (root : ByteArray) (column : Nat)
+    (metadata message : Option ByteArray) : BaseIO Bool := do
+  let topic ← s.topic (.dataColumnSidecar column)
+  s.gossip.sendPartial peer
+    { topicId := some (Bytes.toNatList topic.name.toUTF8)
+      groupId := some (Bytes.toNatList (PartialColumns.groupIdOf root))
+      partialMessage := message.map Bytes.toNatList
+      partsMetadata := metadata.map Bytes.toNatList }
+
+/-- The client's answer to a partial column (`Event.partialColumn`).
+Invalid data costs the peer an invalid delivery ("On receiving invalid
+data, the client should report to gossipsub an invalid message
+delivery"). Valid data earns the first-delivery reward once per peer,
+block, and column (`PartialColumns.Rewards.earn`), as the spec asks:
+"Clients SHOULD limit the rate at which a peer gets the first message
+delivery reward". -/
+def judgePartialColumn (s : Service) (peer : PeerId) (root : ByteArray) (column : Nat)
+    (valid : Bool) : BaseIO Bool := do
+  let topic ← s.topic (.dataColumnSidecar column)
+  if !valid then return ← s.gossip.judgePartial peer topic false
+  let earns ← s.partials.updateGet (·.earn peer root column)
+  if earns then s.gossip.judgePartial peer topic true else return true
+
+/-- Our `Status`, its 92 bytes of SSZ, from the client's chain. The
+service writes our digest over its first 4 bytes, the digest our topics
+carry. It takes the digest from the stored `Status` in the same update,
+so a fork switch between two calls cannot leave the old digest.
+`false`, and no change, for another width. -/
+def setStatus (s : Service) (status : ByteArray) : BaseIO Bool := do
+  if status.size != statusLen then return false
+  s.base.status.update fun old => withDigest status (statusDigest old)
+  return true
+
+/-- Our `MetaData`. Peers learn of the change from our next Ping
+answer. `false`, and no change, when the bytes do not have their
+widths. -/
+def setMetaData (s : Service) (m : MetaData) : BaseIO Bool := do
+  if !m.wellFormed then return false
+  s.base.metaData.set m
+  return true
 
 /-- Send one request to a peer, and collect its chunks. -/
 def request (s : Service) (peer : PeerId) (m : Method) (payload : Option ByteArray) :

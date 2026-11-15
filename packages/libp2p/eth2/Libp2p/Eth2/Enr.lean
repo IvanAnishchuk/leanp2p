@@ -51,13 +51,12 @@ structure Advert where
 private def bytesItem (b : ByteArray) : Rlp.Item := .bytes (b.toList.map (·.toNat))
 
 /-- The consensus pairs of the node's record at `epoch`. -/
-def advertPairs (c : Chain) (epoch : Nat) (a : Advert) :
-    Except Crypto.CryptoError (List Enr.Pair) := do
-  return [⟨eth2Key, bytesItem (← c.enrForkId epoch)⟩,
-          ⟨attnetsKey, bytesItem a.attnets⟩,
-          ⟨syncnetsKey, bytesItem a.syncnets⟩,
-          ⟨cgcKey, .bytes (Rlp.ofScalar a.cgc)⟩,
-          ⟨nfdKey, bytesItem (← c.nextForkDigest epoch)⟩]
+def advertPairs (c : Chain) (epoch : Nat) (a : Advert) : List Enr.Pair :=
+  [⟨eth2Key, bytesItem (c.enrForkId epoch)⟩,
+   ⟨attnetsKey, bytesItem a.attnets⟩,
+   ⟨syncnetsKey, bytesItem a.syncnets⟩,
+   ⟨cgcKey, .bytes (Rlp.ofScalar a.cgc)⟩,
+   ⟨nfdKey, bytesItem (c.nextForkDigest epoch)⟩]
 
 /-- The byte string under `k`, or `none`. -/
 def bytesOf? (r : Enr) (k : Enr.Key) : Option ByteArray :=
@@ -92,15 +91,11 @@ def bitSet (b : ByteArray) (i : Nat) : Bool :=
 
 /-- The record's digest is our digest at `epoch`. -/
 def sameDigest (c : Chain) (epoch : Nat) (r : Enr) : Bool :=
-  match c.forkDigest epoch, forkDigest? r with
-  | .ok ours, some theirs => ours == theirs
-  | _, _ => false
+  forkDigest? r == some (c.forkDigest epoch)
 
 /-- The record's whole `ENRForkID` is ours at `epoch`. -/
 def sameFork (c : Chain) (epoch : Nat) (r : Enr) : Bool :=
-  match c.enrForkId epoch, enrForkId? r with
-  | .ok ours, some theirs => ours == theirs
-  | _, _ => false
+  enrForkId? r == some (c.enrForkId epoch)
 
 #guard bitSet ⟨#[0x80, 0x01]⟩ 7 && bitSet ⟨#[0x80, 0x01]⟩ 8 && !bitSet ⟨#[0x80, 0x01]⟩ 0
 

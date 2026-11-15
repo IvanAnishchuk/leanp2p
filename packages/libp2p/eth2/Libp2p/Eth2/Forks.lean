@@ -19,7 +19,8 @@ pre-fork and a post-fork variant, and the spec asks for three steps:
    from" (`UNSUBSCRIBE_DELAY_EPOCHS`).
 
 A Blob-Parameters-Only fork changes the digest with the same version
-(EIP-7892), so it takes the same three steps.
+(EIP-7892). It is one more entry of the schedule, so it takes the same
+three steps.
 
 "Messages SHOULD NOT be re-broadcast from one fork to the other." The
 router forwards a message on its own topic only, so the rule holds with
@@ -64,9 +65,8 @@ namespace ForkState
 
 /-- The duties at `epoch`, in order, and the next state. A fork the loop
 did not see ahead also subscribes to the new digest at the switch. -/
-def step (c : Chain) (epoch : Nat) (st : ForkState) :
-    Except Crypto.CryptoError (List ForkAction × ForkState) := do
-  let digest ← c.forkDigest epoch
+def step (c : Chain) (epoch : Nat) (st : ForkState) : List ForkAction × ForkState := Id.run do
+  let digest := c.forkDigest epoch
   let mut acts : List ForkAction := []
   let mut st := st
   -- The fork: the digest of the epoch is no longer ours.
@@ -78,7 +78,7 @@ def step (c : Chain) (epoch : Nat) (st : ForkState) :
   -- The lead: the next fork is at most `subscribeLeadEpochs` away.
   let nextEpoch := c.nextForkEpoch epoch
   if nextEpoch != Constants.farFutureEpoch && nextEpoch ≤ epoch + subscribeLeadEpochs then
-    let nextDigest ← c.forkDigest nextEpoch
+    let nextDigest := c.forkDigest nextEpoch
     if st.next != some nextDigest && nextDigest != digest then
       acts := acts ++ [.subscribe nextDigest]
       st := { st with next := some nextDigest }

@@ -5,20 +5,23 @@ import Libp2p.Eth2
 # eth2 suite
 
 The suite checks `libp2p/eth2` in this order:
-- the chain of a devnet config, and its fork digest against the record
-  that a Lighthouse node of that devnet published
+- partial columns: the group ID, the reward rule, and two services that
+  carry the client's bytes
+- the fork schedule that the client hands in, and the record that a
+  Lighthouse node of a devnet published
 - the message id, against SHA-256 values that Python's `hashlib`
   computed from the spec's formula
-- the small req/resp messages
+- the req/resp methods and the fixed places the service reads
+- the score profile, the fork loop, and the peer table
 - two services over loopback: the dial from a boot record, the
-  `Status` handshake, gossip with the held validation, a block request
-  with its context bytes, MetaData, and Goodbye at stop
+  `Status` handshake, gossip with the held validation, the requests the
+  client serves, MetaData, Ping, Goodbye, and bans
 
-The devnet fixture is the shadow node's (`etheorem-shadow-node` at
-`8cd3247`, `helper/tests/fixtures`). The suite keeps the lines of
-`config.yaml` that the chain reads, the genesis validators root, and
-the ENR. Its fork digest `8049f250` is the one Python computes from the
-same values, and the one the record carries.
+The devnet values are the shadow node's (`etheorem-shadow-node` at
+`8cd3247`, `helper/tests/fixtures`): the digest `8049f250`, and the
+record of its Lighthouse node. The service treats every payload as
+opaque bytes, so the checks of the services use filler bytes. Where a
+check plays the client, it writes the few request fields it needs.
 -/
 
 set_option autoImplicit false
@@ -33,78 +36,63 @@ private def expectOk {ε α : Type} (what : String) : Except ε α → IO α
   | .ok a => pure a
   | .error _ => throw (IO.userError s!"{what} failed")
 
-/-! ## The devnet chain and its record -/
+/-! ## The fork schedule and the devnet record -/
 
-/-- The lines of the devnet's `config.yaml` that the chain reads, with
-the comments and the far-future forks of the file. -/
-private def devnetConfig : String :=
-  "PRESET_BASE: 'mainnet'\n" ++
-  "CONFIG_NAME: 'testnet' # needs to exist because of Prysm\n" ++
-  "GENESIS_FORK_VERSION: 0x10000038\n" ++
-  "ALTAIR_FORK_VERSION: 0x20000038\nALTAIR_FORK_EPOCH: 0\n" ++
-  "BELLATRIX_FORK_VERSION: 0x30000038\nBELLATRIX_FORK_EPOCH: 0\n" ++
-  "CAPELLA_FORK_VERSION: 0x40000038\nCAPELLA_FORK_EPOCH: 0\n" ++
-  "DENEB_FORK_VERSION: 0x50000038\nDENEB_FORK_EPOCH: 0\n" ++
-  "ELECTRA_FORK_VERSION: 0x60000038\nELECTRA_FORK_EPOCH: 0\n" ++
-  "FULU_FORK_VERSION: 0x70000038\nFULU_FORK_EPOCH: 0\n" ++
-  "GLOAS_FORK_VERSION: 0x80000038\nGLOAS_FORK_EPOCH: 18446744073709551615\n" ++
-  "SLOT_DURATION_MS: 12000\n" ++
-  "MAX_BLOBS_PER_BLOCK_ELECTRA: 9\n" ++
-  "BLOB_SCHEDULE:\n  - EPOCH: 0\n    MAX_BLOBS_PER_BLOCK: 21\n" ++
-  "DEPOSIT_CHAIN_ID: 3151908\n"
+/-- The devnet's digest. -/
+private def devnetDigest : ByteArray := hex "8049f250"
 
-private def devnetGvr : String := "02f14ddf4f37508bccf9ca39ac94d4a559cfdbd1e94e2f335114be1e50d02a7f"
+/-- The devnet's `ENRForkID`: the digest, Fulu's version as the next
+version, and `FAR_FUTURE_EPOCH`. -/
+private def devnetForkId : ByteArray := hex "8049f25070000038ffffffffffffffff"
 
 /-- The record of a Lighthouse node of the devnet. -/
 private def devnetEnr : String :=
   "enr:-NO4QEamopaXI3y7x4t2Kiir5IR2VxQSTZaH1QSKvsGH3rnBLdpFNQP_-dMWVqyrQakXBc0Ad5yy-W0cce1UHhEKgmMHh2F0dG5ldHOIgAEAAAAAAACDY2djgYCEZXRoMpCASfJQcAAAOP__________gmlkgnY0gmlwhKwQAA2DbmZkhAAAAACEcXVpY4IjKYlzZWNwMjU2azGhAtAWrNSOtz-KzskCSwPbP21-C9qVUN1FCgogvYX0EBtRiHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo"
 
-/-- The first 40 bytes of a `genesis.ssz`. -/
-private def genesisPrefix (time : Nat) : ByteArray := Chain.le64 time ++ hex devnetGvr
+/-- A schedule entry at `epoch` with the filler digest `d d d d`. The
+service compares digests and never computes one. -/
+private def entry (epoch : Nat) (d : UInt8) : ForkEntry :=
+  { epoch, digest := ⟨#[d, d, d, d]⟩, enrForkId := ⟨#[d, d, d, d] ++ Array.replicate 12 0⟩ }
 
-private def devnetChain (time : Nat := 1700000000) : IO Chain :=
-  match Config.chainOf devnetConfig (genesisPrefix time) with
-  | .ok c => pure c
-  | .error e => throw (IO.userError e)
+/-- The devnet's schedule at mainnet timing, with later entries. -/
+private def devnetChain (time : Nat := 1700000000) (later : List ForkEntry := []) : Chain :=
+  { schedule := { epoch := 0, digest := devnetDigest, enrForkId := devnetForkId } :: later
+    slotDurationMs := 12000, slotsPerEpoch := 32, genesisTime := time }
 
 private def chainChecks (r : Runner) : IO Unit := do
-  let c ← devnetChain
-  r.check "eth2: the config gives six scheduled forks after genesis" (c.forks.length == 6)
-  r.check "eth2: the config gives Fulu at epoch 0" (c.fuluEpoch == some 0)
-  r.check "eth2: the config gives the one blob schedule entry"
-    (c.blobSchedule.map (fun b => (b.epoch, b.maxBlobsPerBlock)) == [(0, 21)])
-  r.check "eth2: the config gives the mainnet epoch and the slot length"
-    (c.slotsPerEpoch == 32 && c.slotDurationMs == 12000 && c.maxBlobsElectra == 9)
-  r.check "eth2: the genesis prefix gives the root and the time"
-    (c.genesisValidatorsRoot == hex devnetGvr && c.genesisTime == 1700000000)
-  r.check "eth2: the fork version at epoch 0 is Fulu's" (c.forkVersion 0 == hex "70000038")
-  r.check "eth2: the digest is the one Python computes"
-    ((c.forkDigest 0).toOption == some (hex "8049f250"))
-  r.check "eth2: no fork follows" (c.nextForkEpoch 0 == Constants.farFutureEpoch)
+  let c := devnetChain
+  r.check "eth2: the devnet schedule is well formed" c.wellFormed
+  r.check "eth2: the digest at epoch 0 is the entry's" (c.forkDigest 0 == devnetDigest)
+  r.check "eth2: no fork follows"
+    (c.nextForkEpoch 0 == Constants.farFutureEpoch && c.nextForkDigest 0 == ⟨#[0, 0, 0, 0]⟩)
   let rec_ ← expectOk "the devnet ENR" (Enr.ofText? devnetEnr)
-  r.check "eth2: Lighthouse's record carries our digest" (forkDigest? rec_ == (c.forkDigest 0).toOption)
-  r.check "eth2: Lighthouse's ENRForkID is ours byte for byte"
-    (enrForkId? rec_ == (c.enrForkId 0).toOption)
-  r.check "eth2: Lighthouse's nfd is ours" (bytesOf? rec_ nfdKey == (c.nextForkDigest 0).toOption)
+  r.check "eth2: Lighthouse's record carries the devnet digest" (forkDigest? rec_ == some devnetDigest)
+  r.check "eth2: Lighthouse's ENRForkID is the devnet's byte for byte"
+    (enrForkId? rec_ == some (c.enrForkId 0))
+  r.check "eth2: Lighthouse's nfd is ours" (bytesOf? rec_ nfdKey == some (c.nextForkDigest 0))
   r.check "eth2: the record names a supernode's custody" (cgc? rec_ == some 128)
-  r.check "eth2: the record is of our fork" (sameFork c 0 rec_)
+  r.check "eth2: the record is of our fork" (sameFork c 0 rec_ && sameDigest c 0 rec_)
   r.check "eth2: the record has a dial address"
     (match rec_.dialAddrs with | .ok (_ :: _) => true | _ => false)
-  -- A Blob-Parameters-Only fork at epoch 5: a new digest with the same
-  -- version, and the next fork epoch is the entry's.
-  let bpo := { c with blobSchedule := c.blobSchedule ++ [({ epoch := 5, maxBlobsPerBlock := 48 } : BlobEntry)] }
-  r.check "eth2: a BPO entry is the next fork" (bpo.nextForkEpoch 0 == 5)
-  r.check "eth2: a BPO entry changes the digest"
-    ((bpo.forkDigest 5).toOption != (bpo.forkDigest 0).toOption)
-  r.check "eth2: a BPO entry keeps the version" (bpo.forkVersion 5 == bpo.forkVersion 0)
-  r.check "eth2: the nfd of a BPO entry is its digest"
-    ((bpo.nextForkDigest 0).toOption == (bpo.forkDigest 5).toOption)
-  -- Before Fulu, the digest is the plain fork data root.
-  let early := { c with fuluEpoch := some 10 }
-  r.check "eth2: before Fulu the digest has no blob mask"
-    ((early.forkDigest 0).toOption ==
-      ((Chain.forkDataRoot (early.forkVersion 0) early.genesisValidatorsRoot).toOption.map
-        (·.extract 0 4)))
+  -- A later entry, a Blob-Parameters-Only fork for one: the next fork,
+  -- its digest from its epoch on, and the `nfd` before it.
+  let bpo := devnetChain (later := [entry 5 0xaa])
+  r.check "eth2: a later entry is the next fork" (bpo.nextForkEpoch 0 == 5 && bpo.nextForkEpoch 4 == 5)
+  r.check "eth2: the digest changes at the entry's epoch"
+    (bpo.forkDigest 4 == devnetDigest && bpo.forkDigest 5 == ⟨#[0xaa, 0xaa, 0xaa, 0xaa]⟩)
+  r.check "eth2: the nfd before the entry is its digest" (bpo.nextForkDigest 0 == bpo.forkDigest 5)
+  r.check "eth2: the digests from an epoch on"
+    (bpo.digestsFrom 0 == [devnetDigest, bpo.forkDigest 5] && bpo.digestsFrom 5 == [bpo.forkDigest 5])
+  r.check "eth2: an empty schedule is refused" (!{ c with schedule := [] }.wellFormed)
+  r.check "eth2: a schedule that starts after epoch 0 is refused"
+    (!{ c with schedule := [entry 1 1] }.wellFormed)
+  r.check "eth2: a schedule out of order is refused"
+    (!{ c with schedule := [entry 0 1, entry 7 2, entry 7 3] }.wellFormed)
+  r.check "eth2: a digest of 3 bytes is refused"
+    (!{ c with schedule := [{ entry 0 1 with digest := ⟨#[1, 1, 1]⟩ }] }.wellFormed)
+  r.check "eth2: epoch 1 starts 384 s after genesis, and epoch 0 holds before genesis"
+    (c.epochAt (1700000000 * 1000 + 384000) == 1 && c.epochAt (1700000000 * 1000 + 383999) == 0 &&
+      c.epochAt 0 == 0)
 
 /-! ## The message id -/
 
@@ -122,21 +110,29 @@ private def messageIdChecks (r : Runner) : IO Unit := do
   r.check "eth2: the topic enters the id"
     (messageIdBytes "/eth2/8049f250/voluntary_exit/ssz_snappy" data != messageIdBytes topic data)
 
-/-! ## The small messages -/
+/-! ## The methods -/
 
-private def messageChecks (r : Runner) : IO Unit := do
-  let s : Status := ⟨hex "8049f250", ⟨Array.replicate 32 1⟩, 7, ⟨Array.replicate 32 2⟩, 230, 4⟩
-  let b := s.encode
-  r.check "eth2: Status v2 has 92 bytes" (b.size == statusLen)
-  r.check "eth2: Status v2 reads back"
-    ((Status.decode? b).map (fun t => (t.forkDigest, t.finalizedEpoch, t.headRoot, t.headSlot,
-      t.earliestAvailableSlot)) == some (s.forkDigest, 7, s.headRoot, 230, 4))
-  r.check "eth2: a Status of 84 bytes is refused" (Status.decode? (b.extract 0 84)).isNone
-  let m : MetaData := ⟨3, ⟨#[0x80, 0, 0, 0, 0, 0, 0, 1]⟩, ⟨#[0x0f]⟩, 128⟩
-  r.check "eth2: MetaData v3 has 25 bytes and reads back"
-    (m.encodeV3.size == 25 &&
-      ((MetaData.decodeV3? m.encodeV3).map (fun t => (t.seqNumber, t.custodyGroupCount))) == some (3, 128))
-  r.check "eth2: MetaData v2 has 17 bytes" (m.encodeV2.size == 17)
+private def methodChecks (r : Runner) : IO Unit := do
+  let st : ByteArray := ⟨Array.replicate statusLen 7⟩
+  r.check "eth2: the digest of a Status is its first 4 bytes"
+    (statusDigest (withDigest st devnetDigest) == devnetDigest)
+  r.check "eth2: a new digest keeps the other 88 bytes"
+    ((withDigest st devnetDigest).extract 4 statusLen == st.extract 4 statusLen)
+  r.check "eth2: Status, Ping, Goodbye, and MetaData have their fixed sizes"
+    (statusMethod.request == some (exactly 92) && pingMethod.response == exactly 8 &&
+      goodbyeMethod.request == some (exactly 8) && metadataV3Method.response == exactly 25 &&
+      metadataV2Method.response == exactly 17)
+  r.check "eth2: the fixed requests have their sizes"
+    (blocksByRangeMethod.request == some (exactly 24) && blocksByHeadMethod.request == some (exactly 40) &&
+      lightClientBootstrapMethod.request == some (exactly 32) &&
+      lightClientUpdatesByRangeMethod.request == some (exactly 16))
+  r.check "eth2: a block chunk is bounded by MAX_PAYLOAD_SIZE"
+    (blocksByRangeMethod.response.maxLen == Libp2p.Protocols.Constants.maxPayloadSize)
+  r.check "eth2: the client serves nine methods, three of them one chunk or an error"
+    (servedMethods.length == 9 && oneOrErrorMethods.length == 3 &&
+      oneOrErrorMethods.all fun m => servedMethods.any (·.id == m.id))
+  r.check "eth2: Ping and Goodbye carry a little-endian Uint64"
+    (le64 3 == ⟨#[3, 0, 0, 0, 0, 0, 0, 0]⟩ && le64At (le64 70000) 0 == 70000)
 
 /-! ## Two services over loopback -/
 
@@ -155,7 +151,7 @@ Lighthouse, computed in Python's float64 at mainnet timing (12 s slots,
 scaled by 1000 and rounded half away from zero. -/
 
 private def scoringChecks (r : Runner) : IO Unit := do
-  let c := { (← devnetChain) with slotDurationMs := 12000, slotsPerEpoch := 32 }
+  let c := devnetChain
   let st := Scoring.settings c
   let (block, aggregate, attestation) := Scoring.dynamicParams st 500000 100000
   r.check "scoring: the block topic equals Lighthouse's"
@@ -204,7 +200,7 @@ private def scoringChecks (r : Runner) : IO Unit := do
   r.check "scoring: every scored kind passes the validity check"
     (kinds.all fun k => (Scoring.kindParams st 500000 100000 k).all (·.validB))
   r.check "scoring: the global parameters pass the validity check" g.validB
-  let digest ← expectOk "digest" (c.forkDigest 0)
+  let digest := c.forkDigest 0
   let params := Scoring.scoredParams c digest 500000 100000
   r.check s!"scoring: the router parameters meet the spec's constraints {params.problems}"
     params.problems.isEmpty
@@ -219,17 +215,13 @@ private def scoringChecks (r : Runner) : IO Unit := do
     (topicsPerFork == 205 && params.maxSubscriptionsPerRpc == some 410 &&
       params.maxSubscribedTopics == some 820)
 
-/-! ## The fork schedule -/
+/-! ## The fork loop -/
 
 private def forkChecks (r : Runner) : IO Unit := do
-  let c0 ← devnetChain
-  -- A Blob-Parameters-Only fork at epoch 10 changes the digest.
-  let c := { c0 with blobSchedule := c0.blobSchedule ++
-    [({ epoch := 10, maxBlobsPerBlock := 99 } : BlobEntry)] }
-  let pre ← expectOk "digest" (c.forkDigest 9)
-  let post ← expectOk "digest" (c.forkDigest 10)
-  let run (st : ForkState) (epoch : Nat) : IO (List ForkAction × ForkState) :=
-    expectOk "step" (st.step c epoch)
+  let c := devnetChain (later := [entry 10 0xaa])
+  let pre := c.forkDigest 9
+  let post := c.forkDigest 10
+  let run (st : ForkState) (epoch : Nat) : List ForkAction × ForkState := st.step c epoch
   let isSub (d : ByteArray) : ForkAction → Bool
     | .subscribe d' => d' == d
     | _ => false
@@ -240,36 +232,34 @@ private def forkChecks (r : Runner) : IO Unit := do
     | .unsubscribe d' => d' == d
     | _ => false
   let s0 : ForkState := { current := pre }
-  let (a8, s8) ← run s0 8
+  let (a8, s8) := run s0 8
   r.check "forks: two epochs before the fork, nothing is due" a8.isEmpty
-  let (a9, s9) ← run s8 9
+  let (a9, s9) := run s8 9
   r.check "forks: one epoch before the fork, the post-fork topics are joined"
     (a9.length == 1 && a9.all (isSub post) && s9.next == some post)
-  let (a9b, _) ← run s9 9
+  let (a9b, _) := run s9 9
   r.check "forks: a second look in the same epoch joins nothing" a9b.isEmpty
-  let (a10, s10) ← run s9 10
+  let (a10, s10) := run s9 10
   r.check "forks: at the fork, the digest switches with no second join"
     (a10.length == 1 && a10.all isSwitch && s10.current == post)
-  let (a11, s11) ← run s10 11
+  let (a11, s11) := run s10 11
   r.check "forks: one epoch after the fork, the pre-fork topics stay" a11.isEmpty
-  let (a12, s12) ← run s11 12
+  let (a12, s12) := run s11 12
   r.check "forks: two epochs after the fork, the pre-fork topics go"
     (a12.length == 1 && a12.all (isUnsub pre) && s12.retiring.isEmpty)
-  let (late, _) ← run s8 10
+  let (late, _) := run s8 10
   r.check "forks: a fork the loop did not see ahead joins and switches at once"
     (late.length == 2 && (late.head?.map (isSub post)) == some true &&
       (late.getLast?.map isSwitch) == some true)
-  -- Two BPO forks one epoch apart, at 10 and 11: each pre-fork digest
-  -- goes two epochs after its own fork.
-  let c2 := { c with blobSchedule := c.blobSchedule ++
-    [({ epoch := 11, maxBlobsPerBlock := 100 } : BlobEntry)] }
-  let post2 ← expectOk "digest" (c2.forkDigest 11)
-  let run2 (st : ForkState) (epoch : Nat) : IO (List ForkAction × ForkState) :=
-    expectOk "step" (st.step c2 epoch)
-  let (_, t10) ← run2 s9 10
-  let (_, t11) ← run2 t10 11
-  let (b12, t12) ← run2 t11 12
-  let (b13, t13) ← run2 t12 13
+  -- Two forks one epoch apart, at 10 and 11: each pre-fork digest goes
+  -- two epochs after its own fork.
+  let c2 := devnetChain (later := [entry 10 0xaa, entry 11 0xbb])
+  let post2 := c2.forkDigest 11
+  let run2 (st : ForkState) (epoch : Nat) : List ForkAction × ForkState := st.step c2 epoch
+  let (_, t10) := run2 s9 10
+  let (_, t11) := run2 t10 11
+  let (b12, t12) := run2 t11 12
+  let (b13, t13) := run2 t12 13
   r.check "forks: two forks an epoch apart, each pre-fork digest goes in its turn"
     (t11.current == post2 && b12.length == 1 && b12.all (isUnsub pre) &&
       b13.length == 1 && b13.all (isUnsub post) && t13.retiring.isEmpty)
@@ -304,54 +294,64 @@ private def peersChecks (r : Runner) : IO Unit := do
   r.check "peers: a new ban keeps the table at the cap"
     ((full.ban q 0 5000).bans.length == Constants.maxBans && (full.ban q 0 5000).banned q 10)
 
+/-! ## The client's bytes
+
+Filler bytes stand for the client's SSZ, and the requests carry the few
+fields a check needs, as a client would write them. -/
+
+/-- A `Status` of filler bytes. The service writes the digest. -/
+private def testStatus : ByteArray := ⟨Array.replicate statusLen 0x11⟩
+
+/-- A `MetaData` of filler bytes with `seq_number` 5. -/
+private def testMeta : MetaData :=
+  { seq := 5, v3 := ⟨Array.replicate metaDataV3Len 0x33⟩, v2 := ⟨Array.replicate metaDataV2Len 0x22⟩ }
+
+/-- A `BeaconBlocksByRange` request: `start_slot`, `count`, `step` 1. -/
+private def rangeRequest (start count : Nat) : ByteArray := le64 start ++ le64 count ++ le64 1
+
+/-- The service's client answer of the checks: what a client's `serve`
+does, over filler payloads whose first byte names the chunk. -/
+private def testServe (digest : ByteArray) : PeerId → Libp2p.Protocols.ReqResp.Method → ByteArray →
+    Emit → Async Ending := fun _ m req emit => do
+  -- `count` blocks from `start_slot` on, each with our digest.
+  if m.id == blocksByRangeMethod.id then
+    let start := le64At req 0
+    for i in [0:le64At req 8] do
+      if !(← emit digest ⟨Array.replicate 100 (start + i).toUInt8⟩) then break
+    return .done
+  -- The ancestry of the root, newest first: blocks 9, 8, ... here.
+  else if m.id == blocksByHeadMethod.id then
+    for i in [0:le64At req 32] do
+      discard <| emit digest ⟨Array.replicate 100 (9 - i).toUInt8⟩
+    return .done
+  -- One column, then the end of what we keep.
+  else if m.id == columnsByRangeMethod.id then
+    discard <| emit digest ⟨Array.replicate 100 (le64At req 0).toUInt8⟩
+    return .resourceUnavailable "pruned"
+  else if m.id == lightClientBootstrapMethod.id then
+    discard <| emit digest ⟨Array.replicate 300 3⟩
+    return .done
+  -- The finality and optimistic updates take the default: no chunk.
+  else return .done
+
 /-- A service on loopback with a recorded event list. -/
 private def startOn (c : Chain) (seed : UInt8) (events : OnceRef (List Event))
-    (boot : List Enr := []) (serve : PeerId → Inbound → Emit → Async Ending := fun _ _ _ => pure .done) :
+    (boot : List Enr := []) (partialColumns : Libp2p.Protocols.Gossipsub.Core.PartialOpts := {}) :
     Async Service := do
   let key ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 seed⟩)
   Service.start {
-    chain := c, key, ip := [127, 0, 0, 1], tcpPort := 0, discPort := 0
-    bootEnrs := boot, advert := { cgc := 4 }, discoverEveryMs := 500
-    onEvent := fun e => events.update (· ++ [e]), serve }
+    chain := c, status := testStatus, metaData := testMeta
+    key, ip := [127, 0, 0, 1], tcpPort := 0, discPort := 0
+    bootEnrs := boot, advert := { cgc := 4 }, discoverEveryMs := 500, partialColumns
+    onEvent := fun e => events.update (· ++ [e]), serve := testServe (c.forkDigest 0) }
 
 private def serviceChecks (r : Runner) : Async Unit := do
   -- The genesis is now, so the wall-clock epoch is 0.
-  let c ← devnetChain ((← wallMs) / 1000)
-  let digest ← expectOk "digest" (c.forkDigest 0)
+  let c := devnetChain ((← wallMs) / 1000)
+  let digest := c.forkDigest 0
   let evA ← (OnceRef.new ([] : List Event) : BaseIO _)
   let evB ← (OnceRef.new ([] : List Event) : BaseIO _)
-  -- A serves blocks of 404 bytes from `startSlot` on, each with our
-  -- digest as its context. It tries two past `count`, and the service's
-  -- cap refuses those two.
-  let refused ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
-  let serve : PeerId → Inbound → Emit → Async Ending := fun _ req emit => do
-    match req with
-    | .blocksByRange start count =>
-      for i in [0:count + 2] do
-        if !(← emit digest ⟨Array.replicate 404 (start + i).toUInt8⟩) then
-          (refused.update (· + 1) : BaseIO Unit)
-      return .done
-    -- The ancestry of the root, newest first: blocks 9, 8, ... here.
-    | .blocksByHead root count =>
-      if root.size == 32 then
-        for i in [0:count] do
-          discard <| emit digest ⟨Array.replicate 404 (9 - i).toUInt8⟩
-      return .done
-    -- One column, then the end of what A keeps.
-    | .columnsByRange start _ _ =>
-      discard <| emit digest ⟨Array.replicate 356 start.toUInt8⟩
-      return .resourceUnavailable "pruned"
-    -- The least bootstrap, and one update past `count`, which the cap
-    -- refuses. The finality and optimistic updates take the default.
-    | .lightClientBootstrap _ =>
-      discard <| emit digest ⟨Array.replicate lightClientBootstrapBounds.minLen 3⟩
-      return .done
-    | .lightClientUpdatesByRange start count =>
-      for i in [0:count + 1] do
-        discard <| emit digest ⟨Array.replicate lightClientUpdateBounds.minLen (start + i).toUInt8⟩
-      return .done
-    | _ => return .done
-  let a ← startOn c 1 evA (serve := serve)
+  let a ← startOn c 1 evA
   let b ← startOn c 2 evB [← (a.localEnr : BaseIO Enr)]
   let aPeer := a.base.host.localPeer
   let bPeer := b.base.host.localPeer
@@ -362,8 +362,10 @@ private def serviceChecks (r : Runner) : Async Unit := do
     (← waitUntil (has evB fun | .connected p true => p == aPeer | _ => false) 5000)
   r.check "eth2 service: the listener sees the inbound peer"
     (← waitUntil (has evA fun | .connected p false => p == bPeer | _ => false) 5000)
-  r.check "eth2 service: the dialer gets the listener's Status"
-    (← waitUntil (has evB fun | .status p s => p == aPeer && s.forkDigest == digest | _ => false) 5000)
+  r.check "eth2 service: the dialer gets the listener's Status, our digest then the client's bytes"
+    (← waitUntil (has evB fun
+      | .status p s => p == aPeer && s == withDigest testStatus digest
+      | _ => false) 5000)
   r.check "eth2 service: the listener gets the dialer's Status"
     (← waitUntil (has evA fun | .status p _ => p == bPeer | _ => false) 5000)
   -- B's identify answer names B's listeners.
@@ -411,18 +413,28 @@ private def serviceChecks (r : Runner) : Async Unit := do
   if let some id := ids.head? then
     r.check "eth2 service: the validation answer posts" (← (a.report id bPeer .accept : BaseIO Bool))
   -- A block request with its context bytes.
-  match ← b.request aPeer blocksByRangeMethod (some (blocksByRangeRequest 10 3)) with
+  match ← b.request aPeer blocksByRangeMethod (some (rangeRequest 10 3)) with
   | .ok chunks =>
     r.check "eth2 service: the range request gets three chunks" (chunks.length == 3)
     r.check "eth2 service: each chunk carries our digest as context"
       (chunks.all (·.context == digest))
     r.check "eth2 service: the chunks keep their order"
       (chunks.map (·.payload.get! 0) == [10, 11, 12])
-    r.check "eth2 service: the cap refuses the two chunks past count" ((← refused.get) == 2)
   | .error _ => r.check "eth2 service: the range request answers" false
+  -- A client that emits past the method's cap: the service stops it there.
+  match ← b.request aPeer blocksByRangeMethod (some (rangeRequest 0 (Constants.maxRequestBlocksDeneb + 2))) with
+  | .ok chunks =>
+    r.check "eth2 service: the cap of MAX_REQUEST_BLOCKS_DENEB holds"
+      (chunks.length == Constants.maxRequestBlocksDeneb)
+  | .error _ => r.check "eth2 service: the long range request answers" false
+  -- A request of another size than the method's fixed one is refused.
+  r.check "eth2 service: a range request of 23 bytes gets no block"
+    (match ← b.request aPeer blocksByRangeMethod (some ⟨Array.replicate 23 0⟩) with
+     | .ok chunks => !chunks.any (·.result matches .success)
+     | .error _ => true)
   -- A check that refuses the second block ends the read there.
   let checked ← (OnceRef.new ([] : List Nat) : BaseIO (OnceRef (List Nat)))
-  let each ← b.requestEach aPeer blocksByRangeMethod (some (blocksByRangeRequest 10 3)) fun c => do
+  let each ← b.requestEach aPeer blocksByRangeMethod (some (rangeRequest 10 3)) fun c => do
     (checked.update (· ++ [(c.payload.get! 0).toNat]) : BaseIO Unit)
     return c.payload.get! 0 != 11
   r.check "eth2 service: a check of each chunk stops the read at the refused block"
@@ -431,59 +443,72 @@ private def serviceChecks (r : Runner) : Async Unit := do
   match ← b.request aPeer lightClientBootstrapMethod (some ⟨Array.replicate 32 5⟩) with
   | .ok chunks =>
     r.check "eth2 service: a light-client bootstrap answers one chunk with our digest"
-      (chunks.map (·.payload.size) == [lightClientBootstrapBounds.minLen] &&
-        chunks.all (·.context == digest))
+      (chunks.map (·.payload.size) == [300] && chunks.all (·.context == digest))
   | .error _ => r.check "eth2 service: the light-client bootstrap answers" false
-  match ← b.request aPeer lightClientUpdatesByRangeMethod (some (lightClientUpdatesByRangeRequest 4 2)) with
-  | .ok chunks =>
-    r.check "eth2 service: light-client updates stop at count"
-      (chunks.map (·.payload.get! 0) == [4, 5])
-  | .error _ => r.check "eth2 service: the light-client updates answer" false
   match ← b.request aPeer lightClientFinalityUpdateMethod none with
   | .ok chunks =>
     r.check "eth2 service: a light-client request with no data gets ResourceUnavailable"
       (chunks.map (·.result) == [.resourceUnavailable])
   | .error _ => r.check "eth2 service: the finality update answers" false
+  match ← b.request aPeer lightClientUpdatesByRangeMethod (some (le64 4 ++ le64 2)) with
+  | .ok chunks =>
+    r.check "eth2 service: an updates range with no data answers no chunk" chunks.isEmpty
+  | .error _ => r.check "eth2 service: the light-client updates answer" false
   r.check "eth2 service: the light-client topics parse"
     ((topicParse? (topicOf digest .lightClientOptimisticUpdate)).map (·.2) ==
       some .lightClientOptimisticUpdate)
-  match ← b.request aPeer columnsByRangeMethod (some (columnsByRangeRequest 5 1 [1, 2])) with
+  match ← b.request aPeer columnsByRangeMethod (some (le64 5 ++ le64 1)) with
   | .ok chunks =>
     r.check "eth2 service: a column range ends with ResourceUnavailable after its column"
       (chunks.map (·.result) == [.success, .resourceUnavailable] &&
         (chunks.getLast?.map (·.payload)) == some "pruned".toUTF8)
   | .error _ => r.check "eth2 service: the column range request answers" false
-  match ← b.request aPeer blocksByHeadMethod (some (blocksByHeadRequest ⟨Array.replicate 32 1⟩ 3)) with
+  match ← b.request aPeer blocksByHeadMethod (some (⟨Array.replicate 32 1⟩ ++ le64 3)) with
   | .ok chunks =>
     r.check "eth2 service: the head request gets the ancestry, newest first"
       (chunks.map (·.payload.get! 0) == [9, 8, 7] && chunks.all (·.context == digest))
   | .error _ => r.check "eth2 service: the head request answers" false
-  match ← b.request aPeer goodbyeMethod (some (Chain.le64 3)) with
+  match ← b.request aPeer goodbyeMethod (some (le64 3)) with
   | .ok chunks =>
     r.check "eth2 service: Goodbye answers one chunk of 0, as the spec asks"
-      (chunks.map (·.payload) == [Chain.le64 0])
+      (chunks.map (·.payload) == [le64 0])
   | .error _ => r.check "eth2 service: Goodbye answers" false
   match ← b.request aPeer metadataV3Method none with
-  | .ok [m] =>
-    r.check "eth2 service: MetaData v3 names the custody"
-      ((MetaData.decodeV3? m.payload).map (·.custodyGroupCount) == some 4)
+  | .ok [m] => r.check "eth2 service: MetaData v3 answers the client's bytes" (m.payload == testMeta.v3)
   | _ => r.check "eth2 service: MetaData v3 answers" false
-  match ← b.request aPeer pingMethod (some (Chain.le64 0)) with
-  | .ok [p] => r.check "eth2 service: Ping answers the seq number" (p.payload == Chain.le64 0)
+  match ← b.request aPeer metadataV2Method none with
+  | .ok [m] => r.check "eth2 service: MetaData v2 answers the client's bytes" (m.payload == testMeta.v2)
+  | _ => r.check "eth2 service: MetaData v2 answers" false
+  match ← b.request aPeer pingMethod (some (le64 0)) with
+  | .ok [p] => r.check "eth2 service: Ping answers the seq number" (p.payload == le64 testMeta.seq)
   | _ => r.check "eth2 service: Ping answers" false
   -- Liveness: the first Ping of a peer brings its MetaData, since we
   -- know none of it yet. The second finds the same seq number.
   b.base.ping aPeer
   b.base.ping aPeer
   let metas := (← (evB.get : BaseIO (List Event))).filter fun
-    | .metaData p _ => p == aPeer
+    | .metaData p _ _ => p == aPeer
     | _ => false
   r.check "eth2 service: a Ping with a new seq number brings MetaData once"
     (match metas with
-     | [.metaData _ md] => md.custodyGroupCount == 4
+     | [.metaData _ seq md] => seq == testMeta.seq && md == testMeta.v3
      | _ => false)
   r.check "eth2 service: an answered Ping is no unresponsive event"
     (!(← has evB fun | .unresponsive _ => true | _ => false))
+  -- The client's updates: a new Status keeps our digest, and bytes of
+  -- another width change nothing.
+  let newer : ByteArray := ⟨Array.replicate statusLen 0x55⟩
+  r.check "eth2 service: a new Status of 92 bytes is taken" (← (a.setStatus newer : BaseIO Bool))
+  r.check "eth2 service: the new Status keeps our digest"
+    ((← (a.base.status.get : BaseIO ByteArray)) == withDigest newer digest)
+  r.check "eth2 service: a Status of 91 bytes is refused"
+    (!(← (a.setStatus (newer.extract 0 91) : BaseIO Bool)))
+  r.check "eth2 service: a MetaData of the wrong width is refused"
+    (!(← (a.setMetaData { testMeta with v2 := testMeta.v3 } : BaseIO Bool)))
+  r.check "eth2 service: a new MetaData is taken" (← (a.setMetaData { testMeta with seq := 6 } : BaseIO Bool))
+  match ← b.request aPeer pingMethod (some (le64 0)) with
+  | .ok [p] => r.check "eth2 service: Ping answers the new seq number" (p.payload == le64 6)
+  | _ => r.check "eth2 service: Ping answers after the update" false
   -- Goodbye at stop.
   b.stop
   r.check "eth2 service: the stop says Goodbye with reason 1"
@@ -514,17 +539,33 @@ private def serviceChecks (r : Runner) : Async Unit := do
   cs.stop
   a.stop
 
-/-- A fork on a live service: 1 s slots, 2 slots per epoch, and a
-Blob-Parameters-Only fork at epoch 2, 4 s after genesis. The fork loop
-joins the post-fork topic at epoch 1, switches at epoch 2, and leaves the
-pre-fork topic at epoch 4. The run takes about 9 s. -/
+/-- The service refuses a config whose bytes or schedule are malformed. -/
+private def startRefusals (r : Runner) : Async Unit := do
+  let key ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 31⟩)
+  let base : Config := {
+    chain := devnetChain, status := testStatus, metaData := testMeta
+    key, ip := [127, 0, 0, 1], tcpPort := 0, quicPort := none, discPort := 0, advert := { cgc := 4 } }
+  let refused (cfg : Config) : Async Bool := do
+    try
+      let s ← Service.start cfg
+      s.stop
+      return false
+    catch _ => return true
+  r.check "eth2 service: a Status of 91 bytes is refused at the start"
+    (← refused { base with status := testStatus.extract 0 91 })
+  r.check "eth2 service: a schedule that starts after epoch 0 is refused at the start"
+    (← refused { base with chain := { devnetChain with schedule := [entry 3 1] } })
+  r.check "eth2 service: a MetaData of the wrong width is refused at the start"
+    (← refused { base with metaData := { testMeta with v3 := testMeta.v2 } })
+
+/-- A fork on a live service: 1 s slots, 2 slots per epoch, and a new
+entry at epoch 2, 4 s after genesis. The fork loop joins the post-fork
+topic at epoch 1, switches at epoch 2, and leaves the pre-fork topic at
+epoch 4. The run takes about 9 s. -/
 private def liveForkChecks (r : Runner) : Async Unit := do
-  let c0 ← devnetChain ((← wallMs) / 1000)
-  let c := { c0 with slotDurationMs := 1000, slotsPerEpoch := 2
-                     blobSchedule := c0.blobSchedule ++
-                       [({ epoch := 2, maxBlobsPerBlock := 99 } : BlobEntry)] }
-  let pre ← expectOk "digest" (c.forkDigest 0)
-  let post ← expectOk "digest" (c.forkDigest 2)
+  let c := { devnetChain ((← wallMs) / 1000) [entry 2 0xaa] with slotDurationMs := 1000, slotsPerEpoch := 2 }
+  let pre := c.forkDigest 0
+  let post := c.forkDigest 2
   let ev ← (OnceRef.new ([] : List Event) : BaseIO _)
   let a ← startOn c 4 ev
   r.check "eth2 fork: the subscribe posts" (← a.subscribe .beaconBlock)
@@ -534,8 +575,10 @@ private def liveForkChecks (r : Runner) : Async Unit := do
     | none => return false
   r.check "eth2 fork: ahead of the fork, both digests carry the topic" (← waitUntil (topics 2) 5000)
   let switched : Async Bool := do
-    return (← (a.base.status.get : BaseIO Status)).forkDigest == post
+    return statusDigest (← (a.base.status.get : BaseIO ByteArray)) == post
   r.check "eth2 fork: at the fork, our Status names the new digest" (← waitUntil switched 5000)
+  r.check "eth2 fork: the Status keeps the client's other bytes"
+    (((← (a.base.status.get : BaseIO ByteArray)).extract 4 statusLen) == testStatus.extract 4 statusLen)
   r.check "eth2 fork: our record names the new digest"
     (forkDigest? (← (a.localEnr : BaseIO Enr)) == some post)
   r.check "eth2 fork: the topic of a kind is the new digest's"
@@ -549,11 +592,12 @@ private def liveForkChecks (r : Runner) : Async Unit := do
 (Lighthouse's 1.3 times the target, rounded up), so of three peers that
 dial, two at most stay. -/
 private def limitChecks (r : Runner) : Async Unit := do
-  let c ← devnetChain ((← wallMs) / 1000)
+  let c := devnetChain ((← wallMs) / 1000)
   let ev ← (OnceRef.new ([] : List Event) : BaseIO _)
   let key ← expectOk "key" (PrivKey.ofData? .secp256k1 ⟨Array.replicate 32 9⟩)
   let a ← Service.start {
-    chain := c, key, ip := [127, 0, 0, 1], tcpPort := 0, discPort := 0, advert := { cgc := 4 }
+    chain := c, status := testStatus, metaData := testMeta
+    key, ip := [127, 0, 0, 1], tcpPort := 0, discPort := 0, advert := { cgc := 4 }
     targetPeers := 1, onEvent := fun e => ev.update (· ++ [e]) }
   let boot ← (a.localEnr : BaseIO Enr)
   let others ← [11, 12, 13].mapM fun (seed : UInt8) => do
@@ -567,14 +611,92 @@ private def limitChecks (r : Runner) : Async Unit := do
   for o in others do o.stop
   a.stop
 
+/-! ## Partial columns -/
+
+private def partialChecks (r : Runner) : IO Unit := do
+  let root : ByteArray := ⟨Array.replicate 32 7⟩
+  let gid := PartialColumns.groupIdOf root
+  r.check "partial: the group ID is 0x00 then the root" (gid.size == 33 && gid.get! 0 == 0)
+  r.check "partial: the group ID gives back its root" (PartialColumns.rootOf? gid == some root)
+  r.check "partial: an unknown version is ignored"
+    (PartialColumns.rootOf? (ByteArray.mk #[1] ++ root)).isNone
+  let pa := PeerId.inline (ByteArray.mk #[1]) (by decide)
+  let pb := PeerId.inline (ByteArray.mk #[2]) (by decide)
+  let (first, s1) := ({} : PartialColumns.Rewards).earn pa root 0
+  let (second, s2) := s1.earn pa root 0
+  r.check "partial: the reward goes once per peer, block, and column" (first && !second)
+  r.check "partial: another column and another peer each earn it"
+    ((s2.earn pa root 1).1 && (s2.earn pb root 0).1)
+  let five := (List.range 5).foldl (fun (st : PartialColumns.Rewards) i =>
+    (st.earn pa ⟨Array.replicate 32 i.toUInt8⟩ 0).2) {}
+  r.check "partial: the state keeps four blocks, and the oldest goes"
+    (five.blocks.length == 4 && !five.blocks.any (·.1 == ⟨Array.replicate 32 0⟩))
+
+/-- Two services with partial columns on column 0: A sends B its parts
+metadata and a message, and B gets both bytes as they went out. -/
+private def partialServiceChecks (r : Runner) : Async Unit := do
+  let c := devnetChain ((← wallMs) / 1000)
+  let opts : Libp2p.Protocols.Gossipsub.Core.PartialOpts := { requests := true, supports := true }
+  let evA ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let evB ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let a ← startOn c 21 evA [] opts
+  let b ← startOn c 22 evB [← (a.localEnr : BaseIO Enr)] opts
+  let aPeer := a.base.host.localPeer
+  let bPeer := b.base.host.localPeer
+  r.check "partial service: both subscribe to column 0"
+    ((← a.subscribe (.dataColumnSidecar 0)) && (← b.subscribe (.dataColumnSidecar 0)))
+  let knows : Async Bool := do
+    match ← a.partialColumnPeers 0 with
+    | some ps => return ps.any fun (p, req) => p == bPeer && req
+    | none => return false
+  r.check "partial service: A learns that B asks for partial columns" (← waitUntil knows 10000)
+  let root : ByteArray := ⟨Array.replicate 32 5⟩
+  let parts : ByteArray := ⟨#[1, 2, 3]⟩
+  let msg : ByteArray := ⟨Array.replicate 500 9⟩
+  r.check "partial service: A sends its metadata and a message"
+    (← (a.sendPartialColumn bPeer root 0 (some parts) (some msg) : BaseIO Bool))
+  let got : Async Bool := do
+    return (← (evB.get : BaseIO (List Event))).any fun
+      | .partialColumn 0 r p m x => r == root && p == aPeer && m == some parts && x == some msg
+      | _ => false
+  r.check "partial service: B gets the bytes, the block root, and the source" (← waitUntil got 5000)
+  -- A group ID of version 1: B ignores it.
+  let topic ← (a.topic (.dataColumnSidecar 0) : BaseIO Libp2p.Protocols.Gossipsub.TopicId)
+  let other : ByteArray := ⟨Array.replicate 32 6⟩
+  discard <| (a.gossip.sendPartial bPeer
+    { topicId := some (Bytes.toNatList topic.name.toUTF8)
+      groupId := some (Bytes.toNatList (ByteArray.mk #[1] ++ other))
+      partialMessage := some (Bytes.toNatList msg), partsMetadata := some (Bytes.toNatList parts) } :
+      BaseIO Bool)
+  -- A known group after it, so the wait has an end.
+  discard <| (a.sendPartialColumn bPeer other 0 (some parts) none : BaseIO Bool)
+  let later : Async Bool := do
+    return (← (evB.get : BaseIO (List Event))).any fun
+      | .partialColumn 0 r _ _ none => r == other
+      | _ => false
+  r.check "partial service: the known group after it arrives" (← waitUntil later 5000)
+  r.check "partial service: B ignores the group ID of an unknown version"
+    (((← (evB.get : BaseIO (List Event))).filter (fun
+      | .partialColumn 0 r _ _ _ => r == other
+      | _ => false)).length == 1)
+  r.check "partial service: B judges the cells valid, and the reward posts"
+    (← (b.judgePartialColumn aPeer root 0 true : BaseIO Bool))
+  r.check "partial service: a second judgment of the same block earns nothing more"
+    (!((← (b.partials.get : BaseIO PartialColumns.Rewards)).earn aPeer root 0).1)
+  b.stop
+  a.stop
+
 def run (r : Runner) : IO Unit := do
-  r.section "eth2" "vendor/consensus-specs: specs/*/p2p-interface.md to fulu, fulu beacon-chain.md"
+  r.section "eth2" "vendor/consensus-specs: specs/*/p2p-interface.md to fulu, fulu partial-columns"
+  partialChecks r
+  Async.run (partialServiceChecks r)
   chainChecks r
   messageIdChecks r
-  messageChecks r
+  methodChecks r
   scoringChecks r
   forkChecks r
   peersChecks r
+  Async.run (startRefusals r)
   Async.run (serviceChecks r)
   Async.run (liveForkChecks r)
   Async.run (limitChecks r)

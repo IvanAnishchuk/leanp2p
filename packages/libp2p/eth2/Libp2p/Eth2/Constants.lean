@@ -99,11 +99,15 @@ def maxRequestDataColumnSidecars : Nat := maxRequestBlocksDeneb * numberOfColumn
 "Configs"). -/
 def maxRequestLightClientUpdates : Nat := 128
 
-/-- `SYNC_COMMITTEE_SIZE` (altair `beacon-chain.md`, mainnet preset). -/
-def syncCommitteeSize : Nat := 512
+/-! ## Partial columns (fulu `partial-columns/p2p-interface.md`) -/
 
-/-- `MAX_EXTRA_DATA_BYTES` (bellatrix `beacon-chain.md`, "Preset"). -/
-def maxExtraDataBytes : Nat := 32
+/-- The version byte of the Fulu partial message group ID. "The version
+byte MUST be `0x00`." -/
+def partialColumnsVersion : UInt8 := 0
+
+/-- The blocks whose partial-column state the service keeps: Lighthouse's
+`MAX_BLOCKS` of its header tracker (`partial_column_header_tracker.rs`). -/
+def partialColumnBlocks : Nat := 4
 
 /-- The Goodbye reasons of phase0 ("Goodbye v1"). -/
 def goodbyeClientShutdown : Nat := 1

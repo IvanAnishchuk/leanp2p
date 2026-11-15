@@ -1,7 +1,8 @@
 import Crypto
 import Snappy
 import Libp2p.Protocols.Gossipsub.Types
-import Libp2p.Eth2.Fork
+import Libp2p.Eth2.Constants
+import Libp2p.Eth2.Uint64
 
 /-!
 # The consensus message id
@@ -35,8 +36,8 @@ open Libp2p.Protocols.Gossipsub (MessageId)
 def messageIdInput (topic : String) (data : ByteArray) : ByteArray :=
   let t := topic.toUTF8
   match Snappy.decompress data Libp2p.Protocols.Constants.maxPayloadSize with
-  | .ok raw => Constants.messageDomainValidSnappy ++ Chain.le64 t.size ++ t ++ raw
-  | .error _ => Constants.messageDomainInvalidSnappy ++ Chain.le64 t.size ++ t ++ data
+  | .ok raw => Constants.messageDomainValidSnappy ++ le64 t.size ++ t ++ raw
+  | .error _ => Constants.messageDomainInvalidSnappy ++ le64 t.size ++ t ++ data
 
 /-- The message id of `data` on `topic`, as bytes. `none` on a fault of
 the SHA-256 shim. -/

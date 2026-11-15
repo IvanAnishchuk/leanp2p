@@ -6,14 +6,14 @@ both.
 
 ## Units
 
-1. **The pure layer.** The constants, `Chain` and the fork digest, the
-   config reader, the topics, the message id, the ENR fields, the
-   methods and the small messages, and the gossip parameters.
+1. **The pure layer.** The constants, `Chain` and its lookups, the
+   topics, the message id, the ENR fields, the methods, and the gossip
+   parameters.
 2. **The service.** The host with TCP and QUIC, gossipsub on the payload
    path with the held validation, discv5 with our record and the
    discovery loop, the `Status` duty, the answers to Ping, MetaData, and
-   Goodbye, and the client's seams for gossip and for block and column
-   requests.
+   Goodbye with the client's bytes, and the client's seams for gossip
+   and for the served methods.
 3. **The live gate.** The shadow node over this service, on the Kurtosis
    devnet of `etheorem-shadow-node` (`devnet/multi.yaml`: two
    Lighthouse nodes and one Grandine), against the same agreement as
@@ -25,6 +25,9 @@ both.
 6. **Forks.** The fork schedule (`ForkState`) and the fork loop: the
    post-fork joins one epoch ahead, the switch, and the retirement two
    epochs after.
+7. **Partial columns.** The partial options of the column topics, the
+   group ID, the client's bytes both ways, and the first-delivery reward
+   once per peer, block, and column.
 
 ## Consumers
 
@@ -34,39 +37,47 @@ both.
 ## Test milestones
 
 Unit 1 (`Tests/Eth2.lean`):
-- The devnet config gives six forks after genesis, Fulu at epoch 0,
-  the one blob schedule entry, and the mainnet epoch.
-- The digest is `8049f250`, the value Python computes, and the record
-  of a Lighthouse node of the devnet carries it.
-- That record's whole `ENRForkID` and its `nfd` equal ours, and its
-  `cgc` is a supernode's 128.
-- A Blob-Parameters-Only entry is the next fork, changes the digest,
-  keeps the version, and gives `nfd`.
-- Before Fulu, the digest is the plain fork data root.
+- The record of a Lighthouse node of the devnet carries the devnet's
+  digest `8049f250`. Its whole `ENRForkID` and its `nfd` equal the
+  schedule's, and its `cgc` is a supernode's 128.
+- A later entry is the next fork, changes the digest at its epoch, and
+  gives `nfd`. The digests from an epoch on list ours, then each later
+  one.
+- `Chain.wellFormed` refuses an empty schedule, one that starts after
+  epoch 0, one out of order, and a digest of 3 bytes.
+- The wall-clock epoch starts at genesis, and epoch 0 holds before it.
 - The message id of data that does not decompress, and of compressed
   data, equal the values of Python's `hashlib`. The topic enters the
   id.
-- `Status` v2 has 92 bytes and reads back, and 84 bytes are refused.
-  `MetaData` v3 has 25 bytes and v2 17.
+- The digest of a `Status` is its first 4 bytes, and a new digest keeps
+  the other 88. The methods have the spec's fixed sizes.
 - The topic parse refuses an index past the subnet count, a leading
   zero, a deprecated name, and a short digest (`#guard` checks in
   `Topic.lean`).
 
 Unit 2 (`Tests/Eth2.lean`, two services over loopback):
 - The boot record's peer connects, and the listener sees it inbound.
-- Each side gets the other's `Status`.
+- Each side gets the other's `Status`: our digest, then the client's
+  bytes.
 - The block topic meshes, and a published block reaches the other side
   as a held message with the consensus message id. The answer posts.
 - A range request gets three chunks in order, each with our digest as
-  its context.
-- MetaData v3 names the custody, and Ping answers the seq number.
+  its context. A client that emits past the method's cap stops at
+  `MAX_REQUEST_BLOCKS_DENEB`.
+- A light-client request with no data gets `ResourceUnavailable`.
+- MetaData v3 and v2 answer the client's bytes, and Ping answers the
+  seq number. A new `Status` keeps our digest, and bytes of another
+  width change nothing.
+- The start refuses a `Status`, a `MetaData`, or a schedule of the wrong
+  shape.
 - The stop says Goodbye with reason 1, and the listener sees the peer
   leave.
 - The suite passes on two threads and on one.
 
 Unit 3 has two legs:
 - The network leg: `eth2-probe` (`packages/cli/Eth2Probe.lean`) joins
-  the devnet with the service alone, and needs no chain model. On
+  the devnet with the service alone, and needs no chain model. It takes
+  its fork from the `eth2` field of a boot record. On
   `devnet/multi.yaml`, two Lighthouse nodes and one Grandine accepted
   its dials and exchanged `Status`, with our digest. Each answered
   `BeaconBlocksByRange` with our digest as the context bytes, and Ping
@@ -108,7 +119,17 @@ Unit 6 (`Tests/Eth2.lean`):
   at once.
 - A live service on a chain of 2 s epochs: both digests carry the topic
   ahead of the fork, then `Status`, the record, and `topic` name the new
-  digest, then the pre-fork topic goes.
+  digest, then the pre-fork topic goes. The `Status` keeps the client's
+  other bytes.
+
+Unit 7 (`Tests/Eth2.lean`):
+- The group ID is `0x00` then the root, gives back its root, and an
+  unknown version is ignored.
+- The reward goes once per peer, block, and column, and the state keeps
+  four blocks.
+- Over loopback: a peer that requests partial columns is listed, the
+  client's metadata and message reach it with the block root and the
+  source, and a group ID of an unknown version raises no event.
 
 A run of 600 s on the devnet without the spammer and assertoor, with
 Lighthouse at the debug level: three peers stayed connected for the
