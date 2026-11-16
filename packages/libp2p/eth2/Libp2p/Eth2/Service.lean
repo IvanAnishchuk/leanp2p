@@ -12,6 +12,7 @@ import Libp2p.Protocols.Gossipsub.HostSeam
 import Libp2p.Protocols.Gossipsub.Node
 import Libp2p.Protocols.ReqResp.Exchange
 import Libp2p.Protocols.ReqResp.Limiter
+import Libp2p.Protocols.ReqResp.RateLimit
 import Libp2p.Eth2.Fork
 import Libp2p.Eth2.Enr
 import Libp2p.Eth2.Topic
@@ -22,6 +23,7 @@ import Libp2p.Eth2.Peers
 import Libp2p.Eth2.Scoring
 import Libp2p.Eth2.Forks
 import Libp2p.Eth2.PartialColumns
+import Libp2p.Eth2.RateLimit
 
 /-!
 # The consensus network service
@@ -79,6 +81,15 @@ the events. The service carries the bytes and never decodes SSZ.
   (`Config.serve`). It sends at most the method's chunk count. The
   client keeps the request's own count, for example "no more than
   `count` blocks".
+* **The responder's rate limit.** Each chunk to a peer takes a token of
+  the method's bucket for that peer (`quotaOf`, Lighthouse's quotas),
+  and a chunk with no token waits for one: "The responder MAY rate-limit
+  chunks by withholding each chunk until capacity is available". A
+  peer's request past `MAX_CONCURRENT_REQUESTS` open ones of the same
+  method gets no chunk, and the client hears of it
+  (`Event.tooManyRequests`), since "The responder MAY penalise peers
+  that concurrently open more than `MAX_CONCURRENT_REQUESTS` streams".
+  Goodbye is exempt, as in Lighthouse.
 * **Partial columns.** The service carries the parts metadata and the
   message of each partial column to the client and back, by block root
   and column (`PartialColumns`). It gives each peer the first-delivery
@@ -148,6 +159,10 @@ inductive Event where
   sends its metadata of each block it holds through
   `Service.sendPartialColumn`. -/
   | partialGossip (column : Nat) (peers : List PeerId)
+  /-- A peer opened one request more than `MAX_CONCURRENT_REQUESTS` of
+  `method`, and the service answered it with no chunk. The spec lets
+  the client penalise the peer. -/
+  | tooManyRequests (peer : PeerId) (method : Libp2p.Core.ProtocolId)
 
 /-- The answer of one chunk to an inbound request: the context bytes,
 the `ForkDigest` of the chunk's epoch, and the SSZ. It answers `false`
@@ -256,6 +271,9 @@ structure Config where
   method of `oneOrErrorMethods` with no chunk, the service then answers
   `ResourceUnavailable`. -/
   serve : PeerId → Method → ByteArray → Emit → Async Ending := fun _ _ _ _ => pure .done
+  /-- The responder's rate limit and the cap on concurrent inbound
+  requests. `false` serves every request at once. -/
+  rateLimit : Bool := true
 
 /-- Milliseconds since the Unix epoch. -/
 def wallMs : IO Nat := do
@@ -280,7 +298,25 @@ structure Base where
   /-- The Ping state of each peer, and the bans (`Peers`). Its clock is
   `IO.monoMsNow`. -/
   peers : OnceRef Peers
+  /-- The token buckets of each method with a quota, keyed by peer
+  (`quotaOf`). -/
+  buckets : OnceRef (Std.HashMap Libp2p.Core.ProtocolId (ReqResp.Buckets PeerId))
+  /-- The open inbound requests of each peer and method. -/
+  inbound : OnceRef (ReqResp.Inbound (PeerId × Libp2p.Core.ProtocolId))
+  /-- `stop` closes it. The loops and the withheld chunks park on it. -/
+  stopping : Chan Unit
   tasks : TaskSet
+
+/-- Every method the service answers. -/
+def answeredMethods : List Method :=
+  [statusMethod, goodbyeMethod, pingMethod, metadataV3Method, metadataV2Method] ++ servedMethods
+
+/-- An empty bucket for each method with a quota. -/
+def freshBuckets : Std.HashMap Libp2p.Core.ProtocolId (ReqResp.Buckets PeerId) :=
+  answeredMethods.foldl (fun t m =>
+    match quotaOf m with
+    | some q => t.insert m.id { quota := q }
+    | none => t) {}
 
 namespace Base
 
@@ -344,12 +380,48 @@ def sendStatus (b : Base) (peer : PeerId) : Async Unit := do
 /-- One success chunk with no context. -/
 def plain (payload : ByteArray) : Chunk := ⟨.success, ByteArray.empty, payload⟩
 
-/-- A responder over `serveStreaming`. -/
+/-- Wait `us` microseconds. `false` when `stop` came first. Park: the
+timer wakes it, and so does `stop`, which closes `stopping`. -/
+def pause (b : Base) (us : Nat) : Async Bool := do
+  if us == 0 then return true
+  let timer ← (Park.sleep ((us + 999) / 1000) true : BaseIO (Park Bool))
+  select #[Park.recv b.stopping (fun _ => false), timer]
+
+/-- Withhold the next chunk of `m` to `peer` until its bucket gives a
+token. The reservation is one `updateGet`, so two chunks never take the
+same token. `false` when `stop` came first. -/
+def withhold (b : Base) (peer : PeerId) (m : Method) : Async Bool := do
+  let now := (← (IO.monoNanosNow : BaseIO Nat)) / 1000
+  let wait ← (b.buckets.updateGet fun t =>
+      match t[m.id]? with
+      | none => (0, t)
+      | some bk =>
+        let (w, bk) := bk.reserve peer now
+        (w, t.insert m.id bk) : BaseIO Nat)
+  b.pause wait
+
+/-- A responder over `serveStreaming`, under the rate limit: a request
+past the concurrent cap gets no chunk, and each chunk waits for a
+token. Goodbye takes neither. -/
 def handlerOf (b : Base) (m : Method)
     (respond : PeerId → Option ByteArray → (Chunk → Async (Except ReqResp.Error Unit)) → Async Unit) :
     Libp2p.Core.StreamHandler :=
-  ReqResp.streamingHandler m Clock.system b.config.requestTimeoutMs fun ctx payload emit =>
-    respond ctx.remotePeer payload emit
+  ReqResp.streamingHandler m Clock.system b.config.requestTimeoutMs fun ctx payload emit => do
+    let peer := ctx.remotePeer
+    if !b.config.rateLimit || m.id == goodbyeMethod.id then
+      return ← respond peer payload emit
+    let key := (peer, m.id)
+    let admitted ← (b.inbound.updateGet
+      (·.admit key Libp2p.Protocols.Constants.maxConcurrentRequests) : BaseIO Bool)
+    if !admitted then
+      (b.config.onEvent (.tooManyRequests peer m.id) : BaseIO Unit)
+      return
+    try
+      respond peer payload fun c => do
+        if !(← b.withhold peer m) then return .error (.stream .closed)
+        emit c
+    finally
+      (b.inbound.update (·.finish key) : BaseIO Unit)
 
 /-- The `ResourceUnavailable` chunk of a one-chunk method with no data. -/
 def unavailable : Chunk :=
@@ -405,8 +477,7 @@ def handlers (b : Base) : List Libp2p.Core.StreamHandler :=
 /-- The protocol ids the identify answer lists. -/
 def servedIds : List String :=
   ([Identify.protocolId, Constants.meshsubV13Id, Constants.meshsubV12Id, Constants.meshsubId] ++
-    ([statusMethod, goodbyeMethod, pingMethod, metadataV3Method, metadataV2Method] ++
-      servedMethods).map (·.id)).map (·.toString)
+    answeredMethods.map (·.id)).map (·.toString)
 
 /-- Report the host's sessions, and send `Status` on each outbound one.
 A replaced session raises `disconnected` while the peer stays
@@ -484,6 +555,9 @@ partial def liveness (b : Base) (stopping : Chan Unit) : Async Unit := do
   let due ← (b.peers.updateGet (·.takeDue now) : BaseIO (List PeerId))
   for p in due do
     (b.tasks.spawn (b.ping p) : BaseIO Unit)
+  -- The full buckets go, so the table holds the peers of the last period.
+  let nowUs := (← (IO.monoNanosNow : BaseIO Nat)) / 1000
+  (b.buckets.update (·.map fun _ bk => bk.prune nowUs) : BaseIO Unit)
   b.liveness stopping
 
 end Base
@@ -624,12 +698,16 @@ def start (cfg : Config) : Async Service := do
   let host ← orThrow "the host does not start" (← (Libp2p.Host.Host.new hostCfg : BaseIO _))
   let epoch := cfg.chain.epochAt (← wallMs)
   let digest := cfg.chain.forkDigest epoch
+  let stopping ← (Chan.new 1 (by decide) : BaseIO (Chan Unit))
   let base : Base := {
     config := cfg, host
     status := ← OnceRef.new (withDigest cfg.status digest)
     metaData := ← OnceRef.new cfg.metaData
     limiters := ← OnceRef.new []
     peers
+    buckets := ← OnceRef.new freshBuckets
+    inbound := ← OnceRef.new {}
+    stopping
     tasks := ← TaskSet.new }
   for h in base.handlers do (host.setHandler h : BaseIO Unit)
   base.watchPeers
@@ -693,7 +771,6 @@ def start (cfg : Config) : Async Service := do
   for r in cfg.bootEnrs do
     (disc.addEnr r : BaseIO Unit)
     (base.dialRecord r : BaseIO Unit)
-  let stopping ← (Chan.new 1 (by decide) : BaseIO (Chan Unit))
   (base.tasks.spawn (base.discover disc stopping) : BaseIO Unit)
   (base.tasks.spawn (base.liveness stopping) : BaseIO Unit)
   let s : Service := {

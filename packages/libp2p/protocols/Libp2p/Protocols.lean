@@ -17,6 +17,7 @@ import Libp2p.Protocols.ReqResp.SnappyFrame
 import Libp2p.Protocols.ReqResp.Payload
 import Libp2p.Protocols.ReqResp.Core
 import Libp2p.Protocols.ReqResp.Limiter
+import Libp2p.Protocols.ReqResp.RateLimit
 import Libp2p.Protocols.ReqResp.Exchange
 
 /-!

@@ -28,6 +28,9 @@ both.
 7. **Partial columns.** The partial options of the column topics, the
    group ID, the client's bytes both ways, and the first-delivery reward
    once per peer, block, and column.
+8. **The responder's rate limit.** A bucket per peer and method with
+   Lighthouse's quotas, one token per chunk, and the cap on concurrent
+   inbound requests.
 
 ## Consumers
 
@@ -133,7 +136,17 @@ Unit 7 (`Tests/Eth2.lean`):
   client's metadata and message reach it with the block root and the
   source, and a group ID of an unknown version raises no event.
 
-The same run lasted 600 s, without the spammer and assertoor, with
+Unit 8 (`Tests/Eth2.lean`, and the `#guard` checks of
+`ReqResp/RateLimit.lean` and `RateLimit.lean`):
+- A bucket of 2 per 10 s sends two chunks at once, and the third waits
+  5 s. Another key keeps its own bucket, and a full bucket leaves the
+  table at the prune.
+- Over loopback: the rest of the Status bucket answers at once, and the
+  next Status waits about 3 s, then arrives.
+- A third open bootstrap request of one peer gets no chunk and raises
+  `tooManyRequests`, and the stop wakes the two withheld answers.
+
+The devnet run of unit 3 lasted 600 s, without the spammer and assertoor, with
 Lighthouse at the debug level. Three peers stayed connected for the
 whole run. Gossip brought 50 blocks (one per slot), 235 aggregates, and
 1650 attestations. No frame dropped, and Lighthouse sent `Status` again

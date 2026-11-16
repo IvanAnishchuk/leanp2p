@@ -10,6 +10,7 @@ import Libp2p.Eth2.Scoring
 import Libp2p.Eth2.Peers
 import Libp2p.Eth2.Forks
 import Libp2p.Eth2.PartialColumns
+import Libp2p.Eth2.RateLimit
 import Libp2p.Eth2.Service
 
 /-!

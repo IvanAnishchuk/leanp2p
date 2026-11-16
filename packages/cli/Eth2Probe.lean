@@ -286,6 +286,7 @@ def run (a : Args) : IO UInt32 := do
       | .metaData p seq md =>
         IO.println s!"metadata refresh {short p}: seq {seq}, cgc {StandIn.custody md}"
       | .unresponsive p => IO.println s!"no ping answer {short p}"
+      | .tooManyRequests p m => IO.println s!"too many requests {short p}: {m}"
       | .partialColumn .. | .partialGossip .. => pure ()
     -- Every 10 s, the gossip so far, so a stall shows as a flat count.
     let now ← IO.monoMsNow

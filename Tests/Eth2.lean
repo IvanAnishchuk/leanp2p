@@ -16,7 +16,8 @@ The suite checks `libp2p/eth2` in this order:
 - two services over loopback: the dial from a boot record, the
   `Status` handshake, gossip with the held validation, the requests the
   client serves, MetaData, Ping, Goodbye, and bans
-- the start refusals, a fork on a live service, and the connection cap
+- the start refusals, a fork on a live service, the connection cap, and
+  the responder's rate limit
 
 The devnet values are the shadow node's (`etheorem-shadow-node` at
 `8cd3247`, `helper/tests/fixtures`): the digest `8049f250`, and the
@@ -612,6 +613,64 @@ private def limitChecks (r : Runner) : Async Unit := do
   for o in others do o.stop
   a.stop
 
+/-- The responder's rate limit, between two services over loopback:
+chunks past the bucket wait and still arrive, a request past
+`MAX_CONCURRENT_REQUESTS` open ones gets no chunk, and the stop wakes
+the withheld chunks. -/
+private def rateLimitChecks (r : Runner) : Async Unit := do
+  let c := devnetChain ((← wallMs) / 1000)
+  let evA ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let evB ← (OnceRef.new ([] : List Event) : BaseIO _)
+  let a ← startOn c 21 evA
+  let b ← startOn c 22 evB [← (a.localEnr : BaseIO Enr)]
+  let aPeer := a.base.host.localPeer
+  let bPeer := b.base.host.localPeer
+  let up : Async Bool := do return (← (b.peers : BaseIO (List PeerId))).contains aPeer
+  r.check "eth2 rate limit: the peers connect" (← waitUntil up 5000)
+  let successes : Except Libp2p.Protocols.ReqResp.Error (List Libp2p.Protocols.ReqResp.Chunk) → Nat
+    | .ok cs => (cs.filter (·.result matches .success)).length
+    | .error _ => 0
+  -- The Status quota is 5 per 15 s, and B's dial sent one Status. So 4
+  -- more go at once, and the fifth waits about one step of 3 s.
+  let ours := withDigest testStatus (c.forkDigest 0)
+  let t0 ← (IO.monoMsNow : BaseIO Nat)
+  let burst ← (List.range 4).mapM fun _ => b.request aPeer statusMethod (some ours)
+  let quick := (← (IO.monoMsNow : BaseIO Nat)) - t0
+  let t1 ← (IO.monoMsNow : BaseIO Nat)
+  let late ← b.request aPeer statusMethod (some ours)
+  let waited := (← (IO.monoMsNow : BaseIO Nat)) - t1
+  r.check "eth2 rate limit: the rest of the bucket goes at once"
+    (burst.all (successes · == 1) && quick < 1500)
+  r.check "eth2 rate limit: a chunk past the bucket waits, then arrives"
+    (successes late == 1 && 1500 ≤ waited)
+  -- The bootstrap quota is 1 per 10 s. One request takes it, so the next
+  -- two wait, and a third beside them is past the cap of 2.
+  let root : ByteArray := ⟨Array.replicate 32 5⟩
+  discard <| b.request aPeer lightClientBootstrapMethod (some root)
+  let answers ← (OnceRef.new ([] : List Nat) : BaseIO _)
+  let raw ← (TaskSet.new : BaseIO TaskSet)
+  for _ in [0:3] do
+    (raw.spawn do
+      match ← b.base.host.newStream aPeer [lightClientBootstrapMethod.id] with
+      | .ok (_, st) =>
+        let got ← Libp2p.Protocols.ReqResp.requestAll st lightClientBootstrapMethod Clock.system
+          30000 (some root)
+        (answers.update (successes got :: ·) : BaseIO Unit)
+      | .error _ => pure () : BaseIO Unit)
+  r.check "eth2 rate limit: the third open request of a method raises tooManyRequests"
+    (← waitUntil (do return (← (evA.get : BaseIO (List Event))).any fun
+      | .tooManyRequests p m => p == bPeer && m == lightClientBootstrapMethod.id
+      | _ => false) 5000)
+  r.check "eth2 rate limit: the refused request gets no chunk"
+    (← waitUntil (do return (← (answers.get : BaseIO (List Nat))) == [0]) 5000)
+  -- The two withheld answers park until the stop, which wakes them.
+  let t1 ← (IO.monoMsNow : BaseIO Nat)
+  a.stop
+  raw.joinAll
+  r.check "eth2 rate limit: the stop wakes the withheld chunks"
+    ((← (IO.monoMsNow : BaseIO Nat)) - t1 < 5000)
+  b.stop
+
 /-! ## Partial columns -/
 
 private def partialChecks (r : Runner) : IO Unit := do
@@ -701,5 +760,6 @@ def run (r : Runner) : IO Unit := do
   Async.run (serviceChecks r)
   Async.run (liveForkChecks r)
   Async.run (limitChecks r)
+  Async.run (rateLimitChecks r)
 
 end Tests.Eth2

@@ -26,6 +26,7 @@ group is §7, row 10). The spike has no req/resp or gossipsub code.
 | `Libp2p/Protocols/ReqResp/Payload.lean` | what both directions share: `ReqResp.Error`, the result codes, `Method` and the size bounds, the protobuf varint length prefix with its round-trip theorem, and the writer; the snappy call goes through the `codec/snappy` binding (root PLAN W6.2) |
 | `Libp2p/Protocols/ReqResp/Core.lean` | the reader state machine of §3.3: `State`, `Event`, `Action`, and the total `step`; it reads one request or a run of response chunks, and the output so far, the budget spent, the chunk count, and the error/EOF distinction live in the state |
 | `Libp2p/Protocols/ReqResp/Limiter.lean` | `MAX_CONCURRENT_REQUESTS`: the pure table rule with its bound theorem, and the per-peer `Limiter` over `OnceRef` |
+| `Libp2p/Protocols/ReqResp/RateLimit.lean` | the responder's side: GCRA buckets that withhold chunks, as Lighthouse's `rate_limiter.rs`, and the count of open inbound requests per key |
 | `Libp2p/Protocols/ReqResp/Exchange.lean` | the shell over the core: the requester `request` and `requestPeer`, the responder `serve`, the handler value the registry stores, and the deadlines |
 | `Libp2p/Protocols/StreamError.lean` | `mapStreamError`, the one map from a stream error into `Core.Error` that the req/resp handler uses |
 | `Libp2p/Protocols/Gossipsub/Types.lean` | the shared value types: `TopicId`, `MessageId`, `Message`, the thresholds, and `Peer` |

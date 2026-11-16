@@ -36,6 +36,7 @@ and `quic`.
 | `Libp2p/Eth2/Forks.lean` | the gossip across a fork: the pure schedule of the post-fork joins, the switch, and the retirement of the pre-fork topics |
 | `Libp2p/Eth2/Peers.lean` | the peer table: the Ping intervals, the known MetaData seq numbers, and the bans, as pure transitions |
 | `Libp2p/Eth2/PartialColumns.lean` | the group ID of a partial column, and the first-delivery reward once per peer, block, and column |
+| `Libp2p/Eth2/RateLimit.lean` | the responder's quota of each method, Lighthouse's numbers |
 | `Libp2p/Eth2/Service.lean` | the service: the host, gossipsub, discv5, the req/resp handlers, and the peer duties |
 
 ## Public surface
@@ -57,6 +58,7 @@ and `quic`.
 - `Peers`, `ForkState`, `ForkAction`.
 - `PartialColumns.groupIdOf`, `PartialColumns.rootOf?`,
   `PartialColumns.Rewards`.
+- `quotaOf`.
 - `Service.start`, `subscribe`, `unsubscribe`, `publish`, `report`,
   `setStatus`, `setMetaData`, `request`, `requestEach` (a check of each
   chunk before the next), `partialColumnPeers`, `sendPartialColumn`,
@@ -162,6 +164,21 @@ and `quic`.
   block, and column ("Clients SHOULD limit the rate at which a peer
   gets the first message delivery reward"), over the latest 4 blocks,
   the bound of Lighthouse's header tracker.
+- **The responder withholds chunks.** "The responder MAY rate-limit
+  chunks by withholding each chunk until capacity is available", and it
+  "MUST NOT respond with an error or close the stream when rate
+  limiting". Each chunk to a peer takes a token of a GCRA bucket per
+  peer and method (`ReqResp.Buckets`), with Lighthouse's inbound quotas
+  (`quotaOf`). A chunk with no token waits, and the stop wakes it.
+  Lighthouse charges a request its largest answer at once and refuses a
+  request that would wait past 10 s with an error. The spec's rationale
+  prefers a cost per chunk, and the spec forbids the error, so the
+  service charges per chunk and never refuses. A peer's request past
+  `MAX_CONCURRENT_REQUESTS` open ones of a method gets no chunk, which
+  bounds the withheld answers to two per peer and method. The client
+  hears of it (`Event.tooManyRequests`) and may penalise the peer.
+  Goodbye is exempt, as in Lighthouse. `Config.rateLimit := false`
+  turns both off.
 - **The seen cache holds 262144 ids**, which covers 341 messages per
   second at mainnet's TTL of 768 s. The router keeps each id as a
   `List Nat`, about 480 bytes. A larger cache needs a smaller id type
