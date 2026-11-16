@@ -186,9 +186,6 @@ structure Config where
   bytes. A `none` id is a local fault, for example of a hash shim. The
   node then drops the inbound RPC whole, and `publish` answers `false`. -/
   payloadId : Option (String → ByteArray → Option MessageId) := none
-  /-- The heartbeats between opportunistic grafting rounds. rust's
-  `opportunistic_graft_ticks` is 60. -/
-  opportunisticGraftTicks : Nat := 60
   /-- Called for each partial message a peer sends on a topic where
   `params.partialTopics` can send them, mesh peer or not
   (`partial-messages.md`, "Application-Library Interface"). It runs on
@@ -905,11 +902,6 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
         dialExplicit env
         pure { st with nextExplicitCheck := now + env.config.explicitCheckMs }
       else pure st
-    let st := { st with router := Core.expirePending st.params st.router now }
-    let opportunistic := st.ticks > 0 && st.ticks % env.config.opportunisticGraftTicks == 0
-    let (router, grafts) := Core.maintain st.params st.router now opportunistic
-    let st := { st with router }
-    discard <| perform env none st.gossipIndex grafts
     let order := env.config.order st.ticks st.router.peers.keys
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }

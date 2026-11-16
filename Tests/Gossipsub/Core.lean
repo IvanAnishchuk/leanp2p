@@ -529,6 +529,18 @@ def run (r : Runner) : IO Unit := do
   r.check "core.maintain.fanout-expires"
     ((maintain cfgParams withFanout (cfgParams.fanoutTtl - 1)).1.fanout.length = 1 &&
       (maintain cfgParams withFanout cfgParams.fanoutTtl).1.fanout.isEmpty)
+  -- The tick runs the upkeep inside `step` (root §3.3): a due tick
+  -- expires the fanout, and counts the heartbeat.
+  r.check "core.tick.runs-upkeep"
+    (match step cfgParams { withFanout with lastHeartbeat := 0 } (.tick cfgParams.fanoutTtl []) with
+     | .ok (s', _) => s'.fanout.isEmpty && s'.heartbeats = 1
+     | _ => false)
+  -- Opportunistic grafting runs on every `opportunisticGraftTicks`-th
+  -- heartbeat after the first.
+  r.check "core.tick.opportunistic-due"
+    (!opportunisticDue cfgParams { known with heartbeats := 0 } &&
+      !opportunisticDue cfgParams { known with heartbeats := cfgParams.opportunisticGraftTicks - 1 } &&
+      opportunisticDue cfgParams { known with heartbeats := cfgParams.opportunisticGraftTicks })
   -- A promise past its deadline is one P₇ penalty, and leaves the table.
   let promised : State := { known with iwant := Cache.PromiseTable.promise [] pa ⟨[7]⟩ 100 }
   -- In whole events.

@@ -249,6 +249,9 @@ structure Params where
   `opportunisticGraftThreshold` grafts up to this many peers that score
   above the median. rust grafts 2 every 60 heartbeats. -/
   opportunisticGraftPeers : Nat := 2
+  /-- The heartbeats between two opportunistic grafting rounds. rust's
+  `opportunistic_graft_ticks` is 60. 0 turns the rounds off. -/
+  opportunisticGraftTicks : Nat := 60
   /-- Our partial-messages choice per topic (gossipsub v1.3,
   `partial-messages.md`). A topic with the default choice takes full
   messages only. A topic that can send makes the node announce the
@@ -329,6 +332,9 @@ structure State where
   served : Std.HashMap (Peer × MessageId) Nat := {}
   /-- The records of departed peers and when each expires (`retainScore`). -/
   retained : List (Peer × PeerData × Millis) := []
+  /-- The heartbeats so far. Every `opportunisticGraftTicks`-th one runs
+  opportunistic grafting (`upkeep`). -/
+  heartbeats : Nat := 0
 
 /-- The application's answer on one held message
 (`gossipsub-v1.1.md`, "Extended Validators"). -/
@@ -1238,8 +1244,7 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
 `historyLength` heartbeats. rust-libp2p keeps an unvalidated message in
 its message cache, so it expires with that window. An expired message
 stays in the seen cache, so the core drops a later copy as a duplicate,
-and no score changes. The loop calls this at each heartbeat, outside
-`step`, so the step theorems hold unchanged. -/
+and no score changes. The tick runs it first (`upkeep`). -/
 def expirePending (p : Params) (s : State) (now : Millis) : State :=
   let ttl := p.window.historyLength * p.heartbeatInterval
   let old := (s.pendingAt.filter fun e => decide (e.2 + ttl ≤ now)).map (·.1)
@@ -1269,9 +1274,27 @@ def opportunisticGrafts (p : Params) (s : State) (now : Millis) : State × List 
       updateScoreOf (setTopicMesh st t (q :: meshOf st t)) q (fun sc => Score.graft p.score sc now t)) st
     (st, acts ++ cands.map (fun q => Action.sendRpc q (graftRpc t)))) (s, [])
 
-/-- Heartbeat upkeep that the spike runs outside `step` (the loop calls it
-before each tick), so the heartbeat theorems hold unchanged. Each part
-cites #95:
+/-- The broken IWANT promises: each one past its deadline adds one P₇
+behaviour penalty to its peer. -/
+def penalizeBroken (s : State) (now : Millis) : State :=
+  (Cache.PromiseTable.broken s.iwant now).foldl (fun st (q, n) =>
+    updateScoreOf st q (fun sc => (List.replicate n ()).foldl (fun sc _ => Score.behaviourPenalty sc) sc)) s
+
+/-- P₆: each peer's IP colocation count, one count per IP address over
+the known peers. -/
+def colocate (s : State) : State :=
+  let ips : Std.HashMap (List Nat) Nat := s.peers.fold (fun m _ pd =>
+    match pd.ip with
+    | some a => m.insert a (m.getD a 0 + 1)
+    | none => m) {}
+  { s with peers := s.peers.map fun _ pd =>
+    { pd with score := { pd.score with ipColocation :=
+      match pd.ip with
+      | some a => ips.getD a 0
+      | none => 0 } } }
+
+/-- The heartbeat upkeep, which the tick runs before the plans
+(`upkeep`). The parts:
 
 * Fanout expiry (`gossipsub-v1.0.md`, lines 449 to 473): a topic with no
   publish for `fanoutTtl` loses its fanout.
@@ -1280,24 +1303,14 @@ cites #95:
   and leaves the table.
 * P₆ (`gossipsub-v1.1.md`, "P₆"): each peer's IP colocation count is the
   number of known peers on its IP address.
-* Opportunistic grafting, on the heartbeats that the loop marks
+* Opportunistic grafting, on the heartbeats that `upkeep` marks
   (`opportunistic`): see `opportunisticGrafts`. -/
 def maintain (p : Params) (s : State) (now : Millis) (opportunistic : Bool := false) :
     State × List Action :=
-  let broken := Cache.PromiseTable.broken s.iwant now
-  let s0 := broken.foldl (fun st (q, n) =>
-    updateScoreOf st q (fun sc => (List.replicate n ()).foldl (fun sc _ => Score.behaviourPenalty sc) sc)) s
-  -- P₆: one count per IP address over the known peers.
-  let ips : Std.HashMap (List Nat) Nat := s0.peers.fold (fun m _ pd =>
-    match pd.ip with
-    | some a => m.insert a (m.getD a 0 + 1)
-    | none => m) {}
-  let s1 : State := { s0 with peers := s0.peers.map fun _ pd =>
-    { pd with score := { pd.score with ipColocation :=
-      match pd.ip with
-      | some a => ips.getD a 0
-      | none => 0 } } }
-  let (s1, grafts) := if opportunistic then opportunisticGrafts p s1 now else (s1, [])
+  let s1 := colocate (penalizeBroken s now)
+  let g := if opportunistic then opportunisticGrafts p s1 now else (s1, [])
+  let s1 := g.1
+  let grafts := g.2
   ({ s1 with
     iwant := s1.iwant.filter (fun e => decide (now < e.deadline))
     fanout := s1.fanout.filter (fun e => decide (now < e.2.lastPublished + p.fanoutTtl))
@@ -1309,6 +1322,28 @@ def maintain (p : Params) (s : State) (now : Millis) (opportunistic : Bool := fa
     served := s1.served.filter (fun k _ => (Cache.MessageIndex.get s1.mcache k.2).isSome)
     -- A departed peer's record lives `retainScore`.
     retained := s1.retained.filter (fun e => decide (now < e.2.2 + p.retainScore)) }, grafts)
+
+/-- Whether this heartbeat runs opportunistic grafting: every
+`opportunisticGraftTicks`-th one after the first, as rust counts its
+heartbeat ticks. -/
+def opportunisticDue (p : Params) (s : State) : Bool :=
+  p.opportunisticGraftTicks != 0 && s.heartbeats != 0 &&
+    s.heartbeats % p.opportunisticGraftTicks == 0
+
+/-- The upkeep of a tick, before the plans: the held messages expire,
+then `maintain` runs, and the heartbeat count rises. The answer holds
+the opportunistic grafts. -/
+def upkeep (p : Params) (s : State) (now : Millis) : State × List Action :=
+  let s := expirePending p s now
+  let m := maintain p s now (opportunisticDue p s)
+  ({ m.1 with heartbeats := m.1.heartbeats + 1 }, m.2)
+
+/-- A due tick: the upkeep, then the heartbeat over the upkept state.
+The actions are the grafts of the upkeep, then the heartbeat's. -/
+def tick (p : Params) (s : State) (now : Millis) (order : List Peer) : State × List Action :=
+  let u := upkeep p s now
+  let h := heartbeat p u.1 now order
+  (h.1, u.2 ++ h.2)
 
 /-- Whether the promise table holds the pair. -/
 def promised (ps : Cache.PromiseTable) (q : Peer) (id : MessageId) : Bool :=
@@ -1694,7 +1729,7 @@ def step (p : Params) (s : State) : Event → Except ProtocolError (State × Lis
   | .subscribe topic => .ok (subscribe p s topic)
   | .unsubscribe topic => .ok (unsubscribe p s topic)
   | .tick now order =>
-      if heartbeatDue p s now then .ok (heartbeat p s now order) else .ok (s, [])
+      if heartbeatDue p s now then .ok (tick p s now order) else .ok (s, [])
   | .validated id source outcome => .ok (handleValidated p s id source outcome)
   | .peerInfo peer outbound ip =>
     .ok (match peerOf s peer with
@@ -1890,19 +1925,123 @@ theorem meshOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (top
       | none => [] := by
   simp [meshOf, settleMesh, settleMeshWith, lookupTopic_map_plans]
 
+/-! ## The upkeep of a tick
+
+The theorems of a tick reason about its two parts: the upkeep, then the
+heartbeat over the upkept state. The upkeep keeps the backoff table, and
+each of its actions is a graft to a peer outside its backoff. -/
+
+/-- A property that each step of a fold keeps holds at its end. -/
+private theorem foldl_inv {α β : Type} (f : β → α → β) (P : β → Prop)
+    (h : ∀ b a, P b → P (f b a)) : ∀ (l : List α) (b : β), P b → P (l.foldl f b)
+  | [], _, hb => hb
+  | a :: l, b, hb => foldl_inv f P h l (f b a) (h b a hb)
+
+private theorem updateScoreOf_backoff (s : State) (q : Peer) (f : Score.PeerState → Score.PeerState) :
+    (updateScoreOf s q f).backoff = s.backoff := by
+  unfold updateScoreOf
+  split <;> rfl
+
+private theorem penalizeBroken_backoff (s : State) (now : Millis) :
+    (penalizeBroken s now).backoff = s.backoff := by
+  unfold penalizeBroken
+  refine foldl_inv _ (fun st : State => st.backoff = s.backoff) ?_ _ s rfl
+  intro b a hb
+  obtain ⟨q, n⟩ := a
+  dsimp only
+  rw [updateScoreOf_backoff]
+  exact hb
+
+private theorem expirePending_backoff (p : Params) (s : State) (now : Millis) :
+    (expirePending p s now).backoff = s.backoff := by
+  unfold expirePending
+  dsimp only
+  split <;> rfl
+
+/-- The grafts that the upkeep may send: each one to a peer outside its
+backoff in `b`. -/
+private def GraftsOutside (b : Cache.BackoffTable) (now : Millis) (acts : List Action) : Prop :=
+  ∀ a ∈ acts, ∃ q t, a = Action.sendRpc q (graftRpc t) ∧ Cache.Backoff.active b q t now = false
+
+private theorem opportunisticGrafts_inv (p : Params) (s : State) (now : Millis) :
+    (opportunisticGrafts p s now).1.backoff = s.backoff ∧
+      GraftsOutside s.backoff now (opportunisticGrafts p s now).2 := by
+  unfold opportunisticGrafts
+  refine foldl_inv _ (fun b : State × List Action =>
+      b.1.backoff = s.backoff ∧ GraftsOutside s.backoff now b.2) ?_ s.mesh (s, [])
+    ⟨rfl, by simp [GraftsOutside]⟩
+  rintro ⟨st, acts⟩ ⟨t, ps⟩ ⟨hb, ha⟩
+  dsimp only at hb ha ⊢
+  split
+  · exact ⟨hb, ha⟩
+  · split
+    · exact ⟨hb, ha⟩
+    · refine ⟨?_, ?_⟩
+      · rw [← hb]
+        refine foldl_inv _ (fun st' : State => st'.backoff = st.backoff) ?_ _ st rfl
+        intro b q hb'
+        rw [updateScoreOf_backoff]
+        exact hb'
+      · intro a hmem
+        rcases List.mem_append.mp hmem with h | h
+        · exact ha a h
+        · simp only [List.mem_map] at h
+          obtain ⟨q, hq, rfl⟩ := h
+          refine ⟨q, t, rfl, ?_⟩
+          have hq' := (List.mem_filter.mp (List.mem_of_mem_take hq)).2
+          rw [← hb]
+          cases hc : Cache.Backoff.active st.backoff q t now with
+          | false => rfl
+          | true =>
+              rw [hc] at hq'
+              simp at hq'
+
+private theorem maintain_inv (p : Params) (s : State) (now : Millis) (opp : Bool) :
+    (maintain p s now opp).1.backoff = s.backoff ∧
+      GraftsOutside s.backoff now (maintain p s now opp).2 := by
+  have hs : (colocate (penalizeBroken s now)).backoff = s.backoff :=
+    penalizeBroken_backoff s now
+  unfold maintain
+  dsimp only
+  split
+  · obtain ⟨hb, ha⟩ := opportunisticGrafts_inv p (colocate (penalizeBroken s now)) now
+    rw [hs] at hb ha
+    exact ⟨hb, ha⟩
+  · exact ⟨hs, by simp [GraftsOutside]⟩
+
+/-- The upkeep keeps the backoff table, and each of its actions is a
+graft to a peer outside its backoff. -/
+theorem upkeep_inv (p : Params) (s : State) (now : Millis) :
+    (upkeep p s now).1.backoff = s.backoff ∧
+      ∀ a ∈ (upkeep p s now).2, ∃ q t, a = Action.sendRpc q (graftRpc t) ∧
+        Cache.Backoff.active s.backoff q t now = false := by
+  unfold upkeep
+  dsimp only
+  obtain ⟨hb, ha⟩ := maintain_inv p (expirePending p s now) now
+    (opportunisticDue p (expirePending p s now))
+  rw [expirePending_backoff] at hb ha
+  exact ⟨hb, ha⟩
+
+/-- A due tick is the heartbeat over the upkept state, with the
+upkeep's actions first. -/
+theorem tick_parts (p : Params) (s s' : State) (acts : List Action)
+    (now : Millis) (order : List Peer)
+    (hdue : heartbeatDue p s now)
+    (hstep : step p s (.tick now order) = .ok (s', acts)) :
+    s' = (heartbeat p (upkeep p s now).1 now order).1 ∧
+      acts = (upkeep p s now).2 ++ (heartbeat p (upkeep p s now).1 now order).2 := by
+  simp only [step, ite_eq_left hdue, Except.ok.injEq, tick, Prod.mk.injEq] at hstep
+  exact ⟨hstep.1.symm, hstep.2.symm⟩
+
 /-! ## The mesh bound theorem -/
 
 /-- After a heartbeat, every topic mesh holds at most `dHigh` peers.
 The kept list is cut at `dHigh` by construction, and the negative prune
 only removes peers. -/
-theorem heartbeatMeshBound (p : Params) (s s' : State) (acts : List Action)
-    (now : Millis) (order : List Peer)
-    (hdue : heartbeatDue p s now)
-    (hstep : step p s (.tick now order) = .ok (s', acts)) :
-    ∀ topic, (meshOf s' topic).length ≤ p.mesh.dHigh := by
+theorem meshBound_heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
+    ∀ topic, (meshOf (heartbeat p s now order).1 topic).length ≤ p.mesh.dHigh := by
   intro topic
-  simp only [step, ite_eq_left hdue, Except.ok.injEq] at hstep
-  obtain ⟨rfl, rfl⟩ := hstep
+  simp only [heartbeat]
   rw [heartbeatNext, meshOf_settleMesh]
   split
   · next pl hfind =>
@@ -1915,6 +2054,15 @@ theorem heartbeatMeshBound (p : Params) (s s' : State) (acts : List Action)
     exact Nat.le_trans (List.length_filter_le _ _)
       (planTopic_kept_le p (freshState p s now) now order e.1)
   · exact Nat.zero_le _
+
+/-- After a tick, every topic mesh holds at most `dHigh` peers. -/
+theorem heartbeatMeshBound (p : Params) (s s' : State) (acts : List Action)
+    (now : Millis) (order : List Peer)
+    (hdue : heartbeatDue p s now)
+    (hstep : step p s (.tick now order) = .ok (s', acts)) :
+    ∀ topic, (meshOf s' topic).length ≤ p.mesh.dHigh := by
+  obtain ⟨rfl, -⟩ := tick_parts p s s' acts now order hdue hstep
+  exact meshBound_heartbeat p _ now order
 
 
 /-! ## The graylist gate theorem -/
@@ -2601,13 +2749,11 @@ theorem scoreOf_gossipState (p : Params) (s : State) (now : Millis) (order : Lis
     scoreOf p (gossipState p s now order) q = scoreOf p (heartbeatNext p s now order) q := by
   simp [scoreOf, gossipState, peerOf, heartbeatNext]
 
-theorem tickPruneNegative (p : Params) (s s' : State) (acts : List Action)
-    (now : Millis) (order : List Peer)
-    (hdue : heartbeatDue p s now)
-    (hstep : step p s (.tick now order) = .ok (s', acts)) :
-    ∀ topic peer, peer ∈ meshOf s' topic → 0 ≤ scoreOf p s' peer := by
-  simp only [step, ite_eq_left hdue, Except.ok.injEq] at hstep
-  obtain ⟨rfl, rfl⟩ := hstep
+/-- After a heartbeat, no mesh holds a peer with a negative score. -/
+theorem pruneNegative_heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
+    ∀ topic peer, peer ∈ meshOf (heartbeat p s now order).1 topic →
+      0 ≤ scoreOf p (heartbeat p s now order).1 peer := by
+  simp only [heartbeat]
   intro topic peer hmem
   rw [meshOf_heartbeatNext] at hmem
   split at hmem
@@ -2630,17 +2776,13 @@ theorem tickPruneNegative (p : Params) (s s' : State) (acts : List Action)
     exact hge
   · simp at hmem
 
-/-- Every gossip action targets a peer at or above the gossip threshold
-in the state after the heartbeat. The prune and graft actions fail the
-ihave test. -/
-theorem tickGossipGated (p : Params) (s s' : State) (acts : List Action)
-    (now : Millis) (order : List Peer)
-    (hdue : heartbeatDue p s now)
-    (hstep : step p s (.tick now order) = .ok (s', acts)) :
-    ∀ to rpc, Action.sendRpc to rpc ∈ acts → rpcHasIhave rpc →
-      p.thresholds.gossipThreshold ≤ scoreOf p s' to := by
-  simp only [step, ite_eq_left hdue, Except.ok.injEq] at hstep
-  obtain ⟨rfl, rfl⟩ := hstep
+/-- Every gossip action of a heartbeat targets a peer at or above the
+gossip threshold in the state after it. The prune and graft actions
+fail the ihave test. -/
+theorem gossipGated_heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
+    ∀ to rpc, Action.sendRpc to rpc ∈ (heartbeat p s now order).2 → rpcHasIhave rpc →
+      p.thresholds.gossipThreshold ≤ scoreOf p (heartbeat p s now order).1 to := by
+  simp only [heartbeat]
   intro to rpc hmem hih
   simp only [heartbeatActions, List.mem_append] at hmem
   rcases hmem with hmem | hmem
@@ -2659,6 +2801,32 @@ theorem tickGossipGated (p : Params) (s s' : State) (acts : List Action)
       exact absurd hih (rpcHasIhave_pruneRpc _ _ _)
   · rw [← scoreOf_gossipState]
     exact mem_gossipActions p (gossipState p s now order) order to rpc hmem
+
+/-- After a tick, no mesh holds a peer with a negative score. -/
+theorem tickPruneNegative (p : Params) (s s' : State) (acts : List Action)
+    (now : Millis) (order : List Peer)
+    (hdue : heartbeatDue p s now)
+    (hstep : step p s (.tick now order) = .ok (s', acts)) :
+    ∀ topic peer, peer ∈ meshOf s' topic → 0 ≤ scoreOf p s' peer := by
+  obtain ⟨rfl, -⟩ := tick_parts p s s' acts now order hdue hstep
+  exact pruneNegative_heartbeat p _ now order
+
+/-- Every gossip action targets a peer at or above the gossip threshold
+in the state after the tick. The grafts of the upkeep, and the prune
+and graft actions of the heartbeat, fail the ihave test. -/
+theorem tickGossipGated (p : Params) (s s' : State) (acts : List Action)
+    (now : Millis) (order : List Peer)
+    (hdue : heartbeatDue p s now)
+    (hstep : step p s (.tick now order) = .ok (s', acts)) :
+    ∀ to rpc, Action.sendRpc to rpc ∈ acts → rpcHasIhave rpc →
+      p.thresholds.gossipThreshold ≤ scoreOf p s' to := by
+  obtain ⟨rfl, rfl⟩ := tick_parts p s s' acts now order hdue hstep
+  intro to rpc hmem hih
+  rcases List.mem_append.mp hmem with hu | hh
+  · obtain ⟨q, t, heq, -⟩ := (upkeep_inv p s now).2 _ hu
+    cases heq
+    exact absurd hih (rpcHasIhave_graftRpc _)
+  · exact gossipGated_heartbeat p _ now order to rpc hh hih
 
 /-! ## The deduplication theorem -/
 
@@ -2959,12 +3127,13 @@ theorem stepDeliverUnseen (p : Params) (s s' : State) (acts : List Action)
       exact absurd hdel (unsubscribe_not_deliver p s topic m)
   | tick now order =>
       by_cases hdue : heartbeatDue p s now
-      · have h1 : heartbeat p s now order = (s', acts) := by
-          simpa only [step, ite_eq_left hdue, Except.ok.injEq] using hstep
-        have hacts : acts = (heartbeat p s now order).2 := by rw [h1]
+      · obtain ⟨-, hacts⟩ := tick_parts p s s' acts now order hdue hstep
         simp only [heartbeat] at hacts
         rw [hacts] at hdel
-        exact absurd hdel (heartbeatActions_not_deliver p s now order m)
+        rcases List.mem_append.mp hdel with hu | hh
+        · obtain ⟨q, t, heq, -⟩ := (upkeep_inv p s now).2 _ hu
+          cases heq
+        · exact absurd hh (heartbeatActions_not_deliver p _ now order m)
       · have h1 : (s, ([] : List Action)) = (s', acts) := by
           simpa only [step, ite_eq_right hdue, Except.ok.injEq] using hstep
         have hacts : acts = [] := by
@@ -3104,14 +3273,10 @@ private theorem planTopic_added_backoff (p : Params) (s : State) (now : Millis)
       simp at hc
 
 /-- The heartbeat never grafts a peer whose backoff is active. -/
-theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
-    (now : Millis) (order : List Peer)
-    (hdue : heartbeatDue p s now)
-    (hstep : step p s (.tick now order) = .ok (s', acts)) :
-    ∀ to rpc topic, Action.sendRpc to rpc ∈ acts → rpcGrafts rpc topic →
+theorem noBackoffGraft_heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
+    ∀ to rpc topic, Action.sendRpc to rpc ∈ (heartbeat p s now order).2 → rpcGrafts rpc topic →
       Cache.Backoff.active s.backoff to topic now = false := by
-  simp only [step, ite_eq_left hdue, Except.ok.injEq] at hstep
-  obtain ⟨rfl, rfl⟩ := hstep
+  simp only [heartbeat]
   intro to rpc topic hmem hgraft
   simp only [heartbeatActions, List.mem_append] at hmem
   rcases hmem with hmem | hmem
@@ -3153,6 +3318,24 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
         cases hqeq
         exact absurd hgraft (rpcGrafts_ihaveRpc _ _ _)
     · split at ht <;> simp at ht
+
+/-- A tick never grafts a peer whose backoff is active: neither the
+upkeep's opportunistic grafts nor the heartbeat's. -/
+theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
+    (now : Millis) (order : List Peer)
+    (hdue : heartbeatDue p s now)
+    (hstep : step p s (.tick now order) = .ok (s', acts)) :
+    ∀ to rpc topic, Action.sendRpc to rpc ∈ acts → rpcGrafts rpc topic →
+      Cache.Backoff.active s.backoff to topic now = false := by
+  obtain ⟨-, rfl⟩ := tick_parts p s s' acts now order hdue hstep
+  intro to rpc topic hmem hgraft
+  rcases List.mem_append.mp hmem with hu | hh
+  · obtain ⟨q, t, heq, hb⟩ := (upkeep_inv p s now).2 _ hu
+    cases heq
+    rw [rpcGrafts_graftRpc t topic hgraft]
+    exact hb
+  · have h := noBackoffGraft_heartbeat p _ now order to rpc topic hh hgraft
+    rwa [(upkeep_inv p s now).1] at h
 
 /-! ## The peer exchange and floodsub theorems -/
 
