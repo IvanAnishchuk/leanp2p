@@ -214,8 +214,7 @@ structure Config where
   connectors : Nat := 8
 
 /-- A snapshot of the router for metrics: the sizes a client exports.
-Lighthouse's `lighthouse_network` metrics are off in the shadow node
-(`node.rs:107`), so a poll is the whole interface. -/
+A client polls it, and a metrics exporter is the client's. -/
 structure Stats where
   /-- The known peers. -/
   peers : Nat

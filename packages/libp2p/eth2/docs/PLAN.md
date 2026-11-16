@@ -14,10 +14,8 @@ both.
    discovery loop, the `Status` duty, the answers to Ping, MetaData, and
    Goodbye with the client's bytes, and the client's seams for gossip
    and for the served methods.
-3. **The live gate.** The shadow node over this service, on the Kurtosis
-   devnet of `etheorem-shadow-node` (`devnet/multi.yaml`: two
-   Lighthouse nodes and one Grandine), against the same agreement as
-   its Rust path.
+3. **A live check.** `eth2-probe` runs the service alone against
+   Lighthouse and Grandine on a local devnet, and needs no chain model.
 4. **The peer duties.** The peer table (`Peers`), the liveness loop
    with the MetaData refresh, and the ban at the gater.
 5. **The score profile.** Lighthouse's parameters (`Scoring`), on by
@@ -34,9 +32,8 @@ both.
 
 ## Consumers
 
-- `etheorem-shadow-node`: a p2p adapter there maps the frame commands
-  and events of `P2p/Frames.lean` onto `Service`. The shadow node has
-  no such adapter yet. Its p2p runs through `helper/`, in Rust.
+- A consensus client. It owns the chain and every consensus type, and
+  it talks to the service in bytes.
 
 ## Test milestones
 
@@ -78,20 +75,13 @@ Unit 2 (`Tests/Eth2.lean`, two services over loopback):
   leave.
 - The suite passes on two threads and on one.
 
-Unit 3 has two legs:
-- The network leg: `eth2-probe` (`packages/cli/Eth2Probe.lean`) joins
-  the devnet with the service alone, and needs no chain model. It takes
-  its fork from the `eth2` field of a boot record. In the run at
-  `809d319` on `devnet/multi.yaml`, two Lighthouse nodes and one
-  Grandine accepted its dials and exchanged `Status`, with our digest.
-  Each answered
-  `BeaconBlocksByRange` with our digest as the context bytes, and Ping
-  and MetaData v3. Gossip arrived on the block, aggregate, attestation,
-  and column topics. A column range at slots 0 and 1 gave no chunks,
-  since those blocks carry no blobs.
-- The model leg: the shadow node over this service on the devnet, with
-  `shadow-node check` against the host node. The adapter belongs to
-  `etheorem-shadow-node`, so this leg runs there.
+Unit 3 (`packages/cli/Eth2Probe.lean`): the probe takes its fork from
+the `eth2` field of a boot record. In one run, two Lighthouse nodes and
+one Grandine accepted its dials and exchanged `Status`, with our digest.
+Each answered `BeaconBlocksByRange` with our digest as the context
+bytes, and Ping and MetaData v3. Gossip arrived on the block, aggregate,
+attestation, and column topics. A column range at slots 0 and 1 gave no
+chunks, since those blocks carry no blobs.
 
 Unit 4 (`Tests/Eth2.lean`):
 - The table: an outbound peer is due for a Ping at 15 s and an inbound

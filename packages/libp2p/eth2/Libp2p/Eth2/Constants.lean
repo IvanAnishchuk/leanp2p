@@ -6,8 +6,7 @@ import Libp2p.Protocols.Constants
 Every number and name of the consensus networking spec that this
 package uses has its one home here (root ARCHITECTURE §3.8). The text is
 the vendored consensus-specs (`vendor/consensus-specs`), whose files
-equal `v1.7.0-beta.4`. Each value below is the same in
-`v1.7.0-alpha.11`, the pin of etheorem and of the shadow node.
+equal `v1.7.0-beta.4`.
 
 The numbers of the req/resp framing (`MAX_PAYLOAD_SIZE`,
 `max_compressed_len`, the `ForkDigest` width, the result codes) and the

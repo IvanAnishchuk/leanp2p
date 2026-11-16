@@ -10,11 +10,7 @@ gossip validations and the requests, and it reads the events.
 The spec text is the vendored consensus-specs (`vendor/consensus-specs`,
 pinned at `0216d01` in `VECTORS.lock`): the `p2p-interface.md` of every
 fork to fulu, and fulu `partial-columns/p2p-interface.md`. Each of those
-files equals its `v1.7.0-beta.4` copy. Every wire value the package
-uses is the same in `v1.7.0-alpha.11`, the pin of etheorem and of the
-shadow node. The two differ in the order of the validation rules, in
-the type names, and in the partial-column types. The package reads none
-of those.
+files equals its `v1.7.0-beta.4` copy.
 
 The package sits at rank 7 of the libp2p group, above `protocols`. It
 imports `host`, `protocols`, `discv5`, `identity`, `security`, `mux`,
@@ -235,8 +231,13 @@ and `quic`.
   epoch 2 joins the post-fork topic ahead, switches its `Status`, record,
   and topics at the fork, and leaves the pre-fork topic two epochs
   later.
-- The live gate is the shadow node on the Kurtosis devnet, against
-  Lighthouse and Grandine (the package PLAN, unit 3).
+- The responder's rate limit over loopback: a withheld chunk, the cap
+  on concurrent requests, and the wake at stop.
+- The layers below carry their own interop with go and rust: the
+  transports, gossipsub, the ssz_snappy framing fixtures, and discv5.
+  The package adds no interop of its own. One run of `eth2-probe`
+  against Lighthouse and Grandine confirmed the protocol ids, `Status`,
+  the topics, and the message id (the package PLAN, unit 3).
 
 ## What the package must not depend on
 
