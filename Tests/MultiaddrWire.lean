@@ -42,9 +42,11 @@ private def acceptedChecks (runner : Runner) : IO Unit := do
       "multiaddr-js-variants.json"] do
     let fixture ← loadJson file
     for row in (← jArr file fixture "cases") do
-      if (← jStr? file row "knownDivergence").isSome then
-        runner.skip "documented memory text divergence" "the contract uses a big-endian u64"
-      else
+      -- The rows marked `knownDivergence` hold js-multiaddr's `/memory`
+      -- form. A `/memory` address lives inside one process, so no other
+      -- implementation reads ours, and the contract keeps its big-endian
+      -- u64.
+      if (← jStr? file row "knownDivergence").isNone then
         let field := if file == "multiaddr-js-variants.json" then "value" else "string"
         checkAddress runner file (← jStr file row field)
   for (file, field) in [("multiaddr-js-construction.json", "addr"),
@@ -230,9 +232,8 @@ private def viewChecks (runner : Runner) : IO Unit := do
       (Multiaddr.protocolsWithString? text == none)
   let components ← loadJson "multiaddr-js-get-components.json"
   for row in (← jArr "components" components "cases") do
-    if (← jStr? "components" row "knownDivergence").isSome then
-      runner.skip "documented memory component divergence" "memory values are big-endian u64"
-    else
+    -- js-multiaddr's `/memory` rows: see `acceptedChecks`.
+    if (← jStr? "components" row "knownDivergence").isNone then
       let frames ← fixtureAddress (← jStr "components" row "addr")
       let expected ← (← jArr "components" row "components").mapM fun item => do
         let code ← jNat "components" item "code"

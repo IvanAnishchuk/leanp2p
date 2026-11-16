@@ -9,6 +9,9 @@ import Streams.Stream
 import Streams.Constants
 import Streams.Sim
 import Multiformats.Multiaddr
+import Libp2p.Security
+import Libp2p.Mux
+import Libp2p.Host
 
 /-!
 # The upgrade suite (unit 1b)
@@ -17,8 +20,8 @@ The test milestones of the negotiate package plan, unit 1b. The full
 pipeline runs both directions over an in-process pipe pair, and the
 byte-split runs use the in-memory sim transport of `Streams.Sim`. The
 fixed-key plaintext security value and the minimal muxer value replace
-the Noise and yamux milestones, so the suite runs no crypto and no
-session loop (the matrix check names the live gate). The deadline check
+the Noise and yamux milestones there. The matrix over TCP then runs
+the real Noise core with yamux and mplex. The deadline check
 advances the test `Clock` of `base/conc`, so the suite waits on no wall
 clock.
 
@@ -858,6 +861,86 @@ private def checkSplitPipeline (r : Runner) : Async Unit := do
   ic.close
   rc.close
 
+/-! ## The matrix over TCP
+
+Two hosts on the loopback, with Noise on its real core and the real
+muxer values. Each cell lists the muxers of the dialer and of the
+listener. The upgrader picks the dialer's first muxer that the listener
+speaks, so each cell names the muxer it expects. A stream then carries
+one echo both ways. -/
+
+/-- A host on TCP with a Noise identity from one byte and `muxers`. -/
+private def tcpHost (idByte : UInt8) (muxers : List Libp2p.Core.Muxer) : Async Libp2p.Host.Host := do
+  let .ok identity := Libp2p.Identity.PrivKey.ofData? .ed25519 ⟨Array.replicate 32 idByte⟩
+    | throw (IO.userError "matrix: the identity does not build")
+  let .ok noise ← (Libp2p.Security.Noise.Config.generate identity).run
+    | throw (IO.userError "matrix: the Noise key does not generate")
+  match ← (Libp2p.Host.Host.new {
+      identity
+      transports := [Streams.Tcp.transport]
+      security := [Libp2p.Security.Noise.securityProtocol noise]
+      muxers } : BaseIO _) with
+  | .ok h => return h
+  | .error _ => throw (IO.userError "matrix: the host does not build")
+
+/-- The echo protocol of the matrix. -/
+private def echoId : Libp2p.Core.ProtocolId := ⟨"/matrix/echo/1"⟩
+
+/-- Read until the end of the stream. -/
+private partial def readAll (s : Streams.Stream) (acc : ByteArray) : Async ByteArray := do
+  match ← s.read with
+  | .ok (some b) => readAll s (acc ++ b)
+  | _ => return acc
+
+/-- A muxer value that records its id in `opened` when it opens a
+session, and otherwise is `m`. -/
+private def recording (opened : OnceRef (List String)) (m : Libp2p.Core.Muxer) : Libp2p.Core.Muxer :=
+  { m with «open» := fun role c leftover clock => do
+      (opened.update (m.id.toString :: ·) : BaseIO Unit)
+      m.«open» role c leftover clock }
+
+/-- One cell: the dialer proves the listener's peer id, both sides open
+`expected`, and a stream echoes 4 bytes. -/
+private def matrixCell (r : Runner) (dialer listener : List Libp2p.Core.Muxer)
+    (expected : String) : Async Unit := do
+  let name := s!"upgrade over tcp, noise, {expected}: dialer {dialer.map (·.id.toString)}, \
+    listener {listener.map (·.id.toString)}"
+  let opened ← (OnceRef.new ([] : List String) : BaseIO _)
+  let a ← tcpHost 1 (dialer.map (recording opened))
+  let b ← tcpHost 2 (listener.map (recording opened))
+  (b.setHandler { id := echoId, handle := fun _ s => ExceptT.mk do
+      let got ← readAll s .empty
+      discard <| s.write got
+      s.close
+      return .ok () } : BaseIO Unit)
+  let some at0 := (Multiformats.Multiaddr.parse? "/ip4/127.0.0.1/tcp/0").toOption
+    | throw (IO.userError "matrix: address")
+  let .ok bound ← b.startListening at0 | throw (IO.userError "matrix: listen failed")
+  match ← a.dial bound with
+  | .error _ => r.check name false
+  | .ok peer =>
+    match ← a.newStream peer [echoId] with
+    | .error _ => r.check name false
+    | .ok (_, s) =>
+      discard <| s.write ⟨#[1, 2, 3, 4]⟩
+      s.close
+      let back ← readAll s .empty
+      -- The listener's session exists once the stream has answered.
+      let muxers ← (opened.get : BaseIO (List String))
+      r.check name (peer == b.localPeer && back == ⟨#[1, 2, 3, 4]⟩ &&
+        muxers == [expected, expected])
+  a.close
+  b.close
+
+/-- The matrix: yamux and mplex alone, and each choice from a list of two. -/
+private def checkTcpMatrix (r : Runner) : Async Unit := do
+  let y := Libp2p.Mux.yamux
+  let m := Libp2p.Mux.mplex
+  matrixCell r [y] [y] y.id.toString
+  matrixCell r [m] [m] m.id.toString
+  matrixCell r [y, m] [m] m.id.toString
+  matrixCell r [m, y] [y, m] m.id.toString
+
 /-! ## The suite -/
 
 /-- The suite. -/
@@ -882,8 +965,7 @@ def run (r : Runner) : IO Unit := do
     checkGoTraces r
     checkSplitNegotiate r
     checkSplitPipeline r
+    checkTcpMatrix r
   Conc.Async.run all
-  r.skip "upgrade noise yamux matrix over tcp"
-    "needs the Noise value on the real core (#76) and the yamux muxer value (#77) (the W5.9 live gate)"
 
 end Tests.Upgrade

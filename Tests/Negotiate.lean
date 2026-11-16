@@ -252,8 +252,8 @@ def run (r : Runner) : IO Unit := do
   let ipfsId ← msgOf "/ipfs/id/1.0.0"
   let samples : List Msg := [Reply.toMsg .na, Reply.toMsg .ls, header, kad, ipfsId]
   r.check "mss generic round-trip harness" (Bytes.checkRoundTrips samples == true)
-
-  r.skip "mss generic model pin"
-    "needs the ByteArray adapter, which is not built; the suite runs the model decoder, which is the production path"
+  -- The upgrader decodes with the model decoder itself, over the bytes
+  -- of each read (`Upgrade.lean`, `Bytes.toNatList`). No second decoder
+  -- exists, so no model pin applies.
 
 end Tests.Negotiate
