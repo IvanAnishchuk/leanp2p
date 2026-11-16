@@ -16,6 +16,7 @@ The suite checks `libp2p/eth2` in this order:
 - two services over loopback: the dial from a boot record, the
   `Status` handshake, gossip with the held validation, the requests the
   client serves, MetaData, Ping, Goodbye, and bans
+- the start refusals, a fork on a live service, and the connection cap
 
 The devnet values are the shadow node's (`etheorem-shadow-node` at
 `8cd3247`, `helper/tests/fixtures`): the digest `8049f250`, and the
@@ -309,8 +310,8 @@ private def testMeta : MetaData :=
 /-- A `BeaconBlocksByRange` request: `start_slot`, `count`, `step` 1. -/
 private def rangeRequest (start count : Nat) : ByteArray := le64 start ++ le64 count ++ le64 1
 
-/-- The service's client answer of the checks: what a client's `serve`
-does, over filler payloads whose first byte names the chunk. -/
+/-- The `serve` of the checks. It does what a client's `serve` does,
+over filler payloads whose first byte names the chunk. -/
 private def testServe (digest : ByteArray) : PeerId → Libp2p.Protocols.ReqResp.Method → ByteArray →
     Emit → Async Ending := fun _ m req emit => do
   -- `count` blocks from `start_slot` on, each with our digest.

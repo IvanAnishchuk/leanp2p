@@ -31,8 +31,9 @@ both.
 
 ## Consumers
 
-- `etheorem-shadow-node`: its p2p adapter maps the frame commands and
-  events of `P2p/Frames.lean` onto `Service`.
+- `etheorem-shadow-node`: a p2p adapter there maps the frame commands
+  and events of `P2p/Frames.lean` onto `Service`. The shadow node has
+  no such adapter yet. Its p2p runs through `helper/`, in Rust.
 
 ## Test milestones
 
@@ -77,9 +78,10 @@ Unit 2 (`Tests/Eth2.lean`, two services over loopback):
 Unit 3 has two legs:
 - The network leg: `eth2-probe` (`packages/cli/Eth2Probe.lean`) joins
   the devnet with the service alone, and needs no chain model. It takes
-  its fork from the `eth2` field of a boot record. On
-  `devnet/multi.yaml`, two Lighthouse nodes and one Grandine accepted
-  its dials and exchanged `Status`, with our digest. Each answered
+  its fork from the `eth2` field of a boot record. In the run at
+  `809d319` on `devnet/multi.yaml`, two Lighthouse nodes and one
+  Grandine accepted its dials and exchanged `Status`, with our digest.
+  Each answered
   `BeaconBlocksByRange` with our digest as the context bytes, and Ping
   and MetaData v3. Gossip arrived on the block, aggregate, attestation,
   and column topics. A column range at slots 0 and 1 gave no chunks,
@@ -131,13 +133,11 @@ Unit 7 (`Tests/Eth2.lean`):
   client's metadata and message reach it with the block root and the
   source, and a group ID of an unknown version raises no event.
 
-A run of 600 s on the devnet without the spammer and assertoor, with
-Lighthouse at the debug level: three peers stayed connected for the
-whole run, 50 blocks arrived on gossip (one per slot), 235 aggregates,
-and 1650 attestations. No frame dropped, and Lighthouse sent `Status`
-again every 300 s. Before the loop fix of the gossipsub node, the loop
-used one core in full and fell minutes behind, which explains the
-session drop of the 120 s run. From about 384 s on, the peers pruned the
-probe from many meshes. Their mesh delivery term starts one epoch in,
-and the probe answers IGNORE to every message, so it forwards nothing.
-A client that accepts valid messages forwards them.
+The same run lasted 600 s, without the spammer and assertoor, with
+Lighthouse at the debug level. Three peers stayed connected for the
+whole run. Gossip brought 50 blocks (one per slot), 235 aggregates, and
+1650 attestations. No frame dropped, and Lighthouse sent `Status` again
+every 300 s. From about 384 s on, the peers pruned the probe from many
+meshes. Their mesh delivery term starts one epoch in, and the probe
+answers IGNORE to every message, so it forwards nothing. A client that
+accepts valid messages forwards them.

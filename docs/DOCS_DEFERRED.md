@@ -83,8 +83,8 @@ Findings and resolutions:
   standalone binding package in the codec group, wrapping upstream
   `google/snappy` (C++, runtime compiled out, the `LeanHazmatBn254`
   pattern). Recorded in root PLAN W6.2 and the protocols pair.
-- Open, owner decisions: whether a pure-`Bool` verifier may carry a
-  fault channel (§3.6).
+- Resolved. A pure-`Bool` verifier carries no fault channel (§3.6).
+  The owner picked the documented fold ("Open questions", below).
 
 ## Cleanup pass (stage close-out)
 
@@ -188,15 +188,14 @@ landed first (commit 0cabf36), and the package docs follow them.
 - Deferred. `packages/codec/multiformats/docs/PLAN.md`, the 1a
   milestone names the multibase families by their captured JSON names
   while the vector stance names the upstream CSVs; one cross-reference
-  would remove the mapping step for a new reader.
+  would remove the mapping step for a new reader. Applied in `802305e`.
 - Deferred. `packages/codec/multiformats/docs/PLAN.md`, the consumers
   note attributes identify to W5.6; the root plan puts identify in
-  W5.7. Cite W5.7 for identify.
-- Open item, cross-package. `VECTORS.lock` does not vendor the
-  multicodec CSV, and the spike hand-wrote its multihash function
-  table. Root §3.8 says the multicodec table comes from the vendored
-  CSV. The package PLAN assigns the vendor entry to unit 1a through
-  the W0.3 script; keep the assignment visible when W0.3 lands.
+  W5.7. Cite W5.7 for identify. Applied in `802305e`.
+- Closed. `VECTORS.lock` did not vendor the multicodec CSV, and the
+  spike hand-wrote its multihash function table. Root §3.8 says the
+  multicodec table comes from the vendored CSV. `VECTORS.lock` now
+  vendors it (`vendor/multicodec`).
 - Rejected. None this task.
 
 ## per-package docs, task 6: crypto/cores
@@ -213,10 +212,9 @@ landed first (commit 0cabf36), and the package docs follow them.
   `keys-peer-ids.json` stance says the raw key material feeds the
   suites without naming the mechanism; one clause pointing at the same
   W0.3 extractor emission as `keys-go-libp2p.json` would close it.
-- Open question, root-level. §3.6 fixes pure verifier bindings as
-  `Bool`, so a shim fault and an invalid signature read the same to the
-  caller. The pair follows the root faithfully. Decide at the root
-  whether a verifier may return `Except CryptoError Bool`.
+- Resolved. §3.6 fixes pure verifier bindings as `Bool`, so a shim
+  fault and an invalid signature read the same to the caller. The
+  owner kept the fold ("Open questions", below).
 - Rejected. None this task.
 
 ## per-package docs, task 8: net/streams
@@ -273,13 +271,11 @@ rule); the backend pair followed in 658227e and cdd71b8.
 ## per-package docs, task 11: libp2p/core
 
 - Deferred. None.
-- Open question, for the security and negotiate pairs (W5.3, W5.5).
-  The spike's `SecureConn.remoteMuxers` carried the muxer list the
-  Noise extensions advertise, and go-style muxer selection consumed it
-  (`Upgrade.matchMuxers`). The core pair leaves the field out; W5.3
-  owns the handshake extensions, and W5.5 records whether muxer
-  selection reads them or negotiates on the wire. Decide when those
-  pairs land.
+- Resolved. The spike's `SecureConn.remoteMuxers` carried the muxer
+  list the Noise extensions advertise, and go-style muxer selection
+  consumed it (`Upgrade.matchMuxers`). The core pair leaves the field
+  out. The negotiate pair (task 14) records the selection on the wire
+  ("Cleanup pass", above).
 - Rejected. None this task.
 
 ## per-package docs, task 12: libp2p/security
@@ -416,12 +412,12 @@ The owner directed the open deferrals closed. Applied in two commits
   the suite pins provenance and three shapes, and the gate pins the
   byte-exact regeneration.
 
-Still open, with owners:
+State since:
 
-- The multicodec CSV vendor entry: `codec/multiformats` unit 1a, per
-  the per-package docs record; the extractor and the vendor path now
-  sit ready for it.
-- The `public import` caveat in the lint: reruns on a toolchain bump.
+- The multicodec CSV vendor entry is done: `VECTORS.lock` vendors
+  `vendor/multicodec` (`table.csv`).
+- The `public import` caveat in the lint stands. The check reruns on a
+  toolchain bump.
 
 Closed since:
 
@@ -471,10 +467,8 @@ documents the three kinds. The lead verified the invariant over all
   the provenance gate; see the W0 deferred closure section.
 - Closed post stage close-out. The CI gate pins byte-exact
   regeneration over the whole corpus.
-- Deferred, carried. The multicodec CSV vendor entry stays out of
-  `VECTORS.lock`: per-package docs task 5 assigns it to
-  `codec/multiformats` unit 1a, through the W0.3 script. Kept visible
-  here so the assignment does not get lost.
+- Closed. `VECTORS.lock` vendors the multicodec CSV
+  (`vendor/multicodec`), as per-package docs task 5 assigned.
 
 Rejected, with reasons:
 

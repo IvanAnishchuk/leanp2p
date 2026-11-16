@@ -163,9 +163,9 @@ and `quic`.
   gets the first message delivery reward"), over the latest 4 blocks,
   the bound of Lighthouse's header tracker.
 - **The seen cache holds 262144 ids**, which covers 341 messages per
-  second at mainnet's TTL of 768 s. The ids are `List Nat` in the
-  router, about 480 bytes each, so a larger cache costs memory that the
-  router's id type must shrink first.
+  second at mainnet's TTL of 768 s. The router keeps each id as a
+  `List Nat`, about 480 bytes. A larger cache needs a smaller id type
+  first.
 - **`MessageId` can fail.** The node's `payloadId` seam is a pure
   function that answers `Option`. A fault of the OpenSSL SHA-256 gives
   `none`, and the node drops the message.

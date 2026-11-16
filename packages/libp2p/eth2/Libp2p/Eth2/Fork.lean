@@ -44,8 +44,8 @@ structure Chain where
 namespace Chain
 
 /-- The schedule starts at epoch 0, its epochs ascend strictly, and each
-digest and `ENRForkID` has its width. The slot and the epoch are not
-empty. The service refuses a chain that fails this. -/
+digest and `ENRForkID` has its width. The slot duration and the epoch
+length are above 0. The service refuses a chain that fails this. -/
 def wellFormed (c : Chain) : Bool :=
   let epochs := c.schedule.map (·.epoch)
   epochs.head? == some 0 &&

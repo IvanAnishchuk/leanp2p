@@ -96,8 +96,9 @@ the events. The service carries the bytes and never decodes SSZ.
 
 Every task belongs to the service's task set, and `stop` joins it
 (root §4.1). The discovery loop, the liveness loop, and the fork loop
-park on their timers and on `stopping`, which `stop` closes. The host notifiee and the gossipsub validation
-callback run on tasks that must not park. So they call
+park on their timers and on `stopping`, which `stop` closes. The host
+notifiee and the gossipsub validation callback run on tasks that must
+not park. So they call
 `Config.onEvent`, which must not park either, and they spawn the work
 that waits. `stop` closes the host before it joins the set, and the
 host's close removes the notifiee, so no spawn comes after the join.
@@ -131,7 +132,7 @@ inductive Event where
   arrived: the `seq_number` of the Ping and the 25 bytes of SSZ. -/
   | metaData (peer : PeerId) (seq : Nat) (metaData : ByteArray)
   /-- A peer did not answer our Ping. The spec lets the client end the
-  connection ("MAY disconnect"); the service leaves that to the client
+  connection ("MAY disconnect"), and the client decides
   (`Service.disconnect`). -/
   | unresponsive (peer : PeerId)
   /-- A partial message on a column topic: the column, the block root of
@@ -150,9 +151,9 @@ inductive Event where
 
 /-- The answer of one chunk to an inbound request: the context bytes,
 the `ForkDigest` of the chunk's epoch, and the SSZ. It answers `false`
-when the stream failed or the answer holds the method's most chunks
-(`Method.maxChunks`), and the client should stop then. The service never
-sends a chunk past that cap. -/
+when the stream failed or the answer already holds `Method.maxChunks`
+chunks, and the client should stop then. The service never sends a
+chunk past that cap. -/
 abbrev Emit := ByteArray → ByteArray → Async Bool
 
 /-- Our `MetaData`, as the client encodes it. The service answers Ping
