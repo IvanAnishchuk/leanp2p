@@ -284,6 +284,16 @@ private def peerstoreChecks (r : Runner) : Async Unit := do
   r.check "the peer cap refuses a new peer" (Peerstore.addrsOf two small).isEmpty
   let more := Peerstore.addAddrs large [a2] one (limits := { peers := 1 })
   r.check "the peer cap takes a known peer's address" (Peerstore.addrsOf more large == [a1, a2])
+  -- A full store of expired dial addresses takes a new peer after a
+  -- prune, as the eth2 liveness loop runs it.
+  let full := Peerstore.addAddrs large [a1] {} (nowMs := 0) (ttlMs := some dialAddrTtlMs)
+    (limits := { peers := 1 })
+  let refused := Peerstore.addAddrs small [a2] full (nowMs := dialAddrTtlMs) (limits := { peers := 1 })
+  r.check "a full store refuses a new peer before the prune" (Peerstore.addrsOf refused small).isEmpty
+  let pruned := Peerstore.prune full dialAddrTtlMs
+  let taken := Peerstore.addAddrs small [a2] pruned (nowMs := dialAddrTtlMs) (limits := { peers := 1 })
+  r.check "the prune frees the place of an expired dial address"
+    (Peerstore.addrsOf taken small dialAddrTtlMs == [a2])
 
 /-! ## The limiting resource manager -/
 

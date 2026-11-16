@@ -28,4 +28,12 @@ peer that opens a stream and stays silent would hold its stream
 reservation until the session ends. The expiry resets the stream. -/
 def streamNegotiationMs : Nat := 10000
 
+/-- The lifetime of a dial address in the peerstore, in milliseconds:
+go-libp2p's `TempAddrTTL` of 2 minutes (`core/peerstore/peerstore.go`),
+which its `Connect` gives the addresses it dials
+(`p2p/host/basic/basic_host.go`). A discovered address with no lifetime
+stays until the owner removes it, and the store refuses new peers once
+it holds `Peerstore.Limits.peers`. -/
+def dialAddrTtlMs : Nat := 120000
+
 end Libp2p.Host

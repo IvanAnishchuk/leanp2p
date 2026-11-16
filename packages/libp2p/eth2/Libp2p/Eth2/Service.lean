@@ -498,12 +498,14 @@ def watchPeers (b : Base) : BaseIO Unit :=
         b.peers.update (·.disconnect peer)
         b.config.onEvent (.disconnected peer)
 
-/-- Dial the peer of a record, through its consensus addresses. -/
+/-- Dial the peer of a record, through its consensus addresses. The
+addresses live `Host.dialAddrTtlMs` in the peerstore, as go's `Connect`
+keeps them. Discovery finds the record again for a later dial. -/
 def dialRecord (b : Base) (r : Enr) : BaseIO Unit := do
   let .ok peer := r.peerId | return
   let .ok addrs := r.dialAddrs | return
   if addrs.isEmpty || peer == b.host.localPeer then return
-  b.host.addAddrs peer addrs
+  b.host.addAddrs peer addrs (ttlMs := some Libp2p.Host.dialAddrTtlMs)
   b.tasks.spawn (discard <| b.host.dialPeer peer)
 
 /-- The discovery loop. Park: the timer wakes it, and so does `stop`,
@@ -545,10 +547,16 @@ intervals are 15 s and 20 s, so a look each second keeps a Ping within
 one second of its time. -/
 def livenessTickMs : Nat := 1000
 
-/-- The liveness loop: each tick, ping every peer that is due. Park: the
-timer wakes it, and so does `stop`, which closes `stopping`. `partial`,
-as the IO loops are. -/
-partial def liveness (b : Base) (stopping : Chan Unit) : Async Unit := do
+/-- The ticks of the liveness loop between two prunes of the peerstore:
+one prune a minute. A prune folds the whole store, so it does not run
+at each tick. -/
+def peerstorePruneTicks : Nat := 60
+
+/-- The liveness loop: each tick, ping every peer that is due. Every
+`peerstorePruneTicks` ticks, the expired addresses leave the peerstore,
+so the store keeps room for new peers. Park: the timer wakes it, and so
+does `stop`, which closes `stopping`. `partial`, as the IO loops are. -/
+partial def liveness (b : Base) (stopping : Chan Unit) (tick : Nat := 0) : Async Unit := do
   let timer ← (Park.sleep livenessTickMs false : BaseIO (Park Bool))
   if ← select #[Park.recv stopping (fun _ => true), timer] then return
   let now ← (IO.monoMsNow : BaseIO Nat)
@@ -558,7 +566,8 @@ partial def liveness (b : Base) (stopping : Chan Unit) : Async Unit := do
   -- The full buckets go, so the table holds the peers of the last period.
   let nowUs := (← (IO.monoNanosNow : BaseIO Nat)) / 1000
   (b.buckets.update (·.map fun _ bk => bk.prune nowUs) : BaseIO Unit)
-  b.liveness stopping
+  if (tick + 1) % peerstorePruneTicks == 0 then (b.host.prunePeerstore : BaseIO Unit)
+  b.liveness stopping (tick + 1)
 
 end Base
 
