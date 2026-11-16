@@ -73,7 +73,7 @@ private def peerRec : PeerData :=
 
 /-- Three peers on topic `t`. The mesh holds `pb`. -/
 private def start : State :=
-  { peers := [(pa, peerRec), (pb, peerRec), (pc, peerRec)]
+  { peers := Std.HashMap.ofList [(pa, peerRec), (pb, peerRec), (pc, peerRec)]
     mesh := [(ta, [pb])]
     fanout := []
     mcache := Cache.MessageIndex.empty params.window

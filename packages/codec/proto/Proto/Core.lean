@@ -108,6 +108,26 @@ def takeBytes (n : Nat) (bs : List Nat) : Except Error (List Nat × List Nat) :=
     else .ok (bs.take n, bs.drop n)
   else .error (.framing .malformed)
 
+/-- `takeBytes` with the length check on the first `n` bytes only. The
+check of `takeBytes` walks the whole input, so a message of `k` fields
+in `m` bytes would cost `k * m` steps: a 9 KiB gossipsub subscription
+RPC walks its bytes once for each of its 205 fields. -/
+def takeBytesFast (n : Nat) (bs : List Nat) : Except Error (List Nat × List Nat) :=
+  let head := bs.take n
+  if ∀ b ∈ head, b < 256 then
+    if head.length < n then .error (.framing .truncated)
+    else .ok (head, bs.drop n)
+  else .error (.framing .malformed)
+
+/-- The compiled `takeBytes` is the fast form: `(bs.take n).length` is
+`min n bs.length`, which is below `n` exactly when `bs.length` is. -/
+@[csimp] theorem takeBytes_eq_fast : @takeBytes = @takeBytesFast := by
+  funext n bs
+  have h : ((bs.take n).length < n) = (bs.length < n) := by
+    simp only [List.length_take, eq_iff_iff]
+    omega
+  simp only [takeBytes, takeBytesFast, h]
+
 /-- Fixed-width fields share the length and byte checks. -/
 def readFixed (n : Nat) (bs : List Nat) : Except Error (Nat × List Nat) := do
   let (payload, rest) ← takeBytes n bs

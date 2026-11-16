@@ -152,6 +152,12 @@ type, and each maps it into `Core.Error` once, at its own seam (§3.5).
   (the spike's Identify case runs 5, 6, 1, 2, 2, 4, 3, 3), so a
   re-encode stays byte-exact at every layer. The earlier root wording,
   "tag order", was amended at the root, and this document follows it.
+- **A field's length check reads the field's bytes.** `takeBytes`
+  states the check over the whole input (`bs.length < n`), the form the
+  proofs use. A check of the whole input for each field makes a message
+  of `k` fields in `m` bytes cost `k * m` steps. `takeBytesFast` checks
+  the first `n` bytes instead, and a `@[csimp]` theorem
+  (`takeBytes_eq_fast`) makes the compiler run it.
 
 ## Wire bounds and message boundaries
 

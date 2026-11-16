@@ -280,8 +280,10 @@ structure Fanout where
 
 /-- The router state. -/
 structure State where
-  /-- The known peers and their records. -/
-  peers : List (Peer × PeerData)
+  /-- The known peers and their records. A hash map: the router reads a
+  record for each candidate of each topic at every heartbeat, so a list
+  scan there costs millions of peer-id comparisons at 200 peers. -/
+  peers : Std.HashMap Peer PeerData
   /-- The mesh of each topic. -/
   mesh : List (TopicId × List Peer)
   /-- The fanout of each topic. -/
@@ -310,8 +312,8 @@ structure State where
   /-- The receipt time of each held message (`expirePending`). -/
   pendingAt : List (MessageId × Millis) := []
   /-- The IDONTWANT pairs (gossipsub v1.2): a forward of the id skips
-  the peer. Newest first. -/
-  dontSend : List (Peer × MessageId) := []
+  the peer. -/
+  dontSend : Cache.DontSendTable := {}
   /-- The explicit peers (`gossipsub-v1.1.md`, "Explicit Peering
   Agreements"): outside every mesh, and sent every valid message. -/
   explicit : List Peer := []
@@ -464,30 +466,30 @@ def fanoutOf (s : State) (topic : TopicId) : List Peer :=
 def setTopicFanout (s : State) (topic : TopicId) (f : Fanout) : State :=
   { s with fanout := (topic, f) :: s.fanout.filter (fun e => decide (e.1 ≠ topic)) }
 
-/-- The first record of the peer. -/
-def lookupPeer : List (Peer × PeerData) → Peer → Option PeerData
-  | [], _ => none
-  | (q', pd) :: l, q => if q = q' then some pd else lookupPeer l q
-
-/-- Replace the first record of the peer, or append the peer. -/
-def upsertPeer : List (Peer × PeerData) → Peer → PeerData → List (Peer × PeerData)
-  | [], q, pd => [(q, pd)]
-  | (q', pd') :: l, q, pd => if q = q' then (q, pd) :: l else (q', pd') :: upsertPeer l q pd
-
 /-- The record of the peer. -/
-def peerOf (s : State) (q : Peer) : Option PeerData := lookupPeer s.peers q
+def peerOf (s : State) (q : Peer) : Option PeerData := s.peers[q]?
 
 /-- Write the record of the peer. -/
 def setPeer (s : State) (q : Peer) (pd : PeerData) : State :=
-  { s with peers := upsertPeer s.peers q pd }
+  { s with peers := s.peers.insert q pd }
 
-/-- Update every peer record through `f`. The list order stays. -/
+/-- Update every peer record through `f`. -/
 def mapPeers (s : State) (f : Peer → PeerData → PeerData) : State :=
-  { s with peers := s.peers.map (fun e => (e.1, f e.1 e.2)) }
+  { s with peers := s.peers.map f }
+
+/-- The peers whose record passes `keep`, in peer id order. The hash
+map has no order of its own, so the sort keeps the core's answers
+deterministic. The heartbeat takes its order from the `tick` event
+instead. -/
+def peersWhere (s : State) (keep : Peer → PeerData → Bool) : List Peer :=
+  (s.peers.fold (fun acc q pd => if keep q pd then q :: acc else acc) []).mergeSort
+    fun a b => (compare a b).isLE
 
 /-- Update the score state of one peer and leave every other field. -/
 def updateScoreOf (s : State) (q : Peer) (f : Score.PeerState → Score.PeerState) : State :=
-  mapPeers s (fun r pd => if r = q then { pd with score := f pd.score } else pd)
+  match s.peers[q]? with
+  | some pd => { s with peers := s.peers.insert q { pd with score := f pd.score } }
+  | none => s
 
 /-- The score of a peer at the state time. A missing peer scores 0. -/
 def scoreOf (p : Params) (s : State) (q : Peer) : Score :=
@@ -639,8 +641,8 @@ def inboundTargets (s : State) (sender : Peer) (topic : TopicId) : List Peer :=
 threshold: go-libp2p-pubsub's `rpcs` sends every message to them, from
 us or forwarded ("floodsub peers", `gossipsub.go`). -/
 def floodTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
-  (s.peers.filter fun e => e.2.proto == .floodsub && memB topic e.2.subs &&
-    decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1)).map Prod.fst
+  peersWhere s fun q pd => pd.proto == .floodsub && memB topic pd.subs &&
+    decide (p.thresholds.publishThreshold ≤ scoreOf p s q)
 
 /-- One publish RPC per accepted message, to each mesh peer, explicit
 peer, and floodsub peer other than the sender. The targets come from
@@ -724,7 +726,7 @@ structure TopicPlan where
 
 /-- The peers that announce the topic. -/
 def announced (s : State) (topic : TopicId) : List Peer :=
-  (s.peers.filter (fun e => memB topic e.2.subs)).map Prod.fst
+  peersWhere s fun _ pd => memB topic pd.subs
 
 /-- The peer exchange of a prune to `target` on `topic`
 (`gossipsub-v1.1.md`, "PRUNE Backoff and Peer Exchange"). With `doPX`
@@ -753,6 +755,14 @@ def pickAdded (cands : List Peer) (isOut : Peer → Bool) (need outNeed : Nat) :
     (outNeed - (base.filter isOut).length)
   base ++ extra
 
+/-- A member of a list that a condition may replace with `[]` is a
+member of the list. -/
+theorem mem_of_mem_ite_nil {c : Prop} [Decidable c] {l : List Peer} {q : Peer}
+    (h : q ∈ (if c then [] else l)) : q ∈ l := by
+  split at h
+  · simp at h
+  · exact h
+
 /-- A picked peer is a candidate. -/
 theorem mem_pickAdded {cands : List Peer} {isOut : Peer → Bool} {need outNeed : Nat} {q : Peer}
     (h : q ∈ pickAdded cands isOut need outNeed) : q ∈ cands := by
@@ -772,14 +782,14 @@ theorem mem_pickAdded {cands : List Peer} {isOut : Peer → Bool} {need outNeed 
 
 The plan cuts the kept list at `dHigh`, so the mesh bound holds by
 construction. -/
-def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
-    (topic : TopicId) : TopicPlan :=
+def planTopicWith (score : Peer → Score) (p : Params) (s : State) (now : Millis)
+    (order : List Peer) (topic : TopicId) : TopicPlan :=
   let ps := meshOf s topic
   -- An overfull mesh keeps its `dScore` best-scoring peers, then fills to
   -- `d` from the rest (`gossipsub-v1.1.md`, lines 247 to 258), and prunes
   -- the others. Ties and the fill prefer the back of the mesh list, and
   -- the kept peers keep their mesh order.
-  let best := (ps.reverse.mergeSort (fun a b => decide (scoreOf p s b ≤ scoreOf p s a))).take
+  let best := (ps.reverse.mergeSort (fun a b => decide (score b ≤ score a))).take
     p.mesh.dScore
   let isOut (q : Peer) : Bool := ((peerOf s q).map (·.outbound)).getD false
   let rest := ps.filter (fun q => !memB q best)
@@ -794,15 +804,43 @@ def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
     else ps
   let over := ps.filter (fun q => !memB q kept0)
   let need := if kept0.length < p.mesh.dLow then p.mesh.d - kept0.length else 0
-  let cands := order.filter (fun q =>
-    !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
-      (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit && !isFlood s q)
-  let added := pickAdded cands isOut need (p.dOut - (kept0.filter isOut).length)
+  let outNeed := p.dOut - (kept0.filter isOut).length
+  -- A full mesh with its outbound quota adds no peer, so the plan skips
+  -- the pass over the candidates. The filter sits inside the branch,
+  -- since strict evaluation would run a `let` above it on every topic.
+  let added := if need = 0 ∧ outNeed = 0 then [] else
+    pickAdded (order.filter (fun q =>
+      !memB q ps && !(Cache.Backoff.active s.backoff q topic now) &&
+        (peerOf s q).isSome && decide (0 ≤ score q) && !memB q s.explicit && !isFlood s q))
+      isOut need outNeed
   { topic := topic, kept := (kept0 ++ added).take p.mesh.dHigh, pruned := over, added := added }
+
+/-- The plan of one topic under the state's scores. -/
+def planTopic (p : Params) (s : State) (now : Millis) (order : List Peer)
+    (topic : TopicId) : TopicPlan :=
+  planTopicWith (scoreOf p s) p s now order topic
+
+/-- The plan of every topic in the mesh, under `score`. -/
+def planListWith (score : Peer → Score) (p : Params) (s : State) (now : Millis)
+    (order : List Peer) : List TopicPlan :=
+  s.mesh.map (fun e => planTopicWith score p s now order e.1)
 
 /-- The plan of every topic in the mesh. -/
 def planList (p : Params) (s : State) (now : Millis) (order : List Peer) : List TopicPlan :=
   s.mesh.map (fun e => planTopic p s now order e.1)
+
+/-- The scores of every known peer at the state time, each computed
+once. A heartbeat asks for each peer's score once per topic, so a
+consensus node with 200 peers and 205 topics would compute each score
+about 400 times. -/
+def scoreTable (p : Params) (s : State) : Std.HashMap Peer Score :=
+  s.peers.map fun _ pd => Score.score p.score pd.score s.now
+
+/-- A lookup of the table is `scoreOf`. -/
+theorem scoreTable_get (p : Params) (s : State) (q : Peer) :
+    (scoreTable p s)[q]?.getD 0 = scoreOf p s q := by
+  simp only [scoreTable, Std.HashMap.getElem?_map, scoreOf, peerOf]
+  cases s.peers[q]? <;> rfl
 
 /-- Apply the score updates of the plans: a pruned peer takes the prune
 update, an added peer takes the graft update. -/
@@ -823,15 +861,19 @@ def planActions (p : Params) (s : State) (pl : TopicPlan) : List Action :=
 
 /-- Write the planned meshes and drop the peers below score 0 from every
 mesh. A dropped peer takes the prune score update. -/
-def settleMesh (p : Params) (s : State) (plans : List TopicPlan) : State :=
+def settleMeshWith (score : Peer → Score) (p : Params) (s : State) (plans : List TopicPlan) :
+    State :=
   { s with
     mesh := plans.map (fun pl =>
-      (pl.topic, pl.kept.filter (fun q => decide (0 ≤ scoreOf p s q)))),
-    peers := s.peers.map (fun e =>
-      (e.1, if scoreOf p s e.1 < 0 then
-        { e.2 with
-          score := s.topics.foldl (fun sc t => Score.prune p.score sc s.now t) e.2.score }
-      else e.2)) }
+      (pl.topic, pl.kept.filter (fun q => decide (0 ≤ score q)))),
+    peers := s.peers.map (fun q pd =>
+      if score q < 0 then
+        { pd with score := s.topics.foldl (fun sc t => Score.prune p.score sc s.now t) pd.score }
+      else pd) }
+
+/-- The mesh write under the state's scores. -/
+def settleMesh (p : Params) (s : State) (plans : List TopicPlan) : State :=
+  settleMeshWith (scoreOf p s) p s plans
 
 /-- The gossip targets of a topic. A candidate is a peer of the order at
 or above the gossip threshold. The candidates exclude the peers of the
@@ -839,11 +881,20 @@ topic's mesh and fanout, and the floodsub peers. Adaptive gossip
 (`gossipsub-v1.1.md`, lines 165 to 184) takes at least `dLazy`
 candidates. When `gossipFactor` percent of the candidates is more, it
 takes that many. -/
-def gossipTargets (p : Params) (s : State) (order : List Peer) (t : TopicId) : List Peer :=
+def gossipTargetsWith (score : Peer → Score) (p : Params) (s : State) (order : List Peer)
+    (t : TopicId) : List Peer :=
+  -- The mesh and the fanout are bound once: the compiler hoists no call
+  -- out of the filter, and each lookup walks the topic list.
+  let mesh := meshOf s t
+  let fanout := fanoutOf s t
   let cands := order.filter (fun q =>
-    decide (p.thresholds.gossipThreshold ≤ scoreOf p s q) &&
-      !(memB q (meshOf s t)) && !(memB q (fanoutOf s t)) && !isFlood s q)
+    decide (p.thresholds.gossipThreshold ≤ score q) &&
+      !(memB q mesh) && !(memB q fanout) && !isFlood s q)
   cands.take (max p.mesh.dLazy (cands.length * p.gossipFactor / 100))
+
+/-- The gossip targets of a topic under the state's scores. -/
+def gossipTargets (p : Params) (s : State) (order : List Peer) (t : TopicId) : List Peer :=
+  gossipTargetsWith (scoreOf p s) p s order t
 
 /-- The gossip actions of each topic of the mesh and the fanout. The core
 draws the targets of a topic (`gossipTargets`), then splits them, as
@@ -856,16 +907,21 @@ topic.
 Partial messages never enter the message cache. So the core makes the
 offer also when the cache holds no id. The ids come from the cache as it
 stands, so a heartbeat emits gossip before it shifts the cache. -/
-def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
+def gossipActionsWith (score : Peer → Score) (p : Params) (s : State) (order : List Peer) :
+    List Action :=
   let topics := s.mesh.map Prod.fst ++ s.fanout.map Prod.fst
   topics.flatMap fun t =>
-    let targets := gossipTargets p s order t
+    let targets := gossipTargetsWith score p s order t
     let partials := targets.filter (wantsPartial p s · t)
     let ids := Cache.MessageIndex.gossipIds s.mcache t
     let offer := if partials = [] then [] else [Action.partialGossip t partials]
     let ihaves := if ids = [] then []
       else (targets.filter (!wantsPartial p s · t)).map fun q => Action.sendRpc q (ihaveRpc t ids)
     ihaves ++ offer
+
+/-- The gossip actions under the state's scores. -/
+def gossipActions (p : Params) (s : State) (order : List Peer) : List Action :=
+  gossipActionsWith (scoreOf p s) p s order
 
 /-- The state at the start of the heartbeat: the scores decayed when a
 decay interval has passed, the new clock, the cleared backoff table, the
@@ -874,7 +930,7 @@ def freshState (p : Params) (s : State) (now : Millis) : State :=
   let due := decide (p.score.global.decayInterval ≤ now - s.lastDecay)
   { s with
     peers := if due then
-        s.peers.map (fun e => (e.1, { e.2 with score := Score.decay p.score e.2.score }))
+        s.peers.map (fun _ pd => { pd with score := Score.decay p.score pd.score })
       else s.peers,
     lastDecay := if due then now else s.lastDecay,
     now := now,
@@ -929,27 +985,35 @@ def heartbeat (p : Params) (s : State) (now : Millis) (order : List Peer) :
   (heartbeatNext p s now order, heartbeatActions p s now order)
 
 /-- The heartbeat in one pass: the fresh state, the plans, and the scored
-state each once. `heartbeat` names them part by part, and the proofs
-reason about the parts. Lean evaluates strictly and hoists no call out
-of a function, so the parts would plan every topic again for each use,
-and `negativeActions` once more for each kept peer of each plan. -/
+state each once, and each peer's score once per state that the plans
+and the gossip read (`scoreTable`). `heartbeat` names the parts one by
+one, and the proofs reason about the parts. Lean evaluates strictly and
+hoists no call out of a function, so the parts would plan every topic
+again for each use, and `negativeActions` once more for each kept peer
+of each plan. -/
 def heartbeatOnce (p : Params) (s : State) (now : Millis) (order : List Peer) :
     State × List Action :=
   let fresh := freshState p s now
-  let plans := planList p fresh now order
+  let freshScores := scoreTable p fresh
+  let plans := planListWith (fun q => freshScores[q]?.getD 0) p fresh now order
   let scored := applyPlanScores p fresh plans
-  let next := settleMesh p scored plans
+  let scoredScores := scoreTable p scored
+  let next := settleMeshWith (fun q => scoredScores[q]?.getD 0) p scored plans
   let negative := plans.flatMap (fun pl =>
-    (pl.kept.filter (fun q => decide (scoreOf p scored q < 0))).map
+    (pl.kept.filter (fun q => decide (scoredScores[q]?.getD 0 < 0))).map
       (fun q => Action.sendRpc q (pruneRpc pl.topic p.pruneBackoff)))
+  let gossip : State := { next with mcache := s.mcache }
+  let gossipScores := scoreTable p gossip
   (next, plans.flatMap (planActions p fresh) ++ negative ++
-    gossipActions p { next with mcache := s.mcache } order)
+    gossipActionsWith (fun q => gossipScores[q]?.getD 0) p gossip order)
 
-/-- The compiled heartbeat is the one pass. Both sides unfold to the same
-terms, and `csimp` makes the compiler run `heartbeatOnce` wherever the
-code says `heartbeat`. -/
+/-- The compiled heartbeat is the one pass. The parts unfold to the same
+terms once each table lookup reads as `scoreOf` (`scoreTable_get`), and
+`csimp` makes the compiler run `heartbeatOnce` wherever the code says
+`heartbeat`. -/
 @[csimp] theorem heartbeat_eq_once : @heartbeat = @heartbeatOnce := by
   funext p s now order
+  simp only [heartbeatOnce, scoreTable_get]
   rfl
 
 /-! ## The event handlers -/
@@ -975,7 +1039,7 @@ records, and the promise table, and keep its record with the departure
 time for `retainScore` (`join`). -/
 def leave (s : State) (peer : Peer) : State × List Action :=
   ({ s with
-     peers := s.peers.filter (fun e => decide (e.1 ≠ peer)),
+     peers := s.peers.erase peer,
      mesh := s.mesh.map (fun e => (e.1, e.2.filter (fun q => decide (q ≠ peer)))),
      fanout := s.fanout.map (fun e =>
        (e.1, { e.2 with peers := e.2.peers.filter (fun q => decide (q ≠ peer)) })),
@@ -1079,7 +1143,7 @@ def idontwantRpc (ids : List MessageId) : Rpc.RPC :=
 id. Other actions pass. -/
 def dropDontWant (p : Params) (s : State) (acts : List Action) : List Action :=
   acts.filter fun a => match a with
-    | .sendRpc q r => !(r.publish.any fun m => memB (q, p.msgId m) s.dontSend)
+    | .sendRpc q r => !(r.publish.any fun m => s.dontSend.has q (p.msgId m))
     | _ => true
 
 theorem mem_dropDontWant {p : Params} {s : State} {acts : List Action} {a : Action}
@@ -1088,7 +1152,7 @@ theorem mem_dropDontWant {p : Params} {s : State} {acts : List Action} {a : Acti
 
 /-- Drop the IDONTWANT pairs of one id. -/
 def forgetDontWant (s : State) (id : MessageId) : State :=
-  { s with dontSend := s.dontSend.filter fun e => decide (e.2 ≠ id) }
+  { s with dontSend := s.dontSend.forget id }
 
 /-- Record the IDONTWANT ids of a control message from `sender`, up to
 `dontSendCap` pairs. -/
@@ -1097,7 +1161,7 @@ def noteDontWant (p : Params) (s : State) (sender : Peer) : Option Rpc.ControlMe
   | some c =>
     let ids := c.idontwant.flatMap (·.messageIds)
     if ids.isEmpty then s
-    else { s with dontSend := (ids.map (sender, ·) ++ s.dontSend).take p.dontSendCap }
+    else { s with dontSend := ids.foldl (fun t id => t.add p.dontSendCap sender id) s.dontSend }
 
 /-- `handlePubs` under `Params.validateMessages`. It accepts as
 `handlePubs` does, then holds each accepted message for the
@@ -1224,12 +1288,15 @@ def maintain (p : Params) (s : State) (now : Millis) (opportunistic : Bool := fa
   let s0 := broken.foldl (fun st (q, n) =>
     updateScoreOf st q (fun sc => (List.replicate n ()).foldl (fun sc _ => Score.behaviourPenalty sc) sc)) s
   -- P₆: one count per IP address over the known peers.
-  let ips := s0.peers.filterMap (·.2.ip)
-  let s1 : State := { s0 with peers := s0.peers.map fun (q, pd) =>
-    (q, { pd with score := { pd.score with ipColocation :=
+  let ips : Std.HashMap (List Nat) Nat := s0.peers.fold (fun m _ pd =>
+    match pd.ip with
+    | some a => m.insert a (m.getD a 0 + 1)
+    | none => m) {}
+  let s1 : State := { s0 with peers := s0.peers.map fun _ pd =>
+    { pd with score := { pd.score with ipColocation :=
       match pd.ip with
-      | some a => (ips.filter (· == a)).length
-      | none => 0 } }) }
+      | some a => ips.getD a 0
+      | none => 0 } } }
   let (s1, grafts) := if opportunistic then opportunisticGrafts p s1 now else (s1, [])
   ({ s1 with
     iwant := s1.iwant.filter (fun e => decide (now < e.deadline))
@@ -1547,8 +1614,8 @@ topic, the fanout otherwise, and the floodsub peers of the topic
 def publishTargets (p : Params) (s : State) (topic : TopicId) : List Peer :=
   if p.floodPublish then
     -- Every peer that announced the topic, at or above the publish threshold.
-    (s.peers.filter (fun e => memB topic e.2.subs &&
-      decide (p.thresholds.publishThreshold ≤ scoreOf p s e.1))).map Prod.fst
+    peersWhere s fun q pd => memB topic pd.subs &&
+      decide (p.thresholds.publishThreshold ≤ scoreOf p s q)
   else
     let gossip := if memB topic s.topics then meshOf s topic else fanoutOf s topic
     gossip ++ (floodTargets p s topic).filter (fun q => !memB q gossip)
@@ -1758,55 +1825,22 @@ theorem meshOf_setTopicMesh_ne (s : State) (t t' : TopicId) (h : t' ≠ t)
     (ps : List Peer) : meshOf (setTopicMesh s t ps) t' = meshOf s t' := by
   simp [meshOf, setTopicMesh, lookupTopic_upsertMesh_ne t' t h]
 
-private theorem lookupPeer_upsertPeer_same (l : List (Peer × PeerData)) (q : Peer)
-    (pd : PeerData) : lookupPeer (upsertPeer l q pd) q = some pd := by
-  induction l with
-  | nil => simp [upsertPeer, lookupPeer]
-  | cons e l ih =>
-    obtain ⟨q', pd'⟩ := e
-    by_cases h : q = q'
-    · simp [upsertPeer, lookupPeer, h]
-    · simp [upsertPeer, lookupPeer, h, ih]
-
-private theorem lookupPeer_upsertPeer_ne (q' q : Peer) (h : q' ≠ q)
-    (l : List (Peer × PeerData)) (pd : PeerData) :
-    lookupPeer (upsertPeer l q pd) q' = lookupPeer l q' := by
-  induction l with
-  | nil => simp [upsertPeer, lookupPeer, h]
-  | cons e l ih =>
-    obtain ⟨u, ud⟩ := e
-    by_cases h2 : q = u
-    · subst h2
-      simp [upsertPeer, lookupPeer, h]
-    · simp [upsertPeer, lookupPeer, h2, ih]
-
 /-- The record of the written peer. -/
 theorem peerOf_setPeer_same (s : State) (q : Peer) (pd : PeerData) :
     peerOf (setPeer s q pd) q = some pd := by
-  simp [peerOf, setPeer, lookupPeer_upsertPeer_same]
+  simp [peerOf, setPeer]
 
 /-- A write of one peer leaves the record of another peer. -/
 theorem peerOf_setPeer_ne (s : State) (q q' : Peer) (h : q' ≠ q) (pd : PeerData) :
     peerOf (setPeer s q pd) q' = peerOf s q' := by
-  simp [peerOf, setPeer, lookupPeer_upsertPeer_ne q' q h]
+  simp only [peerOf, setPeer, Std.HashMap.getElem?_insert]
+  -- The `BEq` of `Peer` is its `DecidableEq`, so `q == q'` is `q = q'`.
+  simp [Ne.symm h]
 
-private theorem lookupPeer_map (l : List (Peer × PeerData))
-    (f : Peer → PeerData → PeerData) (q : Peer) :
-    lookupPeer (l.map (fun e => (e.1, f e.1 e.2))) q = (lookupPeer l q).map (f q) := by
-  induction l with
-  | nil => simp [lookupPeer]
-  | cons e l ih =>
-    obtain ⟨q', pd'⟩ := e
-    simp only [List.map_cons, lookupPeer]
-    by_cases h : q = q'
-    · subst h
-      simp
-    · simp [h, ih]
-
-/-- The record of a peer after a map over the whole list. -/
+/-- The record of a peer after a map over the whole table. -/
 theorem peerOf_mapPeers (s : State) (f : Peer → PeerData → PeerData) (q : Peer) :
     peerOf (mapPeers s f) q = (peerOf s q).map (f q) := by
-  simp [peerOf, mapPeers, lookupPeer_map]
+  simp [peerOf, mapPeers]
 
 /-- The score of a peer after a map over the whole peer list. -/
 theorem scoreOf_mapPeers (p : Params) (s : State) (f : Peer → PeerData → PeerData)
@@ -1828,7 +1862,7 @@ theorem scoreOf_congr (p : Params) {s s' : State} (hpeers : s'.peers = s.peers)
 /-- The plan of a topic keeps at most `dHigh` peers. -/
 theorem planTopic_kept_le (p : Params) (s : State) (now : Millis) (order : List Peer)
     (t : TopicId) : (planTopic p s now order t).kept.length ≤ p.mesh.dHigh := by
-  simp only [planTopic]
+  simp only [planTopic, planTopicWith]
   rw [List.length_take]
   omega
 
@@ -1854,7 +1888,7 @@ theorem meshOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (top
       match plans.find? (fun pl => decide (topic = pl.topic)) with
       | some pl => pl.kept.filter (fun q => decide (0 ≤ scoreOf p s q))
       | none => [] := by
-  simp [meshOf, settleMesh, lookupTopic_map_plans]
+  simp [meshOf, settleMesh, settleMeshWith, lookupTopic_map_plans]
 
 /-! ## The mesh bound theorem -/
 
@@ -2342,12 +2376,14 @@ private theorem handleControl_prune (p : Params) (s : State) (sender : Peer)
 private theorem updateScoreOf_mesh (s : State) (q : Peer)
     (f : Score.PeerState → Score.PeerState) (topic : TopicId) :
     meshOf (updateScoreOf s q f) topic = meshOf s topic := by
-  simp [updateScoreOf, mapPeers, meshOf]
+  unfold updateScoreOf
+  split <;> rfl
 
 private theorem updateScoreOf_topics (s : State) (q : Peer)
     (f : Score.PeerState → Score.PeerState) :
     (updateScoreOf s q f).topics = s.topics := by
-  simp [updateScoreOf, mapPeers]
+  unfold updateScoreOf
+  split <;> rfl
 
 private theorem foldl_updateScoreOf_mesh (ms : List Message) (s : State) (sender : Peer)
     (f : Message → Score.PeerState → Score.PeerState) (topic : TopicId) :
@@ -2436,16 +2472,7 @@ theorem peerOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (q :
         if scoreOf p s q < 0 then
           { pd with score := s.topics.foldl (fun sc t => Score.prune p.score sc s.now t) pd.score }
         else pd) := by
-  simp only [peerOf, settleMesh]
-  induction s.peers with
-  | nil => simp [lookupPeer]
-  | cons e l ih =>
-    obtain ⟨a, b⟩ := e
-    simp only [List.map_cons, lookupPeer]
-    by_cases h : q = a
-    · subst h
-      simp
-    · simp [h, ih]
+  simp [peerOf, settleMesh, settleMeshWith]
 
 /-- The score of a peer after the heartbeat mesh write. -/
 theorem scoreOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (q : Peer) :
@@ -2463,7 +2490,7 @@ theorem scoreOf_settleMesh (p : Params) (s : State) (plans : List TopicPlan) (q 
   | none => simp
   | some pd =>
     by_cases hlt : Score.score p.score pd.score s.now < 0 <;>
-      simp [scoreOf, settleMesh, h, hlt]
+      simp [scoreOf, settleMesh, settleMeshWith, h, hlt]
 
 /-- The mesh of a topic after a heartbeat. -/
 theorem meshOf_heartbeatNext (p : Params) (s : State) (now : Millis)
@@ -2473,7 +2500,7 @@ theorem meshOf_heartbeatNext (p : Params) (s : State) (now : Millis)
       | some pl =>
           pl.kept.filter (fun q => decide (0 ≤ scoreOf p (planScored p s now order) q))
       | none => [] := by
-  simp [heartbeatNext, settleMesh, meshOf, lookupTopic_map_plans]
+  simp [heartbeatNext, settleMesh, settleMeshWith, meshOf, lookupTopic_map_plans]
 
 /-! ## The score gate theorems -/
 
@@ -2506,7 +2533,7 @@ theorem mem_gossipActions (p : Params) (s : State) (order : List Peer)
     (to : Peer) (rpc : Rpc.RPC)
     (h : Action.sendRpc to rpc ∈ gossipActions p s order) :
     p.thresholds.gossipThreshold ≤ scoreOf p s to := by
-  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  simp only [gossipActions, gossipActionsWith, List.mem_flatMap, List.mem_append] at h
   obtain ⟨t, _, ht | ht⟩ := h
   · split at ht
     · simp at ht
@@ -2528,7 +2555,7 @@ theorem mem_partialGossip (p : Params) (s : State) (order : List Peer)
     (t : TopicId) (peers : List Peer) (q : Peer)
     (h : Action.partialGossip t peers ∈ gossipActions p s order) (hq : q ∈ peers) :
     q ∈ gossipTargets p s order t ∧ wantsPartial p s q t = true := by
-  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  simp only [gossipActions, gossipActionsWith, List.mem_flatMap, List.mem_append] at h
   obtain ⟨t', _, ht | ht⟩ := h
   · split at ht
     · simp at ht
@@ -2539,7 +2566,7 @@ theorem mem_partialGossip (p : Params) (s : State) (order : List Peer)
     · simp at ht
     · simp only [List.mem_singleton, Action.partialGossip.injEq] at ht
       obtain ⟨rfl, rfl⟩ := ht
-      simpa [List.mem_filter] using hq
+      simpa [List.mem_filter, gossipTargets] using hq
 
 private theorem ihaveRpc_topic {t t' : TopicId} {ids ids' : List MessageId}
     (h : ihaveRpc t' ids' = ihaveRpc t ids) : t' = t := by
@@ -2554,7 +2581,7 @@ theorem gossipActions_no_ihave_partial (p : Params) (s : State) (order : List Pe
     (to : Peer) (t : TopicId) (ids : List MessageId)
     (h : Action.sendRpc to (ihaveRpc t ids) ∈ gossipActions p s order) :
     wantsPartial p s to t = false := by
-  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  simp only [gossipActions, gossipActionsWith, List.mem_flatMap, List.mem_append] at h
   obtain ⟨t', _, ht | ht⟩ := h
   · split at ht
     · simp at ht
@@ -2837,7 +2864,7 @@ private theorem negativeActions_not_deliver (p : Params) (s : State) (now : Mill
 private theorem gossipActions_not_deliver (p : Params) (s : State) (order : List Peer)
     (m : Message) : Action.deliver m ∉ gossipActions p s order := by
   intro h
-  simp only [gossipActions, List.mem_flatMap, List.mem_append] at h
+  simp only [gossipActions, gossipActionsWith, List.mem_flatMap, List.mem_append] at h
   obtain ⟨t, -, ht | ht⟩ := h
   · split at ht
     · simp at ht
@@ -3061,13 +3088,13 @@ private theorem planTopic_added_backoff (p : Params) (s : State) (now : Millis)
     (order : List Peer) (topic : TopicId) {q : Peer}
     (h : q ∈ (planTopic p s now order topic).added) :
     Cache.Backoff.active s.backoff q topic now = false := by
-  simp only [planTopic] at h
+  simp only [planTopic, planTopicWith] at h
   -- `added` is a pick of the candidates (`mem_pickAdded`).
   have hc : q ∈ order.filter (fun q =>
       !memB q (meshOf s topic) && !(Cache.Backoff.active s.backoff q topic now) &&
         (peerOf s q).isSome && decide (0 ≤ scoreOf p s q) && !memB q s.explicit &&
           !isFlood s q) :=
-    mem_pickAdded h
+    mem_pickAdded (mem_of_mem_ite_nil h)
   cases hb : Cache.Backoff.active s.backoff q topic now with
   | false => rfl
   | true =>
@@ -3117,7 +3144,7 @@ theorem tickNoBackoffGraft (p : Params) (s s' : State) (acts : List Action)
       obtain ⟨pl, -, q, -, hqeq⟩ := hmem
       cases hqeq
       exact absurd hgraft (rpcGrafts_pruneRpc _ _ _ _)
-  · simp only [gossipActions, List.mem_flatMap, List.mem_append] at hmem
+  · simp only [gossipActions, gossipActionsWith, List.mem_flatMap, List.mem_append] at hmem
     obtain ⟨t, -, ht | ht⟩ := hmem
     · split at ht
       · simp at ht
@@ -3162,8 +3189,8 @@ them. -/
 theorem planTopicAddedNotFlood (p : Params) (s : State) (now : Millis) (order : List Peer)
     (topic : TopicId) {q : Peer} (h : q ∈ (planTopic p s now order topic).added) :
     isFlood s q = false := by
-  simp only [planTopic] at h
-  have hc := mem_pickAdded h
+  simp only [planTopic, planTopicWith] at h
+  have hc := mem_pickAdded (mem_of_mem_ite_nil h)
   simp only [List.mem_filter, Bool.and_eq_true, Bool.not_eq_true'] at hc
   exact hc.2.2
 

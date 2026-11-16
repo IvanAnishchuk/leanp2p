@@ -12,6 +12,7 @@ import Tests.Gossipsub.HostNode
 import Tests.Gossipsub.Payload
 import Tests.Gossipsub.Partial
 import Tests.Gossipsub.Px
+import Tests.Gossipsub.Load
 import Tests.Leak
 import Tests.Vectors
 import Tests.Concurrency
@@ -65,7 +66,8 @@ pass under a single capability: `lake test -- +RTS -N1 -RTS`
 `LEANP2P_SUITE=protocols` runs `Tests.Protocols`.
 `LEANP2P_SUITE=quic` runs `Tests.Quic`, so a memory checker can run
 the ngtcp2 shim's suite alone. `LEANP2P_SUITE=host` runs `Tests.Host`.
-`LEANP2P_SUITE=eth2` runs `Tests.Eth2`.
+`LEANP2P_SUITE=eth2` runs `Tests.Eth2`. `LEANP2P_SUITE=load` runs the
+router under a consensus load (`Tests.Gossipsub.Load`).
 -/
 
 def main : IO UInt32 := do
@@ -130,6 +132,9 @@ def main : IO UInt32 := do
   if (← IO.getEnv "LEANP2P_SUITE") == some "scale" then
     Tests.Gossipsub.BigMessage.scale r
     return ← r.summary
+  if (← IO.getEnv "LEANP2P_SUITE") == some "load" then
+    Tests.Gossipsub.Load.run r
+    return ← r.summary
   Tests.Vectors.run r
   Tests.Gossipsub.Core.run r
   Tests.Gossipsub.Sign.run r
@@ -139,6 +144,7 @@ def main : IO UInt32 := do
   Tests.Gossipsub.Payload.run r
   Tests.Gossipsub.Partial.run r
   Tests.Gossipsub.Px.run r
+  Tests.Gossipsub.Load.run r
   Tests.Gossipsub.Node.run r
   Tests.Gossipsub.HostNode.run r
   Tests.Gossipsub.HostNode.runPartial r

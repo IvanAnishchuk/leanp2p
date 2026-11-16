@@ -3,18 +3,21 @@ import Libp2p.Protocols.Gossipsub.Types
 /-!
 # Gossipsub caches
 
-The four tables of the gossipsub router: the message cache, the seen
-cache, the backoff table, and the in-flight IWANT promises.
+The tables of the gossipsub router: the message cache, the seen cache,
+the backoff table, the in-flight IWANT promises, and the IDONTWANT
+pairs.
 
 The tables are pure data. Time is an input (`Millis`), never a clock, so
 the router core drives them from a `step` and the suite drives them with
 fixed times.
 
-Every table is a plain `List`, newest first. An add prepends. The spec
-describes the message cache as a ring of history windows; this module
-stores one flat list instead and carries each entry's age, which states
-the same bound (`age < historyLength`) and makes each theorem one list
-induction.
+The model tables are plain `List`s, newest first. An add prepends. The
+spec describes the message cache as a ring of history windows; this
+module stores one flat list instead and carries each entry's age, which
+states the same bound (`age < historyLength`) and makes each theorem one
+list induction. The router runs hash-indexed production forms where a
+consensus load reaches a list scan: `MessageIndex`, `SeenIndex`, and
+`DontSendTable`.
 
 The spec sections are `vendor/specs/pubsub/gossipsub/gossipsub-v1.0.md`
 ("Message Cache", and the `seen` cache paragraph) and
@@ -844,5 +847,70 @@ theorem broken_after_deliver_ignores_id (ps : PromiseTable) (id : MessageId) (no
   intro a _
   by_cases h1 : a.peer = peer <;> by_cases h2 : a.id = id <;> by_cases h3 : a.deadline ≤ now <;>
     simp [h1, h2, h3]
+
+/-! ## The IDONTWANT table (gossipsub v1.2)
+
+A peer's IDONTWANT names ids it already has, so a forward of such an id
+skips that peer. A consensus node gets one IDONTWANT per mesh peer for
+every large message, so the table holds thousands of pairs, and the
+router asks it once per send. The table indexes the pairs by id, so a
+question costs one hash lookup and a walk of the few peers of one id.
+
+A queue in arrival order bounds the table at `cap` pairs: past the cap,
+the oldest pair goes. `forget` drops the pairs of one id from the index
+and leaves their queue entries, so the queue counts them until they
+reach its front. -/
+
+/-- The IDONTWANT pairs, by id, with their arrival queue. -/
+structure DontSendTable where
+  /-- The peers that sent IDONTWANT for each id. -/
+  byId : Std.HashMap MessageId (List Peer) := {}
+  /-- The older half of the queue, oldest first. -/
+  front : List (Peer × MessageId) := []
+  /-- The newer half of the queue, newest first. -/
+  back : List (Peer × MessageId) := []
+  /-- The queue's length. -/
+  len : Nat := 0
+
+namespace DontSendTable
+
+/-- `peer` sent IDONTWANT for `id`. -/
+def has (t : DontSendTable) (peer : Peer) (id : MessageId) : Bool :=
+  match t.byId[id]? with
+  | some ps => ps.contains peer
+  | none => false
+
+/-- Drop the oldest pair. -/
+def popOldest (t : DontSendTable) : DontSendTable :=
+  -- Move `back` into `front` once when `front` is empty.
+  let t := if t.front.isEmpty then { t with front := t.back.reverse, back := [] } else t
+  match t.front with
+  | [] => t
+  | (peer, id) :: rest =>
+    let byId := match t.byId[id]? with
+      | some ps =>
+        match ps.filter (· != peer) with
+        | [] => t.byId.erase id
+        | left => t.byId.insert id left
+      | none => t.byId
+    { t with byId, front := rest, len := t.len - 1 }
+
+/-- Record that `peer` sent IDONTWANT for `id`, and keep at most `cap`
+pairs. -/
+def add (cap : Nat) (t : DontSendTable) (peer : Peer) (id : MessageId) : DontSendTable :=
+  let ps := t.byId[id]?.getD []
+  let t := { t with byId := t.byId.insert id (if ps.contains peer then ps else peer :: ps),
+                    back := (peer, id) :: t.back, len := t.len + 1 }
+  -- One add lifts the length by one, so one pop restores the cap.
+  if cap < t.len then t.popOldest else t
+
+/-- Drop every pair of `id`. -/
+def forget (t : DontSendTable) (id : MessageId) : DontSendTable :=
+  { t with byId := t.byId.erase id }
+
+/-- The pairs the index holds. -/
+def size (t : DontSendTable) : Nat := t.byId.fold (fun n _ ps => n + ps.length) 0
+
+end DontSendTable
 
 end Libp2p.Protocols.Gossipsub.Cache

@@ -32,7 +32,7 @@ group is §7, row 10). The spike has no req/resp or gossipsub code.
 | `Libp2p/Protocols/Gossipsub/Types.lean` | the shared value types: `TopicId`, `MessageId`, `Message`, the thresholds, and `Peer` |
 | `Libp2p/Protocols/Gossipsub/Rpc.lean` | the RPC message of v1.1 to v1.3 with its `ProtoMessage` instances and table theorems (§3.2), and the length-delimited frame step |
 | `Libp2p/Protocols/Gossipsub/Score.lean` | the peer score of `gossipsub-v1.1.md`: the parameters, the counters, decay, and the score function |
-| `Libp2p/Protocols/Gossipsub/Cache.lean` | the message cache, the seen cache, the backoff table, and the IWANT promises |
+| `Libp2p/Protocols/Gossipsub/Cache.lean` | the message cache, the seen cache, the backoff table, the IWANT promises, and the IDONTWANT pairs |
 | `Libp2p/Protocols/Gossipsub/Sign.lean` | the signing policies and the message id functions |
 | `Libp2p/Protocols/Gossipsub/Core.lean` | `State`, `Event`, `Action`, `ProtocolError`, and the total `step` that holds mesh, scoring, heartbeat, peer exchange, and the floodsub forward set (§3.3) |
 | `Libp2p/Protocols/Gossipsub/Payload.lean` | the `ByteArray` payload path: a payload stays a `ByteArray`, and the core sees its id |
@@ -320,10 +320,23 @@ Both spike programs call `Ping.ping`.
   parts one by one computes a shared part again for each use. The
   heartbeat and the control handlers are stated part by part, for the
   proofs, and each has a one-pass twin (`heartbeatOnce`, `runControl`)
-  equal to it by `rfl`. A `@[csimp]` theorem makes the compiler run
-  `heartbeatOnce`. Without it a consensus node, on about 200 topics,
-  planned every topic again for each kept peer of each plan, and the
-  loop fell minutes behind its peers.
+  equal to it. A `@[csimp]` theorem makes the compiler run
+  `heartbeatOnce`. The twin also computes each peer's score once per
+  state (`scoreTable`), and `scoreTable_get` shows that a lookup of the
+  table is `scoreOf`. The parts take the score as a function
+  (`planTopicWith`, `gossipTargetsWith`, `settleMeshWith`), so the
+  proofs read `scoreOf` and the twin reads the table.
+- **The router's hot tables are hash maps.** The peer records
+  (`State.peers`) and the IDONTWANT pairs (`Cache.DontSendTable`) are
+  read for each candidate of each topic and for each send. As lists, at
+  Lighthouse's target of 200 peers and a consensus node's 205 topics,
+  a message cost 15 ms and a heartbeat 2.6 s on one core
+  (`Tests/Gossipsub/Load.lean`). With the hash maps, the score table,
+  and a candidate pass that runs only when a mesh needs peers, a message
+  costs about 160 µs and a heartbeat about 35 ms. The protobuf decoder
+  checks the length of a field on the field's own bytes
+  (`Pb.takeBytesFast`, `@[csimp]`), since a check of the whole input
+  made a message of `k` fields cost `k` times its size.
 - **A frame of our state waits; gossip drops.** A full peer queue drops
   gossip and messages, which the peer can ask for again. A frame with
   subscriptions, GRAFT, PRUNE, or the Extensions message waits on a

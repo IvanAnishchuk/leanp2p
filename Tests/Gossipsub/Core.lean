@@ -88,7 +88,7 @@ private def peerRec (subs : List TopicId) : PeerData :=
   { score := Score.PeerState.zero, proto := .meshsub, subs := subs }
 
 private def emptyState : State :=
-  { peers := []
+  { peers := {}
     mesh := []
     fanout := []
     mcache := Cache.MessageIndex.empty baseParams.window
@@ -102,7 +102,8 @@ private def emptyState : State :=
 /-- A state with the four peers known and the topic `t` subscribed. -/
 private def known : State :=
   { emptyState with
-    peers := [(pa, peerRec [ta]), (pb, peerRec [ta]), (pc, peerRec [ta]), (pd, peerRec [ta])]
+    peers := Std.HashMap.ofList
+      [(pa, peerRec [ta]), (pb, peerRec [ta]), (pc, peerRec [ta]), (pd, peerRec [ta])]
     topics := [ta] }
 
 /-- A message that passes `strictNoSign`: the four signed fields are
@@ -216,7 +217,7 @@ private def negPeerData : PeerData :=
 /-- The state with the negative peer in the mesh of `t`. -/
 private def negState : State :=
   { emptyState with
-    peers := [(pa, negPeerData)]
+    peers := Std.HashMap.ofList [(pa, negPeerData)]
     topics := [ta]
     mesh := [(ta, [pa])]
     now := 0
@@ -285,7 +286,7 @@ def run (r : Runner) : IO Unit := do
   -- A message that fails `strictNoSign` draws no deliver and no
   -- forward, and increments the invalid delivery counter.
   r.check "core.reject.invalid-signature-no-forward"
-    (match step cfgParams { emptyState with peers := [(pa, peerRec [ta])], topics := [ta] }
+    (match step cfgParams { emptyState with peers := Std.HashMap.ofList [(pa, peerRec [ta])], topics := [ta] }
         (.rpc pa (Pb.encodeMessage (rpcOfPublish [badMsg]))) with
      | .ok (s', acts) => delivers badMsg acts = 0 && publishCount acts = 0 &&
          invalidCount s' pa ta = 1
@@ -376,7 +377,7 @@ def run (r : Runner) : IO Unit := do
 
   -- A join sends the hello RPC; a leave drops the peer from the mesh.
   r.check "core.join.hello"
-    (match step baseParams { known with peers := [] } (.peerJoined pa .meshsub) with
+    (match step baseParams { known with peers := {} } (.peerJoined pa .meshsub) with
      | .ok (s', acts) => sendsTo pa acts = 1 && (peerOf s' pa).isSome
      | _ => false)
   r.check "core.leave.mesh"
@@ -492,8 +493,14 @@ def run (r : Runner) : IO Unit := do
   r.check "core.idontwant.forward-skips-peer"
     (match Libp2p.Protocols.Gossipsub.Core.run vParams meshed
         [inbound, dontWantFromPb, .validated ⟨[1]⟩ pa .accept] with
-     | .ok (s', acts) => sendsTo pb acts = 0 && sendsTo pc acts = 1 && s'.dontSend.isEmpty
+     | .ok (s', acts) => sendsTo pb acts = 0 && sendsTo pc acts = 1 && s'.dontSend.size == 0
      | _ => false)
+  -- The table keeps the newest `dontSendCap` pairs: past the cap, the
+  -- oldest pair goes, and a forgotten id leaves the index.
+  let table := [1, 2, 3].foldl (fun t n => t.add 2 pa ⟨[n]⟩) ({} : Cache.DontSendTable)
+  r.check "core.idontwant.cap-drops-the-oldest"
+    (!table.has pa ⟨[1]⟩ && table.has pa ⟨[2]⟩ && table.has pa ⟨[3]⟩ && table.size == 2 &&
+      (table.forget ⟨[3]⟩).size == 1 && !table.has pb ⟨[2]⟩)
 
   -- Explicit peers (`gossipsub-v1.1.md`, "Explicit Peering Agreements").
   -- `pd` announced `t` and sits outside the mesh, yet takes the forward.

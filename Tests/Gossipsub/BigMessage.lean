@@ -45,9 +45,9 @@ def run (r : Runner) : IO Unit := do
   IO.println s!"bigmsg: built and encoded {bytes.length} bytes in {t1 - t0} ms"
   let pa := Tests.Gossipsub.Identity.peer 1
   let pb := Tests.Gossipsub.Identity.peer 2
+  let rec0 : PeerData := { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }
   let s : State :=
-    { peers := [(pa, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }),
-        (pb, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] })]
+    { peers := Std.HashMap.ofList [(pa, rec0), (pb, rec0)]
       mesh := [(ta, [pa, pb])], fanout := []
       mcache := Cache.MessageIndex.empty params.window
       seen := Cache.SeenIndex.empty params.seen
@@ -89,9 +89,9 @@ def runB (r : Runner) : IO Unit := do
   let pa := Tests.Gossipsub.Identity.peer 1
   let pb := Tests.Gossipsub.Identity.peer 2
   let hp : Params := { params with msgId := fun m => ⟨m.data.getD []⟩ }
+  let rec0 : PeerData := { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }
   let s : State :=
-    { peers := [(pa, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] }),
-        (pb, { score := Score.PeerState.zero, proto := .meshsub, subs := [ta] })]
+    { peers := Std.HashMap.ofList [(pa, rec0), (pb, rec0)]
       mesh := [(ta, [pa, pb])], fanout := []
       mcache := Cache.MessageIndex.empty hp.window
       seen := Cache.SeenIndex.empty hp.seen

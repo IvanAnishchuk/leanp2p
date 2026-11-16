@@ -65,7 +65,7 @@ private def rec (proto : PubsubProto := .meshsub) : PeerData :=
 /-- Four meshsub peers on `t`; the mesh holds `pa` and `pb`, full at
 `dHigh`. -/
 private def start : State :=
-  { peers := [(pa, rec), (pb, rec), (pc, rec), (pd, rec)]
+  { peers := Std.HashMap.ofList [(pa, rec), (pb, rec), (pc, rec), (pd, rec)]
     mesh := [(ta, [pa, pb])]
     fanout := []
     mcache := Cache.MessageIndex.empty params.window
@@ -183,7 +183,7 @@ def run (r : Runner) : IO Unit := do
   r.check "px.accept.prunes-mesh" (!memB pa (meshOf s5 ta))
 
   /- ## Floodsub peers -/
-  let flood : State := { start with peers := start.peers ++ [(pe, rec .floodsub)] }
+  let flood : State := { start with peers := start.peers.insert pe (rec .floodsub) }
   -- Our publish reaches the mesh and the floodsub peer.
   let (_, ap) := stepOf params flood (.publish (msgOf [7]))
   r.check "flood.publish" (!(sentTo pe ap).isEmpty && !(sentTo pa ap).isEmpty)

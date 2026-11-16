@@ -868,9 +868,9 @@ private def reconcile (env : Env) (st : LoopState) : BaseIO LoopState := do
   let some livePeers := env.host.peers | return st
   let live ← livePeers
   let unsup ← env.unsupported.get
-  let known := st.router.peers.map (·.1)
+  let known := st.router.peers
   let mut st := st
-  for q in known do
+  for q in known.keys do
     if !live.contains q || unsup.contains q then
       st ← stepAndAct env st (.peerLeft q)
   for q in live do
@@ -911,7 +911,7 @@ private def onWake (env : Env) (st : LoopState) (now : Millis) : BaseIO LoopStat
     let (router, grafts) := Core.maintain st.params st.router now opportunistic
     let st := { st with router }
     discard <| perform env none st.gossipIndex grafts
-    let order := env.config.order st.ticks (st.router.peers.map (·.1))
+    let order := env.config.order st.ticks st.router.peers.keys
     let st ← stepAndAct env st (.tick now order)
     return { st with nextTick := now + st.params.heartbeatInterval, ticks := st.ticks + 1 }
   return st
@@ -971,7 +971,7 @@ private def loop (env : Env) (st0 : LoopState) : Conc.Async Unit := do
 
 /-- The router state of a node with no peers at time `now`. -/
 private def initialState (p : Core.Params) (now : Millis) : Core.State :=
-  { peers := []
+  { peers := {}
     mesh := []
     fanout := []
     mcache := Cache.MessageIndex.empty p.window
@@ -1154,7 +1154,7 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       if ← (closing.get : BaseIO Bool) then return none
       let reply : Conc.Chan (List (Peer × Score)) ← Conc.Chan.new 1
       let k : Core.Params → Core.State → BaseIO Unit := fun p s =>
-        discard <| reply.trySend (s.peers.map fun (q, _) => (q, Core.scoreOf p s q))
+        discard <| reply.trySend (s.peers.keys.map fun q => (q, Core.scoreOf p s q))
       if !(← (control.trySend (.inspect k) : BaseIO Bool)) then return none
       -- Park: the loop answers, or `stop` closes the queue, and the loop
       -- serves the queued inspect before it ends.
@@ -1164,13 +1164,13 @@ def start (host : HostSeam) (config : Config := {}) : BaseIO Node := do
       let reply : Conc.Chan Stats ← Conc.Chan.new 1
       let k : Core.Params → Core.State → BaseIO Unit := fun _ s => do
         discard <| reply.trySend {
-          peers := s.peers.length
+          peers := s.peers.size
           mesh := s.mesh.map fun (t, ps) => (t, ps.length)
           topics := s.topics.length
           seen := s.seen.index.size
           cached := s.mcache.byId.size
           pending := s.pending.length
-          dontSend := s.dontSend.length
+          dontSend := s.dontSend.size
           dropped := ← drops.get
           v12Peers := ((← versions.get).filter (·.2 == Constants.meshsubV12Id)).length
           v13Peers := ((← versions.get).filter (·.2 == Constants.meshsubV13Id)).length }
