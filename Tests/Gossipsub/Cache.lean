@@ -63,10 +63,13 @@ private def lcg (x : Nat) : Nat := (x * 6364136223846793005 + 144269504088896340
 
 /-- The property pin of `SeenIndex` to the model `SeenCache` (CLAUDE.md,
 "Proofs and tests", rule 2): `rounds` random runs of `ops` operations
-each, with capacity 8, a TTL of 50 ms, ids from 0 to 19, and times
-that step forward by 0 to 9 ms. An operation is an add or a prune, and
-after each one every id must agree on `contains`. -/
+each, with capacity 8, a TTL of 50 ms, 20 ids, and times that step
+forward by 0 to 9 ms. An operation is an add or a prune, and after each
+one every id must agree on `contains`. Ids 10 to 19 hold the values 256
+to 265, which equal ids 0 to 9 modulo 256. So a key that kept only the
+low byte of a value would fail the pin. -/
 private def seenIndexPin (rounds ops : Nat) : Bool := Id.run do
+  let mid (k : Nat) : MessageId := Tests.Gossipsub.Cache.mid (if k < 10 then k else k + 246)
   let p : SeenParams := { capacity := 8, ttl := 50, valid := by decide }
   let mut seed := 7
   for _ in [0:rounds] do

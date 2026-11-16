@@ -487,23 +487,40 @@ whose times never decrease, and the router calls them so. The property
 test in `Tests/Gossipsub/Cache.lean` pins that (CLAUDE.md, "Proofs and
 tests", rule 2). With times that decrease, a model `prune` can drop an
 entry from the middle. The index keeps that entry until it reaches the
-front. -/
+front.
+
+The index keys each id by `IdKey`, its bytes in a `ByteArray`. A
+`MessageId` is a `List Nat`, one cons cell per byte, so a 20-byte
+consensus id costs about 580 bytes in a full index. 262144 ids, the
+consensus capacity, held 145 MiB as lists (`LEANP2P_SUITE=scale`). -/
+
+/-- A message id as a map key. An id whose every value is a byte keeps
+its bytes in a `ByteArray`. The model allows any `Nat`, so an id with a
+larger value keeps its list, and two different ids never share a key. -/
+inductive IdKey where
+  | bytes (b : ByteArray)
+  | wide (l : List Nat)
+  deriving BEq, Hashable
+
+/-- The key of an id. -/
+def IdKey.of (id : MessageId) : IdKey :=
+  if id.bytes.all (· < 256) then .bytes ⟨(id.bytes.map (·.toUInt8)).toArray⟩ else .wide id.bytes
 
 /-- The production seen cache. -/
 structure SeenIndex where
   /-- The bounds, shared with the model. -/
   params : SeenParams
   /-- Each live id: its add time, and the number of its queue entry. -/
-  index : Std.HashMap MessageId (Millis × Nat) := {}
+  index : Std.HashMap IdKey (Millis × Nat) := {}
   /-- `(id, number)` in add order, oldest first, with the stale entries.
   The number identifies a stale entry: a second add in the same
   millisecond makes two entries with one id and one time. The queue is
   two lists: `front` oldest first, and `back` newest first. A peek that
   finds `front` empty moves `back` into it once and keeps the result,
   so the walk reverses each entry at most once. -/
-  front : List (MessageId × Nat) := []
+  front : List (IdKey × Nat) := []
   /-- The newer half of the queue, newest first. -/
-  back : List (MessageId × Nat) := []
+  back : List (IdKey × Nat) := []
   /-- The queue's length, stale entries included: the fuel of a walk. -/
   len : Nat := 0
   /-- The next entry number. -/
@@ -516,7 +533,7 @@ def empty (p : SeenParams) : SeenIndex := { params := p }
 
 /-- Whether the id is seen at `now`: `SeenCache.contains`. -/
 def contains (c : SeenIndex) (id : MessageId) (now : Millis) : Bool :=
-  match c.index.get? id with
+  match c.index.get? (IdKey.of id) with
   | some (t, _) => decide (t + c.params.ttl > now)
   | none => false
 
@@ -544,7 +561,8 @@ def popWhile (fuel : Nat) (drop : SeenIndex → Millis → Bool) (c : SeenIndex)
 /-- Record the id at `now`: `SeenCache.add`. Past the capacity, the
 oldest live ids go. -/
 def add (c : SeenIndex) (id : MessageId) (now : Millis) : SeenIndex :=
-  let c := { c with index := c.index.insert id (now, c.next), back := (id, c.next) :: c.back,
+  let key := IdKey.of id
+  let c := { c with index := c.index.insert key (now, c.next), back := (key, c.next) :: c.back,
                     len := c.len + 1, next := c.next + 1 }
   if c.index.size ≤ c.params.capacity then c
   else popWhile c.len (fun c _ => c.params.capacity < c.index.size) c

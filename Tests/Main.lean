@@ -131,6 +131,7 @@ def main : IO UInt32 := do
     return ← r.summary
   if (← IO.getEnv "LEANP2P_SUITE") == some "scale" then
     Tests.Gossipsub.BigMessage.scale r
+    Tests.Gossipsub.BigMessage.memory r
     return ← r.summary
   if (← IO.getEnv "LEANP2P_SUITE") == some "load" then
     Tests.Gossipsub.Load.run r

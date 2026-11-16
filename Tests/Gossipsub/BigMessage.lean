@@ -148,4 +148,28 @@ def scale (r : Runner) (steps : Nat := 500) : IO Unit := do
   IO.println s!"scale index: 65536 ids filled in {t1 - t0} ms; then {n} messages in {t2 - t1} ms, {(t2 - t1) * 1000 / n} us each, {c.index.size} held"
   r.check "scale index: no false hit, capacity held" (hits == 0 && c.index.size == 65536)
 
+/-- The resident size of the process in KiB, from `/proc/self/status`.
+0 where the file is missing. -/
+private def rssKiB : IO Nat := do
+  let text ← try IO.FS.readFile "/proc/self/status" catch _ => pure ""
+  let line := (text.splitOn "\n").find? (·.startsWith "VmRSS:")
+  let digits := (line.getD "").toList.filter Char.isDigit
+  return (String.ofList digits).toNat?.getD 0
+
+/-- The memory of the seen index at the consensus capacity, 262144
+20-byte ids (`Libp2p.Eth2.Gossip.seenCapacity`). The answer is the
+growth of the resident size, so it counts the ids, the map, and the
+queue. `LEANP2P_SUITE=scale` runs it after `scale`. -/
+def memory (r : Runner) : IO Unit := do
+  let ids := 262144
+  let p : Cache.SeenParams := { capacity := ids, ttl := 768000, valid := by decide }
+  let before ← rssKiB
+  let mut c := Cache.SeenIndex.empty p
+  for i in [0:ids] do
+    c := c.add (idOf i) 0
+  let after ← rssKiB
+  IO.println s!"scale memory: {c.index.size} ids hold {(after - before) / 1024} MiB, \
+    {(after - before) * 1024 / ids} bytes each"
+  r.check "scale memory: the index holds every id" (c.index.size == ids)
+
 end Tests.Gossipsub.BigMessage

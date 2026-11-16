@@ -323,8 +323,9 @@ structure State where
   /-- The delivery record of each recent id: the time of its first
   arrival and every peer that sent it. P₃'s near-first deliveries and
   P₄ for every sender of a rejected message read it, as go-libp2p's
-  `deliveries` table does. -/
-  deliveries : Std.HashMap MessageId (Millis × List Peer) := {}
+  `deliveries` table does. It lives as long as the seen cache, so it
+  keys by `Cache.IdKey` as the seen index does. -/
+  deliveries : Std.HashMap Cache.IdKey (Millis × List Peer) := {}
   /-- Per peer this heartbeat: the IHAVE messages it sent and the ids we
   asked it for. `maintain` clears it. -/
   ihaveSeen : Std.HashMap Peer (Nat × Nat) := {}
@@ -1102,16 +1103,17 @@ peer within the topic's `meshMessageDeliveriesWindow` of the first is a
 near-first delivery, and counts toward P₃ (`gossipsub-v1.1.md`, "P₃"),
 once per peer. -/
 def recordOne (p : Params) (credit : Bool) (sender : Peer) (st : State) (m : Message) : State :=
-  match st.deliveries.get? (p.msgId m) with
-  | none => { st with deliveries := st.deliveries.insert (p.msgId m) (st.now, [sender]) }
+  let key := Cache.IdKey.of (p.msgId m)
+  match st.deliveries.get? key with
+  | none => { st with deliveries := st.deliveries.insert key (st.now, [sender]) }
   | some (t, senders) =>
     if memB sender senders then st
     else
       let window := ((p.score.topics m.topic).map (·.meshMessageDeliveriesWindow)).getD 0
       if credit && memB sender (meshOf st m.topic) && decide (st.now ≤ t + window) then
-        updateScoreOf { st with deliveries := st.deliveries.insert (p.msgId m) (t, sender :: senders) }
+        updateScoreOf { st with deliveries := st.deliveries.insert key (t, sender :: senders) }
           sender (fun sc => Score.meshDelivery p.score sc m.topic)
-      else { st with deliveries := st.deliveries.insert (p.msgId m) (t, sender :: senders) }
+      else { st with deliveries := st.deliveries.insert key (t, sender :: senders) }
 
 /-- `recordOne` over the messages of an RPC, in order. -/
 def recordDeliveries (p : Params) (credit : Bool) (sender : Peer) (s : State)
@@ -1218,7 +1220,7 @@ def handleValidated (p : Params) (s : State) (id : MessageId) (_source : Peer)
     -- The score goes to the peer the core recorded at receipt. The
     -- answer's source is the application's copy of the same value.
     -- Every peer that sent the message while it waited, from the record.
-    let others := ((s.deliveries.get? id).map (·.2)).getD [] |>.filter (· != src)
+    let others := ((s.deliveries.get? (Cache.IdKey.of id)).map (·.2)).getD [] |>.filter (· != src)
     match outcome with
     | .accept =>
       let s2 : State := { s1 with mcache := s1.mcache.put id m }
@@ -2562,24 +2564,24 @@ private theorem recordOne_mesh (p : Params) (credit : Bool) (sender : Peer) (s :
     (m : Message) (topic : TopicId) :
     meshOf (recordOne p credit sender s m) topic = meshOf s topic := by
   unfold recordOne
+  dsimp only
   split
   · simp [meshOf]
   · split
     · rfl
-    · dsimp only
-      split
+    · split
       · rw [updateScoreOf_mesh]; simp [meshOf]
       · simp [meshOf]
 
 private theorem recordOne_topics (p : Params) (credit : Bool) (sender : Peer) (s : State)
     (m : Message) : (recordOne p credit sender s m).topics = s.topics := by
   unfold recordOne
+  dsimp only
   split
   · rfl
   · split
     · rfl
-    · dsimp only
-      split
+    · split
       · rw [updateScoreOf_topics]
       · rfl
 
