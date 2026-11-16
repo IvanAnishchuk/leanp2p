@@ -769,6 +769,51 @@ private def probeChecks (r : Runner) : Async Unit := do
   a.close
   tc.close
 
+/-- Move the test clock a second at a time, with a short real pause
+between steps, until `cond` holds or the rounds run out. A timer that
+the code arms late still fires at a later step. -/
+private partial def advanceUntil (tc : TestClock) (cond : BaseIO Bool) (rounds : Nat) :
+    Async Bool := do
+  if ← cond then return true
+  if rounds == 0 then return false
+  tc.advance 1000
+  select #[← (Park.sleep 20 () : BaseIO (Park Unit))]
+  advanceUntil tc cond (rounds - 1)
+
+/-- A probe round probes its peers at once. Two peers never answer, and
+both sessions must end within one round. One peer after the other, the
+round would wait on the first probe, which parks until the end of the
+test, and never start the second. The real-time bound of
+`advanceUntil` fails that case with no hang. -/
+private def probeParallelChecks (r : Runner) : Async Unit := do
+  let net ← Sim.Net.new
+  let tc ← TestClock.new
+  -- The probes park here until the end of the test.
+  let gate : Chan Unit ← Chan.new 1
+  let started ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
+  let probe : Probe := { intervalMs := 1000, timeoutMs := 500,
+                         run := fun _ => do started.update (· + 1); discard gate.recv; pure true }
+  let (a, _) ← mkHost net 27 tc
+  let (c, _) ← mkHost net 28 tc
+  let (b, _) ← mkHost net 29 tc (probe := some probe)
+  let seenB ← (recordEvents b : BaseIO _)
+  let ended ← (OnceRef.new 0 : BaseIO (OnceRef Nat))
+  b.addNotifiee fun
+    | .disconnected _ _ => ended.update (· + 1)
+    | _ => pure ()
+  discard <| b.dial (← withPeer (← listenOn a "/memory/193") a.localPeer)
+  discard <| seenB.recv
+  discard <| b.dial (← withPeer (← listenOn c "/memory/194") c.localPeer)
+  discard <| seenB.recv
+  r.check "host probe: the probe starts with two peers" (← b.startProbe)
+  let both ← advanceUntil tc (do return (← started.get) == 2 && (← ended.get) == 2) 250
+  r.check "host probe: one round ends both silent sessions" both
+  gate.close
+  b.close
+  c.close
+  a.close
+  tc.close
+
 /-- The leftover hand-over on a served stream (§4.7, §5.6). A peer
 writes its stream header, its proposal, and data in one write. The
 handler gets the data in its first read. The peer runs the plain
@@ -799,16 +844,6 @@ private def handOverChecks (r : Runner) : Async Unit := do
     discard session.join.run
   a.close
   tc.close
-
-/-- Move the test clock a second at a time, with a short real pause
-between steps, until `cond` holds or the rounds run out. -/
-private partial def advanceUntil (tc : TestClock) (cond : BaseIO Bool) (rounds : Nat) :
-    Async Bool := do
-  if ← cond then return true
-  if rounds == 0 then return false
-  tc.advance 1000
-  select #[← (Park.sleep 20 () : BaseIO (Park Unit))]
-  advanceUntil tc cond (rounds - 1)
 
 /-- A silent stream: the peer opens a stream, sends one byte of a
 multistream message, and goes silent. The host resets the stream at
@@ -1048,7 +1083,7 @@ def Host.run (r : Runner) : IO Unit := do
       ("policy", policyChecks r), ("silent peer", silentPeerChecks r),
       ("shutdown", shutdownChecks r), ("events", eventChecks r),
       ("limits", limitedHostChecks r), ("probe", probeChecks r),
-      ("hand-over", handOverChecks r), ("silent stream", silentStreamChecks r),
+      ("parallel probe", probeParallelChecks r), ("hand-over", handOverChecks r), ("silent stream", silentStreamChecks r),
       ("mplex", mplexChecks r), ("secured", securedChecks r),
       ("secured policy", securedPolicyChecks r),
       ("secured shutdown", securedShutdownChecks r)] do

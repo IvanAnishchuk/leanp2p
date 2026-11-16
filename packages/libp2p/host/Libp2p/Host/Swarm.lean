@@ -758,17 +758,25 @@ def startListening (h : Host) (addr : Multiaddr) : Async (Except Error Multiaddr
 
 /-! ## The liveness probe -/
 
-/-- One round of the probe: every connected peer, one after the other.
-A probe that fails or misses its deadline ends the session. The
-deadline's expiry closes the session at once, which wakes the probe's
-parked read. -/
+/-- One round of the probe: every connected peer at once. Lighthouse's
+peer manager issues every due Ping in one poll and waits on none of them
+(`peer_manager/network_behaviour.rs`, lines 51 to 79). One after the
+other, a round of
+200 dead peers at a 500 ms deadline would take 100 s. The connection
+limit bounds the probes of a round. A probe that fails or misses its
+deadline ends the session. The deadline's expiry closes the session at
+once, which wakes the probe's parked read. The round owns its probes
+and joins them. -/
 private def probeRound (h : Host) (p : Probe) : Async Unit := do
+  let probes ← (TaskSet.new : BaseIO TaskSet)
   for peer in ← (h.peers : BaseIO (List PeerId)) do
-    let r ← Conc.withinDeadline h.config.clock p.timeoutMs (discard (h.closePeer peer))
-      (try p.run peer catch _ => pure false)
-    match r with
-    | .ok true => pure ()
-    | _ => discard (h.closePeer peer : BaseIO Bool)
+    probes.spawn do
+      let r ← Conc.withinDeadline h.config.clock p.timeoutMs (discard (h.closePeer peer))
+        (try p.run peer catch _ => pure false)
+      match r with
+      | .ok true => pure ()
+      | _ => discard (h.closePeer peer : BaseIO Bool)
+  probes.joinAll
 
 /-- The probe loop: a round every `intervalMs` until `close`. Park: the
 timer wakes it, and so does `close`, which closes `shutdown` first. -/
