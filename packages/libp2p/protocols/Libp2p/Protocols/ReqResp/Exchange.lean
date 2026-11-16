@@ -211,27 +211,12 @@ answer chunk produces. -/
 def errorMessageOf (e : Error) : ByteArray :=
   (toString (repr e)).toUTF8.extract 0 Constants.errorMessageLimit
 
-/-- Write the chunks of an answer, then close. A chunk the writer
-refuses ends the answer with a `ServerError` chunk. -/
-def writeAnswer (s : Streams.Stream) (m : Method) (chunks : List Chunk) :
-    Async (Except Error Unit) := do
-  for c in chunks do
-    match encodeChunkB m c with
-    | .ok bytes =>
-      if let .error e ← s.write bytes then return .error (.stream e)
-    | .error e =>
-      let msg := errorMessageOf e
-      if let .ok bytes := encodeChunkB m ⟨.serverError, ByteArray.empty, msg⟩ then
-        if let .error e ← s.write bytes then return .error (.stream e)
-      s.close
-      return .error e
-  s.close
-  return .ok ()
-
-/-- Serve one request on `s`. `respond` gets the payload (`none` for a
-method with no request content) and gives the chunks to send. -/
-def serve (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
-    (respond : Option ByteArray → Async (List Chunk)) : Async (Except Error Unit) := do
+/-- Read the request of one exchange on `s`, under the deadline. The
+answer is the payload (`none` for a method with no request content). A
+malformed request gets an `InvalidRequest` answer and the close, and
+the call answers its error. Both responder forms start here. -/
+def readRequest (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat) :
+    Async (Except Error (Option ByteArray)) := do
   let got ← Conc.OnceRef.new (none : Option ByteArray)
   let read : Async (Except Error PumpEnd) :=
     pump s (Core.init m.requestConfig m.request.isSome) fun c => do
@@ -241,14 +226,11 @@ def serve (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Na
   | .error (.stream e) => return .error (.stream e)
   | .error .timeout => return .error .timeout
   | .error e =>
-    -- A malformed request: answer in error, then close.
     if let .ok bytes := encodeChunkB m ⟨.invalidRequest, ByteArray.empty, errorMessageOf e⟩ then
       discard <| s.write bytes
     s.close
     return .error e
-  | .ok _ =>
-    let chunks ← respond (← got.get)
-    writeAnswer s m chunks
+  | .ok _ => return .ok (← got.get)
 
 /-- Write one chunk of an answer. A chunk the encoder refuses becomes a
 `ServerError` chunk, and the answer ends there (`.error`). -/
@@ -275,21 +257,10 @@ def serveStreaming (ctx : Libp2p.Core.StreamContext) (s : Streams.Stream) (m : M
     (respond : Libp2p.Core.StreamContext → Option ByteArray →
       (Chunk → Async (Except Error Unit)) → Async Unit) :
     Async (Except Error Unit) := do
-  let got ← Conc.OnceRef.new (none : Option ByteArray)
-  let read : Async (Except Error PumpEnd) :=
-    pump s (Core.init m.requestConfig m.request.isSome) fun c => do
-      got.set (some c.payload)
-      return true
-  match ← underDeadline s clock timeoutMs read with
-  | .error (.stream e) => return .error (.stream e)
-  | .error .timeout => return .error .timeout
-  | .error e =>
-    if let .ok bytes := encodeChunkB m ⟨.invalidRequest, ByteArray.empty, errorMessageOf e⟩ then
-      discard <| s.write bytes
-    s.close
-    return .error e
-  | .ok _ =>
-    -- The first failure of `emit` is the answer of the exchange; later
+  match ← readRequest s m clock timeoutMs with
+  | .error e => return .error e
+  | .ok payload =>
+    -- The first failure of `emit` is the answer of the exchange. Later
     -- calls write nothing.
     let failed ← Conc.OnceRef.new (none : Option Error)
     let emit (c : Chunk) : Async (Except Error Unit) := do
@@ -297,11 +268,27 @@ def serveStreaming (ctx : Libp2p.Core.StreamContext) (s : Streams.Stream) (m : M
       let r ← writeChunk s m c
       if let .error e := r then (failed.set (some e) : BaseIO Unit)
       return r
-    respond ctx (← got.get) emit
+    respond ctx payload emit
     s.close
     match ← (failed.get : BaseIO (Option Error)) with
     | some e => return .error e
     | none => return .ok ()
+
+/-- Serve one request on `s`, with the whole answer at once. `respond`
+gets the payload (`none` for a method with no request content) and
+gives the chunks to send. The chunks go out in order, and a chunk the
+writer refuses ends the answer with a `ServerError` chunk. -/
+def serve (s : Streams.Stream) (m : Method) (clock : Conc.Clock) (timeoutMs : Nat)
+    (respond : Option ByteArray → Async (List Chunk)) : Async (Except Error Unit) := do
+  match ← readRequest s m clock timeoutMs with
+  | .error e => return .error e
+  | .ok payload =>
+    let chunks ← respond payload
+    let r ← chunks.foldlM (fun (r : Except Error Unit) c => do
+      if r matches .error _ then return r
+      writeChunk s m c) (.ok ())
+    s.close
+    return r
 
 /-- The one map from a req/resp error into the coarse core error. -/
 def mapError : Error → Libp2p.Core.Error
